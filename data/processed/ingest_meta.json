@@ -1,0 +1,153 @@
+{
+  "mode_requested": "auto",
+  "mode_resolved": "offline",
+  "works": 107145,
+  "fundflows": 3389,
+  "eras": {
+    "post2023": 107145
+  },
+  "flow_eras": {
+    "pre2023": 1913,
+    "post2023": 1476
+  },
+  "live_tiles": {
+    "Allocated Limit for Hon'ble MPs": {
+      "count": null,
+      "display": "8,333.67 Crore",
+      "raw": [
+        "\u00a083,33,66,73,298.01",
+        "\u00a08,333.67 Crore"
+      ]
+    },
+    "Expenditure on Completed and On-going Works as on Date": {
+      "count": null,
+      "display": "2,782.78 Crore",
+      "raw": [
+        "\u00a027,82,77,91,672.45",
+        "\u00a02,782.78 Crore"
+      ]
+    },
+    "Works Recommended": {
+      "count": 107185,
+      "display": "5,741.79 Crore",
+      "raw": [
+        "107185",
+        "\u00a057,41,79,15,662.41",
+        "\u00a05,741.79 Crore"
+      ]
+    },
+    "Works Completed": {
+      "count": 34561,
+      "display": "1,692.58 Crore",
+      "raw": [
+        "34561",
+        "\u00a016,92,58,11,006.73",
+        "\u00a01,692.58 Crore"
+      ]
+    },
+    "Works Sanctioned": {
+      "count": 79475,
+      "display": "4,186.30 Crore",
+      "raw": [
+        "79475",
+        "\u00a041,86,30,04,781.23",
+        "\u00a04,186.30 Crore"
+      ]
+    },
+    "Amount consented for Calamity": {
+      "count": 12,
+      "display": "4.06 Crore",
+      "raw": [
+        "12",
+        "\u00a04,05,67,400.00",
+        "\u00a04.06 Crore"
+      ]
+    },
+    "Current Tenure": "18th Lok Sabha"
+  },
+  "freshness": {
+    "live_recommended_works": 107185,
+    "local_recommended_works": 107145,
+    "coverage_pct": 99.96,
+    "delta": 40,
+    "live_completed_works": 34561,
+    "live_sanctioned_works": 79475,
+    "tenure": "18th Lok Sabha",
+    "checked_at": "2026-09-07T12:47:22.049467+00:00"
+  },
+  "provenance": [
+    {
+      "source": "MPLADS eSAKSHI portal (mplads.mospi.gov.in)",
+      "mode": "live",
+      "table": "tiles",
+      "rows": 7,
+      "status": "ok",
+      "detail": "official pre-login dashboard service",
+      "fetched_at": "2026-09-07T12:47:12.133046+00:00"
+    },
+    {
+      "source": "MPLADS eSAKSHI official CSV exports (datasets/)",
+      "mode": "offline",
+      "table": "works",
+      "rows": 107145,
+      "status": "ok",
+      "detail": "Works Recommended.csv, Works Sanctioned.csv, Works Completed.csv, Expenditure on Completed and On-going Works as on Date.csv, Allocated Limit for Honble MPs (1).csv, Amount consented for Calamity.csv",
+      "fetched_at": "2026-09-07T12:47:12.135110+00:00"
+    },
+    {
+      "source": "MPLADS eSAKSHI official CSV exports (datasets/)",
+      "mode": "offline",
+      "table": "fundflows",
+      "rows": 1476,
+      "status": "ok",
+      "detail": "constituency x FY aggregation + Allocated Limit",
+      "fetched_at": "2026-09-07T12:47:12.135110+00:00"
+    },
+    {
+      "source": "router decision",
+      "mode": "auto",
+      "table": "works",
+      "rows": 107145,
+      "status": "selected",
+      "detail": "official CSV exports selected: complete national corpus; the live work-level interface is state-scoped and returns only a bounded sample. Live portal still used for freshness and the pre-2023 baseline.",
+      "fetched_at": "2026-09-07T12:47:22.017775+00:00"
+    },
+    {
+      "source": "MPLADS 17th Lok Sabha (2019-2024)",
+      "mode": "live",
+      "table": "fundflows",
+      "rows": 557,
+      "status": "ok",
+      "detail": "cached from an earlier live pull",
+      "fetched_at": "2026-09-07T12:47:22.023947+00:00"
+    },
+    {
+      "source": "MPLADS 16th Lok Sabha (2014-2019)",
+      "mode": "live",
+      "table": "fundflows",
+      "rows": 569,
+      "status": "ok",
+      "detail": "cached from an earlier live pull",
+      "fetched_at": "2026-09-07T12:47:22.030129+00:00"
+    },
+    {
+      "source": "MPLADS 15th Lok Sabha (2009-2014)",
+      "mode": "live",
+      "table": "fundflows",
+      "rows": 549,
+      "status": "ok",
+      "detail": "cached from an earlier live pull",
+      "fetched_at": "2026-09-07T12:47:22.039428+00:00"
+    },
+    {
+      "source": "MPLADS Rajya Sabha (sitting 2022)",
+      "mode": "live",
+      "table": "fundflows",
+      "rows": 238,
+      "status": "ok",
+      "detail": "cached from an earlier live pull",
+      "fetched_at": "2026-09-07T12:47:22.044872+00:00"
+    }
+  ],
+  "ingested_at": "2026-09-07T12:47:23.316792+00:00"
+}

@@ -1,0 +1,29 @@
+# Declarative source specs for the data.gov.in OGD path (astra/ingestion/normalize.py).
+#
+# The primary ingestion paths are astra/ingestion/live.py (real-time official
+# and open interfaces) and astra/ingestion/offline.py (the official eSAKSHI CSV
+# exports in datasets/), both resolved by astra/ingestion/router.py.
+#
+# This file exists so an additional data.gov.in resource can be onboarded as
+# CONFIG rather than code: give it a resource id and a field map onto the
+# canonical schema. Set enabled: true to activate.
+#
+# A free personal API key can be set via the DATAGOV_API_KEY environment
+# variable; the public sample key is used otherwise.
+
+sources:
+  - name: datagov_mplads_example
+    enabled: false
+    fetch: datagov                 # datagov | csv_url | local_csv
+    resource_id: "<resource-id-from-data.gov.in>"
+    kind: fundflows                # works | fundflows
+    amount_scale: 10000000         # source values in crore -> rupees
+    era_default: pre2023
+    field_map:
+      # "<source column>": <canonical column>
+      "state_name": state
+      "constituency": constituency
+      "mp_name": mp_name
+      "financial_year": fy
+      "funds_released": released
+      "expenditure": expenditure

@@ -1,0 +1,104 @@
+{
+  "ran_at": "2026-09-07T12:49:18.647199+00:00",
+  "router_trace": [
+    {
+      "agent": "compliance",
+      "dispatched": true,
+      "reason": "required inputs present",
+      "findings": 26974
+    },
+    {
+      "agent": "anomaly",
+      "dispatched": true,
+      "reason": "required inputs present",
+      "findings": 6315
+    },
+    {
+      "agent": "entity_resolution",
+      "dispatched": true,
+      "reason": "required inputs present",
+      "findings": 14579
+    },
+    {
+      "agent": "network",
+      "dispatched": true,
+      "reason": "required inputs present",
+      "findings": 129
+    }
+  ],
+  "rule_coverage": [
+    {
+      "rule_id": "A-COST-01",
+      "title": "Cost anomaly vs peer benchmark (SoR proxy)",
+      "findings": 6062,
+      "evaluated": true
+    },
+    {
+      "rule_id": "A-EXP-01",
+      "title": "Expenditure pattern outlier",
+      "findings": 253,
+      "evaluated": true
+    },
+    {
+      "rule_id": "D-DUP-01",
+      "title": "Duplicate / near-duplicate work",
+      "findings": 14421,
+      "evaluated": true
+    },
+    {
+      "rule_id": "D-DUP-02",
+      "title": "Repeated low-detail work descriptions in one district",
+      "findings": 158,
+      "evaluated": true
+    },
+    {
+      "rule_id": "N-NET-01",
+      "title": "Implementing-agency / vendor concentration",
+      "findings": 129,
+      "evaluated": true
+    },
+    {
+      "rule_id": "R-COST-01",
+      "title": "Per-work cost ceiling / floor checks",
+      "findings": 10967,
+      "evaluated": true
+    },
+    {
+      "rule_id": "R-PILE-01",
+      "title": "Chronic under-utilization (funds idling)",
+      "findings": 306,
+      "evaluated": true
+    },
+    {
+      "rule_id": "R-PROH-01",
+      "title": "Prohibited work category",
+      "findings": 1039,
+      "evaluated": true
+    },
+    {
+      "rule_id": "R-SCST-01",
+      "title": "SC/ST area allocation minimum",
+      "findings": 0,
+      "evaluated": true
+    },
+    {
+      "rule_id": "R-SCST-02",
+      "title": "SC/ST reserved-constituency spend share (screening proxy)",
+      "findings": 18,
+      "evaluated": true
+    },
+    {
+      "rule_id": "R-SPIKE-01",
+      "title": "Non-lapsable fund utilization spike",
+      "findings": 0,
+      "evaluated": true
+    },
+    {
+      "rule_id": "R-TIME-01",
+      "title": "One-year work completion norm",
+      "findings": 14644,
+      "evaluated": true
+    }
+  ],
+  "flags_produced": 36177
+}

@@ -1,0 +1,288 @@
+# ASTRA — MPLADS compliance & risk rule configuration
+# Every rule here is DETERMINISTIC and cites the MPLADS Guidelines clause it enforces.
+# Thresholds are parameterized so authorities can tune them without code changes.
+# All outputs are RISK FLAGS FOR HUMAN REVIEW — never automated determinations.
+
+scheme:
+  annual_entitlement_cr: 5.0          # Rs 5 crore per MP per year under MPLADS
+  fund_regime: non_lapsable            # funds carry forward; never lapse
+
+rules:
+
+  scst_allocation:
+    id: R-SCST-01
+    title: "SC/ST area allocation minimum"
+    clause: "MPLADS Guidelines 2023: at least 15% of MPLADS funds for areas inhabited by SC population and 7.5% for ST areas"
+    sc_min_pct: 15.0
+    st_min_pct: 7.5
+    severity: high
+
+  # R-SCST-01 needs DA-level SC/ST AREA attribution, which the published
+  # eSAKSHI extracts do not carry. Where only reserved-constituency labels are
+  # available, this state-level proxy measures the share of MPLADS spend
+  # flowing to SC/ST-reserved constituencies. It is a screening indicator that
+  # tells a State Nodal Authority where to pull the DA-level ledger - it is
+  # explicitly NOT a finding of non-compliance with para 2.8.
+  scst_reserved_proxy:
+    id: R-SCST-02
+    title: "SC/ST reserved-constituency spend share (screening proxy)"
+    clause: "Screening proxy for the MPLADS Guidelines 2023 SC/ST allocation provision (15% / 7.5%) - not a compliance determination"
+    sc_min_pct: 15.0
+    st_min_pct: 7.5
+    min_state_expenditure: 50000000     # Rs 5 crore before a state share is meaningful
+    min_reserved_seats: 1
+    severity: medium
+
+  completion_norm:
+    id: R-TIME-01
+    title: "One-year work completion norm"
+    clause: "MPLADS Guidelines 2023: sanctioned works are to be completed within one year of sanction"
+    max_days: 365
+    outer_limit_days: 548
+    severity: medium
+    overdue_severity: high              # beyond outer limit
+
+  prohibited_works:
+    id: R-PROH-01
+    title: "Prohibited work category"
+    clause: "MPLADS Guidelines 2023: negative list of works not permissible under the scheme"
+    severity: critical
+    # ASSET patterns: the term must be the thing actually being BUILT. MPLADS
+    # descriptions constantly use religious buildings as landmarks ("hall near
+    # X temple", "road from Y church"), so these are matched only against the
+    # head asset phrase that follows the construction verb.
+    asset_patterns:
+      - "temple"
+      - "mandir"
+      - "mosque"
+      - "masjid"
+      - "church"
+      - "gurudwara"
+      - "gurdwara"
+      - "religious"
+      - "memorial"
+      - "statue"
+      - "idol"
+      - "gate of honour"
+      - "welcome gate"
+      - "office building"
+      - "residential building"
+      - "commercial establishment"
+    # ACTIVITY patterns: these describe the NATURE of the expenditure rather
+    # than an asset, so they are matched against the description directly.
+    # Operation & maintenance is the state's responsibility, not MPLADS.
+    activity_patterns:
+      - "maintenance of"
+      - "repair of"
+      - "renovation of"
+      - "land acquisition"
+      - "grants and loans"
+      - "recurring expenditure"
+      - "purchase of inventory"
+      - "naming of"
+    activity_severity: medium
+    # nouns that identify a permissible asset; if one of these heads the work,
+    # a religious term elsewhere in the text is a landmark, not the asset
+    permissible_assets:
+      - road
+      - street
+      - lane
+      - path
+      - pathway
+      - marg
+      - drain
+      - drainage
+      - culvert
+      - bridge
+      - hall
+      - bhavan
+      - bhawan
+      - room
+      - school
+      - college
+      - library
+      - toilet
+      - light
+      - lights
+      - lighting
+      - mast
+      - pole
+      - well
+      - borewell
+      - tubewell
+      - handpump
+      - tank
+      - pond
+      - park
+      - ground
+      - stadium
+      - shed
+      - wall
+      - fence
+      - platform
+      - centre
+      - center
+      - building
+      - complex
+      - crematorium
+      - ghat
+      - bus
+      - shelter
+      - water
+      - pipeline
+      - anganwadi
+      - dispensary
+      - hospital
+      - ambulance
+      - vehicle
+      - computer
+      - book
+      - books
+      - furniture
+      - equipment
+      # transliterated Indic asset nouns - a large share of real MPLADS
+      # descriptions are Hindi/Gujarati/Marathi written in Latin script
+      - sadak
+      - sadk
+      - rasta
+      - raasta
+      - marga
+      - pcc
+      - cc
+      - rcc
+      - kharanja
+      - kharnja
+      - interlocking
+      - nali
+      - naali
+      - naala
+      - kuva
+      - kuan
+      - kuwa
+      - talab
+      - bhawan
+      - samudayik
+      - chabutra
+      - chabutara
+      - platform
+      - shauchalay
+      - pulia
+      - puliya
+      - boring
+      - handpump
+      - hentpump
+      - paniki
+      - tanki
+      - vidyalaya
+      - school
+      - aanganwadi
+      - chardiwari
+      - boundary
+      - prakash
+      - streetlight
+
+  cost_ceiling:
+    id: R-COST-01
+    title: "Per-work cost ceiling / floor checks"
+    clause: "MPLADS Guidelines 2023: no work costing less than Rs 1 lakh is permissible under the scheme"
+    min_work_cost: 100000               # Rs 1 lakh floor (verified against the 2023 guidelines)
+    max_work_cost: 25000000             # Rs 2.5 crore soft ceiling for a single work (flag, human reviews)
+    severity: medium
+
+  utilization_spike:
+    id: R-SPIKE-01
+    title: "Non-lapsable fund utilization spike"
+    clause: "Risk heuristic: MPLADS funds never lapse, so a sudden year-end/terminal-year spike after low utilization is the true risk signal, not high spending per se"
+    low_util_pct: 40.0                  # 'dormant' years threshold
+    spike_util_pct: 65.0                # spike year threshold
+    min_dormant_years: 2                # at least this many consecutive low years before the spike
+    spike_ratio: 2.0                    # spike year >= ratio x mean of dormant years
+    severity: high
+
+  unspent_pileup:
+    id: R-PILE-01
+    title: "Chronic under-utilization (funds idling)"
+    clause: "Inefficiency signal: cumulative utilization far below releases over multiple years"
+    max_cum_util_pct: 50.0
+    min_years: 3
+    severity: medium
+
+anomaly:
+  cost_overrun:
+    id: A-COST-01
+    title: "Cost anomaly vs peer benchmark (SoR proxy)"
+    method: "robust z-score (median/MAD) within state x category x era peer group; IsolationForest cross-check"
+    z_threshold: 2.5
+    iforest_contamination: 0.02
+    min_peer_group: 8                   # do not score groups smaller than this
+    # A statistically extreme cost is only worth an officer's time if it is also
+    # MATERIALLY above the benchmark. Without this floor, a tight peer group
+    # flags works that are only a few percent above the median.
+    min_pct_above_benchmark: 30.0
+    min_abs_excess: 100000              # Rs 1 lakh minimum excess over benchmark
+    # ~17% of real peer groups are degenerate (many works share one identical
+    # cost, so MAD = 0 and z-scores are meaningless). Those groups fall back to
+    # a percentile rule instead of the z-score.
+    degenerate_percentile: 97.5
+    # A single MPLADS work type spans very different scales (one street-light
+    # pole vs a whole ward's installation). Beyond this multiple of the peer
+    # median the likeliest explanation is a scale/classification mismatch, not
+    # an overrun, and the finding is reported that way.
+    scale_mismatch_ratio: 20.0
+    severity: high
+  expenditure_pattern:
+    id: A-EXP-01
+    title: "Expenditure pattern outlier"
+    z_threshold: 3.0
+    severity: medium
+
+duplicates:
+  id: D-DUP-01
+  title: "Duplicate / near-duplicate work"
+  semantic_threshold: 0.80              # TF-IDF char-ngram cosine
+  fuzzy_threshold: 88                   # rapidfuzz token_set_ratio 0-100
+  geo_radius_km: 2.0                    # only when lat/long available
+  same_scope_keys: [state, district]    # candidate blocking keys
+  cross_era_bonus: 0.05                 # migration-era duplication is a known pattern
+  severity: high
+  # MPLADS descriptions are templated ("Construction of CC road from X to Y"),
+  # so text similarity alone is not evidence of duplication. A pair must also
+  # share several RARE tokens (place names, ward numbers, landmarks). Tokens
+  # occurring in more than boilerplate_df_pct of the corpus carry no evidence.
+  boilerplate_df_pct: 2.0
+  min_specific_tokens: 3                # informative tokens required per description
+  min_shared_specific: 3                # informative tokens the pair must share
+  top_k_neighbours: 5
+  max_findings_per_work: 2
+
+  # Generic low-detail descriptions repeated within one district are reported
+  # ONCE as a cluster (a transparency/data-quality signal), never as N pairwise
+  # duplicate accusations.
+  generic_cluster:
+    id: D-DUP-02
+    title: "Repeated low-detail work descriptions in one district"
+    min_cluster_size: 8
+    severity: medium
+
+network:
+  id: N-NET-01
+  title: "Implementing-agency / vendor concentration"
+  min_works: 5
+  overrun_share_threshold: 0.5          # >50% of an IA's works flagged for overrun
+  district_spread_threshold: 4          # same IA across >4 districts is unusual for local works
+  severity: medium
+
+risk_score:
+  # composite score in [0,100]; weighted sum of agent findings, capped
+  weights:
+    critical: 40
+    high: 25
+    medium: 12
+    low: 5
+  review_threshold: 40                  # score >= this => 'high risk - review required' alert
+
+era:
+  # eSAKSHI went live April 2023: treat data regimes separately
+  cutoff_date: "2023-04-01"
+  pre_label: "pre-eSAKSHI (physical mode)"
+  post_label: "post-eSAKSHI (digital real-time)"
