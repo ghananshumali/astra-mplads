@@ -250,6 +250,173 @@ def test_persistence_and_api() -> None:
     db.record_feedback(fid, "pending", "district", "")   # restore
 
 
+# ------------------------------------------------- presentation + query layer
+
+def test_explanations() -> None:
+    """The plain-language layer must be readable, grounded and non-accusatory."""
+    print("\n[8] Explanation quality")
+    from astra.explain import build_brief, humanize, rupees, short_title
+
+    check("long descriptions become short titles",
+          len(short_title("Construction of CC Road from Gutuhatu main road towards "
+                          "the house of Pritnath Munda in ward number 7 as per "
+                          "attached letter")) <= 65)
+    check("boilerplate stripped from titles",
+          "attached letter" not in short_title(
+              "Installation of Semi High Mast Lights as per attached letter").lower())
+    check("money uses Indian conventions",
+          rupees(12500000).startswith("Rs".replace("Rs", "\u20b9") + "1.25 crore")
+          and "lakh" in rupees(500000))
+
+    flags = db.query_flags(min_score=60, limit=250)
+    check("flags carry display titles and primary signals",
+          all(f.get("display_title") and f.get("primary_signal") for f in flags))
+    check("flags carry all four authority briefs",
+          all(set(f.get("tier_briefs", {})) == {"mp", "district", "state", "ministry"}
+              for f in flags))
+
+    briefs = [b for f in flags for b in f["tier_briefs"].values()]
+    banned = ("fraud", "fraudulent", "corrupt", "guilty", "embezzl", "scam",
+              "criminal", "wrongdoing by")
+    offenders = [b["primary_plain"] for b in briefs
+                 if any(w in (b["primary_plain"] or "").lower() for w in banned)]
+    check("no brief accuses anyone of fraud", not offenders,
+          offenders[0][:70] if offenders
+          else f"checked {len(briefs):,} briefs across {len(flags)} cases")
+    check("every brief carries the human-review statement",
+          all("not a determination of fraud" in b["disclaimer"] for b in briefs))
+    check("every brief gives at least one concrete action",
+          all(b["actions"] for b in briefs))
+    check("no raw z-scores leak into the plain explanation",
+          not any("robust z=" in (b["primary_plain"] or "") for b in briefs))
+
+    sample = flags[0]
+    firsts = {t: b["actions"][0] for t, b in sample["tier_briefs"].items()}
+    check("each authority gets a different first action",
+          len(set(firsts.values())) == 4)
+    openings = {b["opening"] for b in sample["tier_briefs"].values()}
+    check("each authority gets a different framing", len(openings) == 4)
+
+    sig = [s for f in flags[:60] for s in f["tier_briefs"]["district"]["signals"]]
+    check("signals report a measurement and a benchmark",
+          all(s["metric"] and s["benchmark"] for s in sig),
+          f"{len(sig)} signals checked")
+    check("signal risk contributions are positive",
+          all(s["contribution"] > 0 for s in sig))
+    check("humanize() is total over every emitted rule",
+          all(humanize(fd)["headline"] for f in flags for fd in f["findings"]))
+
+
+def test_query_layer() -> None:
+    """The dashboard query paths must be correct and fast."""
+    print("\n[9] Dashboard query layer")
+    import time
+
+    t = time.time()
+    facets = db.flag_facets()
+    check("facets load", facets["total"] > 0,
+          f"{len(facets['states'])} states, {len(facets['districts'])} districts, "
+          f"{(time.time() - t) * 1000:.0f}ms")
+
+    t = time.time()
+    page = db.query_flags(limit=250, order="risk")
+    dt = (time.time() - t) * 1000
+    check("page query is fast", dt < 2000, f"{len(page)} rows in {dt:.0f}ms")
+    check("ordering is highest-risk-first",
+          all(page[i]["risk_score"] >= page[i + 1]["risk_score"]
+              for i in range(len(page) - 1)))
+    check("count agrees with an unpaginated listing",
+          db.count_flags(min_score=90) == len(db.query_flags(min_score=90, limit=10**6)))
+
+    st_name = facets["states"][0]
+    scoped = db.query_flags(states=[st_name], limit=50)
+    check("state filter scopes correctly",
+          all(f["state"] == st_name for f in scoped),
+          f"{st_name}: {len(scoped)} cases")
+
+    dup = db.query_flags(rule_ids=["D-DUP-01"], limit=40)
+    check("detection-type filter works",
+          all(any(x["rule_id"] == "D-DUP-01" for x in f["findings"]) for f in dup),
+          f"{len(dup)} duplicate cases")
+
+    hits = db.query_flags(search="road", limit=40)
+    check("search filter returns matches", len(hits) > 0, f"{len(hits)} hits")
+
+    stats = db.flag_stats()
+    check("stats reconcile with the total",
+          stats["high"] + stats["medium"] + stats["low"] == stats["total"],
+          f"{stats['high']} high / {stats['medium']} medium / {stats['low']} low")
+
+    one = db.get_flag(page[0]["flag_id"])
+    check("single-case fetch works", bool(one) and one["flag_id"] == page[0]["flag_id"])
+    check("missing case returns None rather than raising",
+          db.get_flag("F-DOESNOTEXIST") is None)
+
+    try:
+        db.query_flags(states=[], districts=None, statuses=["pending"],
+                       entity_types=["work"], rule_ids=["R-TIME-01"],
+                       min_score=50, search="a'b", limit=5)
+        check("filters are injection-safe and tolerate empties", True)
+    except Exception as exc:
+        check("filters are injection-safe and tolerate empties", False, str(exc)[:90])
+
+
+def test_review_workflow() -> None:
+    """Human review must actually persist and be reversible."""
+    print("\n[10] Human review workflow")
+    target = db.query_flags(limit=1)[0]
+    fid = target["flag_id"]
+    original = target["review_status"]
+
+    for action in ("under_review", "confirmed", "false_positive"):
+        db.record_feedback(fid, action, "district", f"system test: {action}")
+        check(f"status persists as '{action}'",
+              db.get_flag(fid)["review_status"] == action)
+
+    check("review actions are auditable", not db.feedback_stats().empty)
+    filtered = db.query_flags(statuses=["false_positive"], limit=10)
+    check("status filter finds the reviewed case",
+          any(f["flag_id"] == fid for f in filtered))
+    db.record_feedback(fid, original, "district", "")
+    check("status restored after test", db.get_flag(fid)["review_status"] == original)
+
+
+def test_dashboard_renders() -> None:
+    """The dashboard module must parse and survive missing/edge-case data."""
+    print("\n[11] Dashboard robustness")
+    import ast
+    src = (ROOT / "dashboard" / "app.py").read_text(encoding="utf-8")
+    try:
+        ast.parse(src)
+        check("dashboard parses", True)
+    except SyntaxError as exc:
+        check("dashboard parses", False, str(exc))
+        return
+
+    from astra.explain import build_brief, risk_band, short_title
+    check("risk bands cover the full range",
+          {risk_band(s)[0] for s in (0, 39, 40, 69, 70, 100)} ==
+          {"Low risk", "Medium risk", "High risk"})
+    check("short_title survives empty input", short_title(None) == "Untitled work")
+    check("short_title survives a 500-character description",
+          len(short_title("x " * 250)) <= 65)
+    empty = build_brief({"findings": []}, "district")
+    check("brief survives a case with no findings",
+          bool(empty["primary_risk"]) and bool(empty["disclaimer"]))
+    check("brief survives an unknown authority tier",
+          bool(build_brief({"findings": []}, "nonsense")["actions"]))
+
+    wf = next((f for f in db.query_flags(entity_types=["work"], limit=5)), None)
+    if wf:
+        row = db.read_df("works", "work_id = ?", (wf["entity_id"],))
+        check("work-level cases resolve to a work record", not row.empty,
+              wf["entity_id"])
+    agf = db.query_flags(entity_types=["agency"], limit=1)
+    if agf:
+        check("agency-level cases have no work row and must not crash the panel",
+              db.read_df("works", "work_id = ?", (agf[0]["entity_id"],)).empty)
+
+
 def main() -> int:
     print("=" * 78)
     print("ASTRA system test — real MPLADS data")
@@ -269,6 +436,10 @@ def main() -> int:
     from astra.pipeline import run_pipeline
     run_pipeline(verbose=False)
     test_persistence_and_api()
+    test_explanations()
+    test_query_layer()
+    test_review_workflow()
+    test_dashboard_renders()
 
     # The offline-mode test above rewrote the database without live enrichment.
     # Restore the full dual-mode batch so the dashboard is left demo-ready.

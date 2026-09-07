@@ -7,6 +7,7 @@ orchestrator's synthesis, not from filtered SQL):
   GET /flags/district?district=&state=     — DA: execution queue
   GET /flags/state?state=                  — SNA: cross-district patterns
   GET /flags/ministry                      — MoSPI: national exception rates
+  GET /flags/case/{flag_id}?tier=          — one case, fully explained for a tier
   POST /flags/{flag_id}/feedback           — human-in-the-loop review action
   GET /meta/router-trace                   — why each agent ran / was skipped
   GET /meta/data-source                    — dual-mode ingestion provenance:
@@ -52,6 +53,10 @@ def _tier_payload(flags: list[dict], tier: str, aggregate: dict | None = None) -
                 "review_status": f["review_status"],
                 "narrative": f["narrative"],
                 "tier_view": f["tier_views"].get(tier, f["narrative"]),
+                # structured, plain-language brief for this authority
+                "display_title": f.get("display_title"),
+                "primary_signal": f.get("primary_signal"),
+                "brief": (f.get("tier_briefs") or {}).get(tier),
                 "findings": f["findings"],
             }
             for f in flags
@@ -102,6 +107,32 @@ def flags_ministry(min_score: float = 0):
     return _tier_payload(flags[:200], "ministry",
                          {"flags_by_state": by_state, "findings_by_rule": by_rule,
                           "total_alerts": sum(1 for f in flags if f["alert"])})
+
+
+@app.get("/flags/case/{flag_id}")
+def flag_case(flag_id: str, tier: str = "district"):
+    """One case with its authority-specific brief and all supporting evidence."""
+    if tier not in ("mp", "district", "state", "ministry"):
+        raise HTTPException(400, "tier must be mp | district | state | ministry")
+    f = db.get_flag(flag_id)
+    if not f:
+        raise HTTPException(404, f"no such case: {flag_id}")
+    return {
+        "flag_id": f["flag_id"],
+        "display_title": f.get("display_title"),
+        "entity_id": f["entity_id"],
+        "entity_type": f["entity_type"],
+        "state": f["state"], "district": f["district"],
+        "constituency": f["constituency"], "era": f["era"],
+        "risk_score": f["risk_score"], "alert": f["alert"],
+        "review_status": f["review_status"],
+        "primary_signal": f.get("primary_signal"),
+        "brief": (f.get("tier_briefs") or {}).get(tier),
+        "all_tier_briefs": f.get("tier_briefs"),
+        "findings": f["findings"],
+        "narrative": f["narrative"],
+        "disclaimer": HUMAN_REVIEW_DISCLAIMER,
+    }
 
 
 class FeedbackIn(BaseModel):

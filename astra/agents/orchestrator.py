@@ -31,6 +31,7 @@ import pandas as pd
 
 from .. import HUMAN_REVIEW_DISCLAIMER
 from ..config import PROCESSED_DIR, load_rules
+from ..explain import brief_to_text, build_brief, humanize, short_title
 from ..schemas import Finding, Flag
 from .anomaly import AnomalyAgent
 from .base import BaseAgent
@@ -157,11 +158,27 @@ class Orchestrator:
             }
             narrative = self._narrative(etype, eid, fs, meta, context, score)
             flag_id = "F-" + hashlib.sha1(f"{etype}|{eid}".encode()).hexdigest()[:10].upper()
+
+            # ---- presentation layer: structured, authority-specific briefs
+            raw = {"findings": [f.model_dump() for f in fs]}
+            note = ""
+            if context["agency_other_flags"] > 0 and meta.get("ia_name"):
+                note = (f"The same implementing agency appears in "
+                        f"{context['agency_other_flags']} other flagged cases in this "
+                        f"dataset, so a common cause may be worth checking.")
+            briefs = {t: build_brief(raw, t, {"note": note}) for t in TIERS}
+            tier_views = {t: brief_to_text(b) for t, b in briefs.items()}
+            primary = briefs["district"]["primary_risk"]
+            title = self._display_title(etype, eid, meta)
+
             flags.append(Flag(
                 flag_id=flag_id,
                 entity_type=etype,
                 entity_id=eid,
                 entity_label=self._label(etype, eid, meta),
+                display_title=title,
+                primary_signal=primary,
+                tier_briefs=briefs,
                 state=meta.get("state"),
                 district=meta.get("district"),
                 constituency=meta.get("constituency"),
@@ -170,7 +187,7 @@ class Orchestrator:
                 alert=score >= threshold,
                 findings=fs,
                 narrative=narrative,
-                tier_views=self._tier_views(etype, eid, fs, meta, context, score),
+                tier_views=tier_views,
                 created_at=datetime.now(timezone.utc).isoformat(),
             ))
         flags.sort(key=lambda f: -f.risk_score)
@@ -189,6 +206,16 @@ class Orchestrator:
         if etype == "agency":
             return {"ia_name": eid}
         return {}
+
+    @staticmethod
+    def _display_title(etype: str, eid: str, meta: dict) -> str:
+        """Short, readable case title for list views (full text kept on the flag)."""
+        if etype == "work":
+            return short_title(meta.get("description"), meta.get("category"))
+        if etype == "constituency":
+            return f"{meta.get('constituency', eid)} constituency"
+        actor = str(meta.get("ia_name", eid))
+        return actor.split(":", 1)[-1].title()[:62]
 
     @staticmethod
     def _label(etype: str, eid: str, meta: dict) -> str:

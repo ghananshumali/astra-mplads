@@ -1,9 +1,17 @@
-"""ASTRA dashboard — four authority tiers over one flag corpus.
+"""ASTRA — AI-Powered MPLADS Risk Intelligence Platform.
 
-The four views are NOT four pages of filtered SQL: every flag carries four
-orchestrator-synthesized framings (tier_views) and each tier renders its own
-framing, action language, and aggregation level. Switch roles on the same
-flag to see the synthesis differ — that is the demo's core proof point.
+A master-detail investigation workspace, not a record dump:
+
+  header        platform identity, live data mode, freshness, review disclaimer
+  authority     MP / District / State Nodal / Ministry — switching reframes the
+                SAME case through the orchestrator's per-tier briefs, it does
+                not merely hide columns
+  overview      executive risk intelligence for the selected authority
+  workspace     left: compact filterable case list · right: full investigation
+
+Everything rendered here comes from the pipeline. Where evidence does not exist
+for a case (no coordinates, no duplicate match, no vendor), the UI says so
+rather than drawing an empty chart.
 """
 from __future__ import annotations
 
@@ -17,14 +25,31 @@ import streamlit as st
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from astra import HUMAN_REVIEW_DISCLAIMER, PLATFORM_NAME, PLATFORM_TAGLINE  # noqa: E402
-from astra import db  # noqa: E402
+from astra import PLATFORM_NAME, db  # noqa: E402
 from astra.config import PROCESSED_DIR  # noqa: E402
+from astra.explain import (AGENT_LABEL, AGENT_ROLE, humanize,  # noqa: E402
+                           risk_band, rupees)
 
-st.set_page_config(page_title=f"{PLATFORM_NAME} — MPLADS Risk Analytics",
-                   page_icon="🛰️", layout="wide")
+st.set_page_config(page_title="ASTRA — MPLADS Risk Intelligence",
+                   page_icon="🛰️", layout="wide",
+                   initial_sidebar_state="expanded")
 
-# Approximate state centroids for map fallback when works lack lat/long.
+TIERS = {
+    "ministry": ("🏛️", "Ministry (MoSPI)", "National trends and policy signals"),
+    "state": ("🗺️", "State Nodal Authority", "Patterns repeating across districts"),
+    "district": ("🏢", "District Authority", "Ground-level execution and verification"),
+    "mp": ("🧑‍⚖️", "Member of Parliament", "Works recommended in your constituency"),
+}
+SEV_COLOR = {"critical": "#a93226", "high": "#c0392b",
+             "medium": "#d68910", "low": "#5d6d7e"}
+STATUS_META = {
+    "pending": ("NEW", "#5d6d7e"),
+    "under_review": ("UNDER REVIEW", "#2471a3"),
+    "confirmed": ("ESCALATED", "#a93226"),
+    "false_positive": ("FALSE POSITIVE", "#1e8449"),
+}
+# Approximate state centroids. Used ONLY to place state-level aggregate bubbles;
+# the eSAKSHI exports carry no asset coordinates and none are invented here.
 STATE_CENTROIDS = {
     "ANDHRA PRADESH": (15.91, 79.74), "ARUNACHAL PRADESH": (28.21, 94.72),
     "ASSAM": (26.20, 92.94), "BIHAR": (25.10, 85.31), "CHHATTISGARH": (21.28, 81.87),
@@ -44,388 +69,693 @@ STATE_CENTROIDS = {
     "DADRA AND NAGAR HAVELI AND DAMAN AND DIU": (20.18, 73.02),
 }
 
-TIER_LABELS = {
-    "mp": "🧑‍⚖️ Member of Parliament",
-    "district": "🏛️ District Authority",
-    "state": "🗺️ State Nodal Authority",
-    "ministry": "🏢 Ministry (MoSPI)",
-}
-SEV_COLOR = {"critical": "#d62728", "high": "#ff7f0e", "medium": "#e6b800", "low": "#7f7f7f"}
+CSS = """
+<style>
+  .block-container {padding-top: 1.2rem; padding-bottom: 1rem; max-width: 1520px;}
+  .astra-head {background: linear-gradient(90deg,#0b2d5c 0%,#123f7d 55%,#17539c 100%);
+      color:#fff; padding:14px 20px; border-radius:10px; margin-bottom:10px;}
+  .astra-head h1 {font-size:1.45rem; margin:0; font-weight:700; letter-spacing:.3px;}
+  .astra-head .sub {opacity:.9; font-size:.86rem; margin-top:4px;}
+  .astra-chip {display:inline-block; padding:2px 10px; border-radius:11px;
+      font-size:.72rem; font-weight:700; letter-spacing:.4px;}
+  .astra-note {background:#fff8e1; border-left:4px solid #f0a202; color:#4a3b00;
+      padding:7px 12px; border-radius:5px; font-size:.8rem; margin:6px 0 12px 0;}
+  .case-card {border:1px solid rgba(140,140,140,.28); border-left-width:5px;
+      border-radius:7px; padding:9px 11px; margin-bottom:2px;}
+  .case-title {font-weight:640; font-size:.93rem; line-height:1.3;}
+  .case-meta {font-size:.76rem; opacity:.72;}
+  .case-sig {font-size:.79rem; margin-top:3px;}
+  .sig-box {border-left:4px solid #999; border-radius:5px; padding:8px 12px;
+      margin:7px 0; background:rgba(128,128,128,.08);}
+  .kv {font-size:.79rem; opacity:.85;}
+  .pipe {text-align:center; font-size:.85rem; opacity:.7; margin:3px 0;}
+  div[data-testid="stMetricValue"] {font-size:1.45rem;}
+  section[data-testid="stSidebar"] {width: 320px !important;}
+</style>
+"""
 
 
-@st.cache_data(ttl=60)
-def load_all():
-    flags = db.load_flags()
-    works = db.read_df("works")
-    flows = db.read_df("fundflows")
-    return flags, works, flows
+# ------------------------------------------------------------------ data
+
+@st.cache_data(ttl=120, show_spinner=False)
+def get_facets():
+    return db.flag_facets()
 
 
-@st.cache_data(ttl=60)
-def load_ingest_meta():
-    """Dual-mode ingestion provenance: which source produced this batch."""
+@st.cache_data(ttl=120, show_spinner=False)
+def get_ingest_meta():
     p = PROCESSED_DIR / "ingest_meta.json"
     meta = json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
     prov = db.load_provenance()
     return meta, prov
 
 
-def risk_badge(score: float, alert: bool) -> str:
-    color = "#d62728" if score >= 65 else "#ff7f0e" if score >= 40 else "#e6b800"
-    tag = " · ALERT" if alert else ""
-    return (f"<span style='background:{color};color:white;padding:2px 10px;"
-            f"border-radius:12px;font-weight:600'>risk {score:.0f}/100{tag}</span>")
+@st.cache_data(ttl=120, show_spinner=False)
+def get_run_meta():
+    p = PROCESSED_DIR / "run_meta.json"
+    return json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
 
 
-def review_badge(status: str) -> str:
-    color = {"pending": "#6c757d", "under_review": "#0d6efd",
-             "confirmed": "#d62728", "false_positive": "#198754"}.get(status, "#6c757d")
-    label = {"pending": "HUMAN REVIEW REQUIRED", "under_review": "UNDER REVIEW",
-             "confirmed": "CONFIRMED BY AUTHORITY", "false_positive": "MARKED FALSE-POSITIVE"}[status]
-    return (f"<span style='border:1px solid {color};color:{color};padding:2px 10px;"
-            f"border-radius:12px;font-size:0.8em;font-weight:600'>{label}</span>")
+@st.cache_data(ttl=120, show_spinner=False)
+def get_corpus_stats():
+    with db.connect() as con:
+        works = con.execute("SELECT COUNT(*) FROM works").fetchone()[0]
+        states = con.execute(
+            "SELECT COUNT(DISTINCT state) FROM works WHERE state IS NOT NULL").fetchone()[0]
+        districts = con.execute(
+            "SELECT COUNT(DISTINCT district) FROM works WHERE district IS NOT NULL").fetchone()[0]
+    return {"works": works, "states": states, "districts": districts}
 
 
-def render_flag(f: dict, tier: str):
-    with st.container(border=True):
-        c1, c2 = st.columns([4, 1])
-        with c1:
-            st.markdown(f"**{f['entity_label']}**  \n"
-                        f"{f['state'] or ''} · {f['district'] or ''} · era: `{f['era']}`")
-        with c2:
-            st.markdown(risk_badge(f["risk_score"], f["alert"]) + "<br>" +
-                        review_badge(f["review_status"]), unsafe_allow_html=True)
-
-        st.markdown(f"**{TIER_LABELS[tier]} briefing** *(orchestrator-synthesized for this tier)*")
-        st.info(f["tier_views"].get(tier, f["narrative"]))
-
-        with st.expander("🔗 Causal narrative & evidence chain (all agents)"):
-            st.write(f["narrative"])
-            for fd in f["findings"]:
-                sev = fd["severity"]
-                st.markdown(
-                    f"<div style='border-left:4px solid {SEV_COLOR[sev]};padding:4px 10px;margin:6px 0'>"
-                    f"<b>{fd['rule_id']}</b> — {fd['rule_title']} "
-                    f"<span style='color:{SEV_COLOR[sev]}'>[{sev}]</span> · agent: <i>{fd['agent']}</i><br>"
-                    f"{fd['summary']}<br>"
-                    + (f"<small>📜 {fd['clause']}</small>" if fd.get("clause") else "")
-                    + "</div>", unsafe_allow_html=True)
-
-        with st.expander("🪞 Same flag, other authority framings (synthesis demo)"):
-            for t, label in TIER_LABELS.items():
-                if t != tier:
-                    st.markdown(f"**{label}:** {f['tier_views'].get(t, '—')}")
-
-        fc1, fc2, fc3 = st.columns(3)
-        if fc1.button("✅ Confirm — escalate", key=f"c_{tier}_{f['flag_id']}"):
-            db.record_feedback(f["flag_id"], "confirmed", tier)
-            st.cache_data.clear(); st.rerun()
-        if fc2.button("🟢 False positive", key=f"fp_{tier}_{f['flag_id']}"):
-            db.record_feedback(f["flag_id"], "false_positive", tier,
-                               "authority review: not a genuine risk")
-            st.cache_data.clear(); st.rerun()
-        if fc3.button("🔎 Mark under review", key=f"ur_{tier}_{f['flag_id']}"):
-            db.record_feedback(f["flag_id"], "under_review", tier)
-            st.cache_data.clear(); st.rerun()
+@st.cache_data(ttl=60, show_spinner=False)
+def cached_query(**kw):
+    return db.query_flags(**kw)
 
 
-def main():
-    st.markdown(
-        f"<div style='background:#0b3d91;color:white;padding:14px 20px;border-radius:8px'>"
-        f"<span style='font-size:1.6em;font-weight:700'>🛰️ {PLATFORM_NAME}</span> "
-        f"<span style='opacity:.85'>· {PLATFORM_TAGLINE}</span><br>"
-        f"<small>⚖️ {HUMAN_REVIEW_DISCLAIMER}</small></div>",
-        unsafe_allow_html=True)
+@st.cache_data(ttl=60, show_spinner=False)
+def cached_count(**kw):
+    return db.count_flags(**kw)
 
-    meta, prov = load_ingest_meta()
+
+@st.cache_data(ttl=120, show_spinner=False)
+def cached_state_summary():
+    return db.state_risk_summary()
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def cached_district_summary(state):
+    return db.district_risk_summary(state)
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def cached_stats(**kw):
+    return db.flag_stats(**kw)
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def cached_rules_scoped(**kw):
+    return db.rule_histogram_scoped(**kw)
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def work_row(work_id: str):
+    df = db.read_df("works", "work_id = ?", (work_id,))
+    return df.iloc[0].to_dict() if not df.empty else None
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def agency_works(agency: str, limit: int = 40):
+    df = db.read_df("works", "UPPER(ia_name) = ? OR UPPER(vendor_name) = ?",
+                    (agency.upper(), agency.upper()))
+    return df.head(limit)
+
+
+def refresh():
+    st.cache_data.clear()
+
+
+# ------------------------------------------------------------------ ui bits
+
+def chip(text: str, bg: str, fg: str = "#fff") -> str:
+    return f"<span class='astra-chip' style='background:{bg};color:{fg}'>{text}</span>"
+
+
+def status_chip(status: str) -> str:
+    label, color = STATUS_META.get(status, ("NEW", "#5d6d7e"))
+    return chip(label, color)
+
+
+def header(meta: dict):
     mode = (meta.get("mode_resolved") or "unknown").upper()
     fresh = meta.get("freshness") or {}
-    badge_bg = "#0f7b3f" if mode == "LIVE" else "#1f4e8c"
-    fresh_txt = ""
+    mode_bg = {"LIVE": "#1e8449", "OFFLINE": "#2471a3"}.get(mode, "#5d6d7e")
+    sub = chip(f"{mode} MODE", mode_bg)
     if fresh.get("coverage_pct") is not None:
-        fresh_txt = (f" &nbsp;|&nbsp; <b>{fresh['coverage_pct']}%</b> of the live "
-                     f"eSAKSHI portal's {fresh['live_recommended_works']:,} recommended "
-                     f"works ({fresh.get('tenure', '')}) — verified live at run time")
+        sub += (f"&nbsp;&nbsp;<span style='font-size:.82rem'>"
+                f"<b>{fresh['coverage_pct']}%</b> current against the live MoSPI "
+                f"portal · {fresh.get('tenure', '')}</span>")
     st.markdown(
-        f"<div style='background:#eef2f7;color:#12263f;border-left:5px solid {badge_bg};"
-        f"padding:8px 14px;margin:8px 0;border-radius:4px;font-size:0.92em'>"
-        f"<b>Data source:</b> <span style='background:{badge_bg};color:white;"
-        f"padding:1px 8px;border-radius:10px'>{mode} MODE</span>{fresh_txt}</div>",
+        f"<div class='astra-head'><h1>🛰️ {PLATFORM_NAME}"
+        f"<span style='font-weight:400;font-size:.95rem;opacity:.9'> · AI-Powered "
+        f"MPLADS Risk Intelligence Platform</span></h1>"
+        f"<div class='sub'>{sub}</div></div>", unsafe_allow_html=True)
+    st.markdown(
+        "<div class='astra-note'>⚖️ <b>Decision-support system.</b> Every case below "
+        "is an AI-generated risk indicator requiring review by the competent "
+        "authority. Nothing here is a determination of fraud or wrongdoing.</div>",
         unsafe_allow_html=True)
 
-    flags, works, flows = load_all()
-    if not flags:
-        st.warning("No flags in the database yet. Run: `python scripts/fetch_data.py` "
-                   "then `python -m astra.pipeline`.")
+
+def case_card_html(f: dict) -> str:
+    band, color = risk_band(f["risk_score"])
+    title = f.get("display_title") or (f.get("entity_label") or "")[:60]
+    loc = " · ".join(x for x in (f.get("district"), f.get("state")) if x)
+    score = f"{f['risk_score']:.0f}"
+    # the trailing serial distinguishes otherwise-identical duplicate records
+    ref = str(f.get("entity_id") or "")
+    ref = ref.rsplit("/", 1)[-1] if "/" in ref else ref[:14]
+    return (
+        f"<div class='case-card' style='border-left-color:{color}'>"
+        f"<div style='display:flex;justify-content:space-between;align-items:center'>"
+        f"{chip(f'{band.upper()} · {score}', color)}"
+        f"{status_chip(f['review_status'])}</div>"
+        f"<div class='case-title' style='margin-top:5px'>{title}</div>"
+        f"<div class='case-meta'>{loc} &nbsp;·&nbsp; <code>#{ref}</code></div>"
+        f"<div class='case-sig'>▸ {f.get('primary_signal') or ''}</div></div>")
+
+
+# ------------------------------------------------------------------ overview
+
+def overview(tier: str, scope: dict, corpus: dict):
+    st.markdown(f"#### {TIERS[tier][0]} {TIERS[tier][1]} — risk overview")
+    st.caption(TIERS[tier][2])
+
+    stats = cached_stats(**scope)
+    c = st.columns(5)
+    c[0].metric("Works analysed", f"{corpus['works']:,}",
+                help="Official MPLADS work records in the analysed corpus")
+    c[1].metric("Cases in your view", f"{stats['total']:,}")
+    c[2].metric("High risk", f"{stats['high']:,}",
+                help="Composite risk score of 70 or above")
+    c[3].metric("Under review", f"{stats['under_review']:,}")
+    c[4].metric("Reviewed / closed", f"{stats['closed']:,}")
+
+    if not stats["total"]:
+        st.info("No cases in the current scope.")
         return
 
-    st.sidebar.title("Authority sign-in")
-    tier = st.sidebar.radio("View as", list(TIER_LABELS), format_func=lambda t: TIER_LABELS[t])
-    st.sidebar.caption("Demo role-switcher. Stage-2 roadmap: full RBAC with "
-                       "eSAKSHI SSO + audit logging.")
-
-    df = pd.DataFrame([{k: f[k] for k in
-                        ("flag_id", "entity_type", "entity_label", "state", "district",
-                         "constituency", "era", "risk_score", "alert", "review_status")}
-                       for f in flags])
-
-    # ---- tier scoping ----
-    scoped = flags
-    if tier == "mp":
-        opts = sorted(df["constituency"].dropna().unique().tolist())
-        sel = st.sidebar.selectbox("Your constituency", opts) if opts else None
-        scoped = [f for f in flags if f["constituency"] == sel] if sel else []
-        if not opts:
-            st.sidebar.info("No constituency-attributed flags in this batch — "
-                            "showing none (MPs see only their own constituency).")
-    elif tier == "district":
-        opts = sorted(df["district"].dropna().unique().tolist())
-        sel = st.sidebar.selectbox("Your district", opts) if opts else None
-        scoped = [f for f in flags if f["district"] == sel] if sel else flags
-    elif tier == "state":
-        opts = sorted(df["state"].dropna().unique().tolist())
-        sel = st.sidebar.selectbox("Your state", opts) if opts else None
-        scoped = [f for f in flags if f["state"] == sel] if sel else flags
-
-    min_score = st.sidebar.slider("Min risk score", 0, 100, 0, 5)
-    only_alerts = st.sidebar.checkbox("Alerts only (crossed review threshold)")
-    scoped = [f for f in scoped if f["risk_score"] >= min_score and (f["alert"] or not only_alerts)]
-
-    m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("Works analyzed", f"{len(works):,}")
-    m2.metric("Fund-flow rows", f"{len(flows):,}")
-    m3.metric("Flags (this view)", len(scoped))
-    m4.metric("High-risk alerts", sum(1 for f in scoped if f["alert"]))
-    fb = db.feedback_stats()
-    m5.metric("Human reviews logged", int(fb["n"].sum()) if not fb.empty else 0)
-
-    tabs = st.tabs(["🚩 Flagged cases", "🗺️ Map & duplicates", "📊 Patterns",
-                    "🕸️ Vendor network", "🤖 Orchestration trace",
-                    "🔌 Data source", "ℹ️ Method"])
-
-    with tabs[0]:
+    left, right = st.columns([1.15, 1])
+    with left:
         if tier == "ministry":
-            st.subheader("National exception overview")
-            by_state = df.groupby("state", dropna=False)["flag_id"].count().sort_values(ascending=False)
-            st.bar_chart(by_state, height=220)
-        for f in scoped[:40]:
-            render_flag(f, tier)
-        if len(scoped) > 40:
-            st.caption(f"Showing top 40 of {len(scoped)} by risk score.")
-        if not scoped:
-            st.success("No flags in scope for this authority view.")
-
-    with tabs[1]:
-        st.subheader("Geospatial view — flagged works & duplicate clusters")
-        rows = []
-        for f in scoped:
-            lat = lon = None
-            # exact coordinates when the source provides them; state centroid fallback
-            w = works[works["work_id"] == f["entity_id"]] if not works.empty else pd.DataFrame()
-            if not w.empty and pd.notna(w.iloc[0].get("lat")):
-                lat, lon = float(w.iloc[0]["lat"]), float(w.iloc[0]["lon"])
-                precise = True
+            st.markdown("**States by high-risk cases**")
+            summ = cached_state_summary()
+            if scope.get("states"):
+                summ = summ[summ["state"].isin(scope["states"])]
+            chart = summ.head(10).set_index("state")[["high_risk", "flags"]]
+            chart.columns = ["High risk", "All cases"]
+            st.bar_chart(chart, height=290, horizontal=True)
+        elif tier == "state":
+            st.markdown("**Districts by high-risk cases**")
+            sel = (scope.get("states") or [None])[0]
+            summ = cached_district_summary(sel)
+            if summ.empty:
+                st.caption("No district-level cases in this state.")
             else:
-                cen = STATE_CENTROIDS.get(str(f["state"] or "").upper())
-                if cen:
-                    import hashlib as _h
-                    jseed = int(_h.sha1(f["flag_id"].encode()).hexdigest()[:6], 16)
-                    lat = cen[0] + ((jseed % 100) - 50) / 90.0
-                    lon = cen[1] + (((jseed // 100) % 100) - 50) / 90.0
-                    precise = False
-            if lat is not None:
-                dup = any(fd["rule_id"].startswith("D-") for fd in f["findings"])
-                rows.append({"lat": lat, "lon": lon, "risk": f["risk_score"],
-                             "label": f["entity_label"][:60], "dup": dup,
-                             "precise": precise})
-        if rows:
-            mdf = pd.DataFrame(rows)
-            mdf["radius"] = 3000 + mdf["risk"] * 400
-            mdf["r"] = mdf["dup"].map({True: 214, False: 255})
-            mdf["g"] = mdf["dup"].map({True: 39, False: 127})
-            mdf["b"] = mdf["dup"].map({True: 40, False: 14})
+                chart = summ.head(10).set_index("district")[["high_risk", "flags"]]
+                chart.columns = ["High risk", "All cases"]
+                st.bar_chart(chart, height=290, horizontal=True)
+        else:
+            st.markdown("**Risk distribution in your view**")
+            bands = pd.Series(stats["bands"])
+            bands = bands[bands > 0]
+            if bands.empty:
+                st.caption("No cases in scope.")
+            else:
+                st.bar_chart(bands, height=290, color="#c0392b")
+
+    with right:
+        st.markdown("**What is being detected**")
+        hist = cached_rules_scoped(**scope)
+        # Fall back to the rule's configured title so a detection never shows as
+        # a bare rule id just because it is absent from the sampled cases.
+        names: dict[str, str] = {c["rule_id"]: c["title"]
+                                 for c in get_run_meta().get("rule_coverage", [])}
+        for r in cached_query(limit=120, order="risk", **scope):
+            for fd in r["findings"]:
+                names[fd["rule_id"]] = humanize(fd)["headline"]
+        if hist:
+            top = sorted(hist.items(), key=lambda kv: -kv[1])[:8]
+            det = pd.DataFrame({
+                "Detection": [names.get(k, k)[:52] for k, _ in top],
+                "Cases": [v for _, v in top],
+            })
+            st.dataframe(
+                det, hide_index=True, height=290, use_container_width=True,
+                column_config={"Cases": st.column_config.ProgressColumn(
+                    "Cases", format="%d", min_value=0,
+                    max_value=int(det["Cases"].max()))})
+        else:
+            st.caption("No detections in scope.")
+
+    if tier == "ministry":
+        st.markdown("**Geographic concentration** — state-level aggregate")
+        summ = cached_state_summary()
+        pts = []
+        for _, r in summ.iterrows():
+            cen = STATE_CENTROIDS.get(str(r["state"]).upper())
+            if cen:
+                pts.append({"lat": cen[0], "lon": cen[1], "state": r["state"],
+                            "high_risk": int(r["high_risk"]), "flags": int(r["flags"]),
+                            "radius": 18000 + int(r["high_risk"]) * 320})
+        if pts:
             import pydeck as pdk
-            layer = pdk.Layer(
-                "ScatterplotLayer", data=mdf, get_position="[lon, lat]",
-                get_radius="radius", get_fill_color="[r, g, b, 170]",
-                pickable=True)
+            mdf = pd.DataFrame(pts)
             st.pydeck_chart(pdk.Deck(
-                map_style=None, layers=[layer],
-                initial_view_state=pdk.ViewState(latitude=22.5, longitude=80, zoom=3.6),
-                tooltip={"text": "{label}\nrisk {risk}"}))
-            if not mdf["precise"].all():
-                st.caption("⚠️ Positions without source lat/long are placed near their state "
-                           "centroid (jittered) for overview only — eSAKSHI asset geo-tags "
-                           "populate exact positions when present.")
-            st.markdown("🔴 red = duplicate-detection flag · 🟠 orange = other flags")
-        else:
-            st.info("No mappable flags in scope.")
-        dup_flags = [f for f in scoped
-                     if any(fd["rule_id"].startswith("D-") for fd in f["findings"])]
-        if dup_flags:
-            st.subheader(f"Duplicate / near-duplicate pairs ({len(dup_flags)})")
-            for f in dup_flags[:15]:
-                fd = next(x for x in f["findings"] if x["rule_id"].startswith("D-"))
-                st.markdown(
-                    f"- **{f['entity_id']}** ↔ **{fd['details'].get('pair_work_id')}** — "
-                    f"sim {fd['details'].get('semantic_sim')} · mode: "
-                    f"*{fd['details'].get('duplication_mode')}*  \n"
-                    f"  \"{fd['details'].get('this_description','')[:100]}…\" vs "
-                    f"\"{fd['details'].get('other_description','')[:100]}…\"")
+                map_style=None,
+                initial_view_state=pdk.ViewState(latitude=22.8, longitude=80, zoom=3.4),
+                layers=[pdk.Layer("ScatterplotLayer", data=mdf,
+                                  get_position="[lon, lat]", get_radius="radius",
+                                  get_fill_color="[192, 57, 43, 150]", pickable=True)],
+                tooltip={"text": "{state}\n{high_risk} high-risk of {flags} cases"}))
+            st.caption("Bubbles sit at state centroids and are sized by high-risk case "
+                       "count. The eSAKSHI exports contain no asset coordinates, so no "
+                       "work-level position is shown or implied.")
 
-    with tabs[2]:
-        st.subheader("Pattern analytics" + (" — era-aware" if "era" in df else ""))
+
+# ------------------------------------------------------------------ detail tabs
+
+def agent_pipeline_view(brief: dict, score: float):
+    st.markdown("##### How the system reached this assessment")
+    st.caption("Each agent works independently. The orchestrator combines their "
+               "findings into one score and one recommendation.")
+    for s in brief["signals"]:
+        color = SEV_COLOR.get(s["severity"], "#777")
+        badge = chip(f"+{s['contribution']} risk · {s['share_pct']}%", color)
+        st.markdown(
+            f"<div class='sig-box' style='border-left-color:{color}'>"
+            f"<div style='display:flex;justify-content:space-between'>"
+            f"<b>{s['agent_label']}</b>{badge}</div>"
+            f"<div style='font-size:.78rem;opacity:.7'>{AGENT_ROLE.get(s['agent'], '')}</div>"
+            f"<div style='font-weight:600;margin-top:4px'>→ {s['headline']}</div>"
+            f"<div class='kv' style='margin-top:3px'>Measured: <b>{s['metric'] or '—'}</b>"
+            f" &nbsp;·&nbsp; Compared with: <b>{s['benchmark'] or '—'}</b></div></div>",
+            unsafe_allow_html=True)
+    band, color = risk_band(score)
+    st.markdown(
+        f"<div class='pipe'>▼</div>"
+        f"<div style='text-align:center;border:1.5px dashed {color};border-radius:8px;"
+        f"padding:9px'><b>SYNTHESISER / ORCHESTRATOR</b><br>"
+        f"<span style='font-size:.82rem;opacity:.85'>{brief['corroboration']}</span></div>"
+        f"<div class='pipe'>▼</div>"
+        f"<div style='text-align:center;background:{color};color:#fff;border-radius:8px;"
+        f"padding:10px'><b>{band.upper()} · {score:.0f}/100 — HUMAN REVIEW REQUIRED</b></div>",
+        unsafe_allow_html=True)
+
+
+def tab_why(f: dict, brief: dict, tier: str):
+    band, color = risk_band(f["risk_score"])
+    st.markdown("##### Why this case needs attention")
+    st.markdown(
+        f"<div class='sig-box' style='border-left-color:{color};"
+        f"background:rgba(192,57,43,.10)'>"
+        f"<div style='font-size:.72rem;letter-spacing:.5px;opacity:.75'>PRIMARY RISK</div>"
+        f"<b>{brief['primary_risk']}</b><br>"
+        f"<span style='font-size:.9rem'>{brief['primary_plain']}</span></div>",
+        unsafe_allow_html=True)
+
+    if len(brief["signals"]) > 1:
+        st.markdown("**Supporting signals**")
+        for s in brief["signals"][1:]:
+            st.markdown(
+                f"<div class='sig-box' style='border-left-color:"
+                f"{SEV_COLOR.get(s['severity'], '#777')}'>"
+                f"<b>{s['headline']}</b><br>"
+                f"<span style='font-size:.88rem'>{s['plain']}</span></div>",
+                unsafe_allow_html=True)
+    else:
+        st.caption("No additional corroborating signals were detected for this case.")
+
+    if brief.get("context_note"):
+        st.info(brief["context_note"])
+
+    st.markdown(f"##### Recommended action — {brief['tier_label']}")
+    for i, a in enumerate(brief["actions"], 1):
+        st.markdown(f"**{i}.** {a}")
+    st.caption(brief["closing"])
+    st.warning(f"⚖️ {brief['disclaimer']}")
+
+
+def tab_evidence(f: dict, brief: dict):
+    st.markdown("##### Evidence and measurements behind this flag")
+    st.caption("Exact values produced by each agent. Nothing on this tab is inferred.")
+    for s in brief["signals"]:
+        with st.expander(f"{s['rule_id']} · {s['headline']}   ({s['agent_label']})"):
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Measured", s["metric"] or "—")
+            c2.metric("Benchmark", s["benchmark"] or "—")
+            c3.metric("Risk contribution", f"+{s['contribution']}")
+            if s.get("clause"):
+                st.markdown(f"**Scheme provision cited:** {s['clause']}")
+            st.markdown(f"**Plain reading:** {s['plain']}")
+            raw = next((x for x in f["findings"] if x["rule_id"] == s["rule_id"]), None)
+            if raw:
+                st.markdown("**Technical detail (audit trail)**")
+                st.code(raw["summary"], language=None)
+                if raw.get("details"):
+                    st.json(raw["details"], expanded=False)
+
+
+def tab_case(f: dict, w: dict | None):
+    st.markdown("##### Work record")
+    if w is None:
+        st.info(f"This case is a **{f['entity_type']}-level** finding rather than a "
+                f"single work record.")
+        st.markdown(f"**Entity**  \n{f['entity_label']}")
+        st.markdown(f"**Location**  \n{f.get('district') or '—'}, {f.get('state') or '—'}")
+        return
+    left, right = st.columns(2)
+    with left:
+        st.markdown(f"**Full description**  \n{w.get('description') or '—'}")
+        st.markdown(f"**Work code**  \n`{f['entity_id']}`")
+        st.markdown(f"**Work type**  \n{w.get('category') or '—'}")
+    with right:
+        st.markdown(f"**Location**  \n{w.get('district') or '—'}, {w.get('state') or '—'}")
+        st.markdown(f"**Constituency / MP**  \n{w.get('constituency') or '—'} · "
+                    f"{w.get('mp_name') or '—'}")
+        st.markdown(f"**Implementing agency**  \n{w.get('ia_name') or '—'}")
+    st.divider()
+    m = st.columns(4)
+    m[0].metric("Sanctioned", rupees(w.get("sanctioned_amount"))
+                if pd.notna(w.get("sanctioned_amount")) else "Not yet sanctioned")
+    m[1].metric("Recommended", rupees(w.get("estimated_cost")))
+    m[2].metric("Paid to date", rupees(w.get("total_paid"))
+                if pd.notna(w.get("total_paid")) else "None recorded")
+    m[3].metric("Workflow stage", str(w.get("status") or "—"))
+    d = st.columns(4)
+    d[0].markdown(f"**Recommended on**  \n{w.get('recommended_date') or '—'}")
+    d[1].markdown(f"**Sanctioned on**  \n{w.get('sanction_date') or '—'}")
+    d[2].markdown(f"**Completed on**  \n{w.get('completion_date') or 'Not recorded'}")
+    d[3].markdown(f"**Data era**  \n`{f.get('era')}`")
+    if pd.notna(w.get("vendor_name")):
+        st.markdown(f"**Vendor paid:** {str(w['vendor_name']).title()} · "
+                    f"{int(w.get('payment_count') or 0)} payment tranche(s)")
+
+
+def tab_duplicates(f: dict):
+    dups = [x for x in f["findings"] if x["rule_id"].startswith("D-")]
+    if not dups:
+        st.info("No duplicate-risk evidence was identified for this case.")
+        return
+    st.markdown("##### Possible repeat records")
+    st.caption("Approval checks review one work at a time, so the same work entered "
+               "twice is not caught by the normal workflow. These are candidates for "
+               "verification, not confirmed duplicates.")
+    for d in dups:
+        det = d["details"]
+        if d["rule_id"] == "D-DUP-02":
+            st.markdown(f"**Shared-description cluster** — {det.get('cluster_size')} "
+                        f"works in {det.get('district')} totalling "
+                        f"{rupees(det.get('total_cost'))}")
+            st.code(det.get("normalised_description", ""), language=None)
+            st.markdown("Member works: " + ", ".join(
+                f"`{w}`" for w in (det.get("member_work_ids") or [])[:8]))
+            st.divider()
+            continue
         c1, c2 = st.columns(2)
-        with c1:
-            st.markdown("**Findings by rule**")
-            rule_counts: dict[str, int] = {}
-            for f in scoped:
-                for fd in f["findings"]:
-                    rule_counts[f"{fd['rule_id']} {fd['rule_title'][:30]}"] = \
-                        rule_counts.get(f"{fd['rule_id']} {fd['rule_title'][:30]}", 0) + 1
-            if rule_counts:
-                st.bar_chart(pd.Series(rule_counts).sort_values(), height=300)
-        with c2:
-            st.markdown("**Flags by data era** *(baselines are computed per era — the "
-                        "2023 eSAKSHI cutover never contaminates anomaly statistics)*")
-            era_counts = df["era"].value_counts()
-            st.bar_chart(era_counts, height=300)
+        c1.markdown(f"**This work** · `{f['entity_id']}`")
+        c1.info(det.get("this_description", "—"))
+        c2.markdown(f"**Matched work** · `{det.get('pair_work_id')}`")
+        c2.info(det.get("other_description", "—"))
+        s = st.columns(3)
+        s[0].metric("Description match", f"{det.get('semantic_sim', 0) * 100:.0f}%")
+        s[1].metric("Same sanction amount",
+                    "Yes" if det.get("same_sanction_amount") else "No")
+        s[2].metric("Evidence strength", str(det.get("evidence_strength", "—")).title())
+        st.markdown(f"**Pattern:** {det.get('duplication_mode', '—')}")
+        if det.get("geo_km") is not None:
+            st.markdown(f"**Distance between assets:** {det['geo_km']} km")
+        else:
+            st.caption("Proximity is assessed at district level — this eSAKSHI export "
+                       "carries no asset coordinates.")
+        st.divider()
 
+
+def tab_network(f: dict, w: dict | None):
+    agency = None
+    if f["entity_type"] == "agency":
+        agency = f["entity_id"].split(":", 1)[-1]
+    elif w is not None:
+        agency = w.get("ia_name")
+    if not agency or pd.isna(agency):
+        st.info("No contractor or agency information is available for this case.")
+        return
+
+    st.markdown(f"##### Agency / contractor context — {str(agency).title()}")
+    net_f = [x for x in f["findings"] if x["agent"] == "network"]
+    if net_f:
+        d = net_f[0]["details"]
+        m = st.columns(4)
+        m[0].metric("Works", f"{d.get('works', 0):,}")
+        m[1].metric("Districts", d.get("districts", 0))
+        m[2].metric("States", d.get("states", 0))
+        m[3].metric("Above-benchmark share", f"{d.get('overrun_share', 0) * 100:.0f}%")
+        if d.get("likely_national_supplier"):
+            st.info("This actor supplies items (vehicles, books, equipment) that are "
+                    "commonly procured nationally, so operating across many districts "
+                    "is expected — the signal is deliberately down-weighted.")
+        if d.get("district_list"):
+            st.markdown("**Districts covered:** " + ", ".join(d["district_list"]))
+    else:
+        st.caption("This agency did not itself trigger a network-pattern signal. "
+                   "Its other works are listed below for context.")
+
+    rel = agency_works(str(agency))
+    if rel.empty:
+        st.caption("No other works by this agency were found in the corpus.")
+        return
+    st.markdown(f"**Other works by this agency** ({len(rel)} shown)")
+    show = rel[["work_id", "district", "category", "sanctioned_amount", "status"]].copy()
+    show.columns = ["Work code", "District", "Work type", "Sanctioned (₹)", "Stage"]
+    st.dataframe(show, use_container_width=True, height=250, hide_index=True)
+
+
+def tab_trace():
+    run = get_run_meta()
+    st.markdown("##### Which agents ran on this batch, and why")
+    st.caption("The orchestrator dispatches only agents whose required inputs exist "
+               "in the current data, and records that decision.")
+    for t in run.get("router_trace", []):
+        icon = "🟢" if t["dispatched"] else "⚪"
+        detail = (f"produced **{t.get('findings', 0):,} findings**"
+                  if t["dispatched"] else t["reason"])
+        st.markdown(f"{icon} **{AGENT_LABEL.get(t['agent'], t['agent'])}** — {detail}")
+
+    cov = run.get("rule_coverage", [])
+    if not cov:
+        return
+    st.markdown("##### Rule coverage across the whole batch")
+    cdf = pd.DataFrame(cov)[["rule_id", "title", "findings"]]
+    cdf.columns = ["Rule", "Check", "Cases found"]
+    st.dataframe(cdf, use_container_width=True, height=250, hide_index=True)
+    zero = [c["rule_id"] for c in cov if c["findings"] == 0]
+    if zero:
+        st.caption("Rules reporting zero are shown deliberately: " + ", ".join(zero) +
+                   " found no matches — either the corpus is clean on that check, or "
+                   "this data source lacks the inputs the rule requires.")
+
+
+def tab_source():
+    meta, prov = get_ingest_meta()
+    fresh = meta.get("freshness") or {}
+    st.markdown("##### Where this data came from")
+    c = st.columns(3)
+    c[0].metric("Resolved mode", (meta.get("mode_resolved") or "—").upper())
+    c[1].metric("Works ingested", f"{meta.get('works', 0):,}")
+    c[2].metric("Fund-flow records", f"{meta.get('fundflows', 0):,}")
+    if fresh:
+        st.success(
+            f"**Live check against mplads.mospi.gov.in** — this batch holds "
+            f"{fresh['local_recommended_works']:,} recommended works; the official "
+            f"portal reported {fresh['live_recommended_works']:,} when queried at "
+            f"{fresh['checked_at'][:16]}Z. That is **{fresh['coverage_pct']}% "
+            f"coverage** ({fresh.get('tenure')}).")
+    if not prov.empty:
+        show = prov[["source", "mode", "rows", "status"]].copy()
+        show.columns = ["Source", "Mode", "Rows", "Status"]
+        st.dataframe(show, use_container_width=True, hide_index=True, height=230)
+    st.caption("Dual-mode ingestion: live official interfaces are attempted under a "
+               "strict time budget, and the official CSV exports supply the corpus "
+               "when live access is slow, partial or unavailable — so a government "
+               "endpoint being down can never block the platform.")
+
+
+def review_controls(f: dict, tier: str):
+    st.markdown("##### Human review decision")
+    cur = f["review_status"]
+    flow = {"pending": "NEW", "under_review": "UNDER REVIEW",
+            "confirmed": "ESCALATED", "false_positive": "CLOSED · FALSE POSITIVE"}
+    st.markdown("Workflow: " + "  →  ".join(
+        f"**{v}**" if k == cur else f"<span style='opacity:.4'>{v}</span>"
+        for k, v in flow.items()), unsafe_allow_html=True)
+
+    note = st.text_input("Reviewer note (optional)", key=f"note_{f['flag_id']}",
+                         placeholder="Record what you verified…")
+    c1, c2, c3 = st.columns(3)
+    if c1.button("🔎 Mark under review", key=f"ur_{f['flag_id']}",
+                 use_container_width=True):
+        db.record_feedback(f["flag_id"], "under_review", tier, note)
+        refresh(); st.rerun()
+    if c2.button("⬆️ Escalate for action", key=f"cf_{f['flag_id']}",
+                 use_container_width=True, type="primary"):
+        db.record_feedback(f["flag_id"], "confirmed", tier, note)
+        refresh(); st.rerun()
+    if c3.button("✅ Close as false positive", key=f"fp_{f['flag_id']}",
+                 use_container_width=True):
+        db.record_feedback(f["flag_id"], "false_positive", tier,
+                           note or "authority review: not a genuine risk")
+        refresh(); st.rerun()
+    st.caption("The authority decides the outcome — ASTRA only prioritises what to "
+               "look at. False-positive decisions are recorded and feed threshold "
+               "recalibration. Persistence in this build is local to the demo database.")
+
+
+def detail_panel(f: dict, tier: str):
+    brief = (f.get("tier_briefs") or {}).get(tier) or {}
+    if not brief:
+        st.warning("No authority brief stored for this case. Re-run "
+                   "`python scripts/run_pipeline.py`.")
+        return
+    band, color = risk_band(f["risk_score"])
+    w = work_row(f["entity_id"]) if f["entity_type"] == "work" else None
+    score = f"{f['risk_score']:.0f}"
+
+    st.markdown(
+        f"<div style='display:flex;justify-content:space-between;align-items:flex-start'>"
+        f"<div><div style='font-size:1.1rem;font-weight:680;line-height:1.3'>"
+        f"{f.get('display_title') or f['entity_label']}</div>"
+        f"<div style='font-size:.79rem;opacity:.72;margin-top:2px'>"
+        f"<code>{f['entity_id']}</code> · {f.get('district') or '—'}, "
+        f"{f.get('state') or '—'}</div></div>"
+        f"<div style='text-align:right;white-space:nowrap'>"
+        f"{chip(f'{band.upper()} · {score}/100', color)}<br>"
+        f"<span style='display:inline-block;margin-top:4px'>"
+        f"{status_chip(f['review_status'])}</span></div></div>",
+        unsafe_allow_html=True)
+    st.caption(f"Viewing as **{brief.get('tier_label', tier)}** — {brief.get('lens', '')}")
+
+    tabs = st.tabs(["Why flagged", "Agent trace", "Evidence", "Work record",
+                    "Duplicates", "Agency network", "Pipeline", "Data source"])
+    with tabs[0]:
+        tab_why(f, brief, tier)
+        st.divider()
+        review_controls(f, tier)
+    with tabs[1]:
+        agent_pipeline_view(brief, f["risk_score"])
+    with tabs[2]:
+        tab_evidence(f, brief)
     with tabs[3]:
-        st.subheader("🕸️ Contractor / implementing-agency network signals")
-        st.caption("Same actor recurring across many districts, and actors whose "
-                   "works price above peer benchmarks. Screening signals for "
-                   "verification — never an allegation against a firm or officer.")
-        net = [f for f in scoped if f["entity_type"] == "agency"]
-        if not net:
-            net = [f for f in flags if f["entity_type"] == "agency"]
-            if net:
-                st.info("No network signals inside the current filter — showing all "
-                        "network signals in the batch.")
-        if net:
-            rows = []
-            for f in net:
-                fd = next((x for x in f["findings"] if x["agent"] == "network"), None)
-                if not fd:
-                    continue
-                d = fd["details"]
-                rows.append({
-                    "actor": str(d.get("actor", ""))[:44].title(),
-                    "type": d.get("actor_type"),
-                    "works": d.get("works"),
-                    "districts": d.get("districts"),
-                    "states": d.get("states"),
-                    "overrun share": d.get("overrun_share"),
-                    "value (Rs)": d.get("total_value"),
-                    "national supplier?": d.get("likely_national_supplier"),
-                    "severity": fd["severity"],
-                    "risk": f["risk_score"],
-                })
-            ndf = pd.DataFrame(rows).sort_values(
-                ["overrun share", "districts"], ascending=False)
-            st.dataframe(ndf, use_container_width=True, height=420)
-            st.caption("‘national supplier?’ marks actors whose work types (vehicles, "
-                       "books, equipment) make wide district coverage legitimate — "
-                       "these are deliberately down-weighted to avoid false positives.")
-        else:
-            st.info("No vendor/agency network signals in this batch.")
-
+        tab_case(f, w)
     with tabs[4]:
-        st.subheader("🤖 Why each agent ran — orchestrator routing trace")
-        st.caption("The orchestrator dispatches only agents whose declared inputs exist in "
-                   "the current batch (dynamic conditional routing, LangGraph-style), and "
-                   "records the decision.")
-        meta_p = PROCESSED_DIR / "run_meta.json"
-        if meta_p.exists():
-            # distinct name: `meta` holds the INGESTION metadata used by later tabs
-            run_meta = json.loads(meta_p.read_text(encoding="utf-8"))
-            st.write(f"Last pipeline run: `{run_meta['ran_at']}` — "
-                     f"{run_meta['flags_produced']} flags")
-            for t in run_meta["router_trace"]:
-                icon = "🟢" if t["dispatched"] else "⚪"
-                extra = f" → **{t.get('findings', 0)} findings**" if t["dispatched"] else ""
-                st.markdown(f"{icon} `{t['agent']}` — {t['reason']}{extra}")
-        if meta_p.exists():
-            cov = json.loads(meta_p.read_text(encoding="utf-8")).get("rule_coverage", [])
-            if cov:
-                st.subheader("📋 Rule coverage — including rules that matched nothing")
-                st.caption("A rule evaluating to zero is a real result: either the "
-                           "corpus is clean on that check, or the rule stood down "
-                           "because this data source lacks the inputs it requires. "
-                           "ASTRA reports that rather than guessing.")
-                cdf = pd.DataFrame(cov)[["rule_id", "title", "findings"]]
-                st.dataframe(cdf, use_container_width=True, height=300)
-
-        fb = db.feedback_stats()
-        st.subheader("🔁 Human feedback loop")
-        if fb.empty:
-            st.caption("No review actions yet. Confirm / false-positive buttons on each flag "
-                       "feed this table; stage-2 uses FP rates to recalibrate rule thresholds.")
-        else:
-            st.dataframe(fb, use_container_width=True)
-
+        tab_duplicates(f)
     with tabs[5]:
-        st.subheader("🔌 Dual-mode ingestion — where this batch came from")
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Resolved mode", mode)
-        c2.metric("Works ingested", f"{meta.get('works', 0):,}")
-        c3.metric("Fund-flow rows", f"{meta.get('fundflows', 0):,}")
-        if fresh:
-            st.success(
-                f"**Live freshness check against mplads.mospi.gov.in:** this batch "
-                f"holds {fresh['local_recommended_works']:,} recommended works; the "
-                f"official portal reported {fresh['live_recommended_works']:,} at "
-                f"{fresh['checked_at'][:19]}Z — **{fresh['coverage_pct']}% coverage** "
-                f"({fresh.get('tenure')}). The portal was queried live during "
-                f"ingestion, so the corpus below is provably current government data.")
-        st.markdown("**Source ledger for this batch**")
-        if not prov.empty:
-            show = prov[["source", "mode", "table_name", "rows", "status", "detail"]]
-            st.dataframe(show, use_container_width=True, height=280)
-        st.markdown(f"""
-**How the router decides.** `auto` probes the live official interfaces under a
-strict time budget, then analyses the most complete authentic corpus available.
-The official CSV exports in `datasets/` are the full national record, so they
-supply the work corpus, while the live portal supplies the freshness check and
-the pre-2023 historical baseline. If those exports are absent, the router pulls
-work records live instead. A slow or unavailable government endpoint can never
-block the pipeline.
-
-- `--mode live`    — live interfaces only (proves the real-time path works)
-- `--mode offline` — official CSV exports only (deterministic, demo-safe)
-- `--mode auto`    — default; resilient, never blocked
-
-**Work eras in this batch:** {meta.get('eras', {})}
-**Fund-flow eras:** {meta.get('flow_eras', {})} — pre-2023 rows come from the
-live open-data interfaces, which is what makes the era-separated baselines real
-rather than hypothetical.
-""")
-
+        tab_network(f, w)
     with tabs[6]:
-        st.markdown(f"""
-**Data sources (live, free/open):** data.gov.in OGD API (MPLADS releases,
-expenditure, works — historical), MPLADS eSAKSHI public reports where
-available. Raw pulls cached under `data/raw/`.
+        tab_trace()
+    with tabs[7]:
+        tab_source()
 
-**Era handling:** every record is tagged `pre2023` / `post2023` around the
-eSAKSHI 2023-04 cutover; anomaly peer groups and expenditure baselines never
-straddle the boundary.
+    with st.expander("🪞 Compare — how the other authorities see this same case"):
+        st.caption("Same underlying flag and same evidence, reframed by the "
+                   "orchestrator for each audience. This is synthesis, not "
+                   "column-hiding.")
+        for t, (icon, label, _l) in TIERS.items():
+            if t == tier:
+                continue
+            b = (f.get("tier_briefs") or {}).get(t)
+            if not b:
+                continue
+            st.markdown(f"**{icon} {label}** — *{b['lens']}*")
+            st.markdown(f"{b['opening']} {b['primary_plain'][:180]}")
+            st.markdown(f"↳ *First action:* {b['actions'][0] if b['actions'] else '—'}")
 
-**Benchmarks:** cost anomalies score against the median of (state × category
-× era) peers — an *empirical Schedule-of-Rates proxy*. Official SoR tables
-drop into `data/sor/` when made available.
 
-**Agents:** Ingestion · Compliance (deterministic, clause-cited) · Statistical
-Anomaly (robust-z + IsolationForest) · Entity-Resolution (TF-IDF + fuzzy +
-geo) · Network (agency concentration) · **Orchestrator** (routing, scoring,
-causal narrative, tier synthesis).
+# ------------------------------------------------------------------ main
 
-**Roadmap (stage 2):** predictive delay forecasting, NL query interface, full
-RBAC + audit logging, OCR for scanned certificates, official SoR integration,
-threshold auto-recalibration from reviewer feedback.
+def main():
+    st.markdown(CSS, unsafe_allow_html=True)
+    meta, _prov = get_ingest_meta()
+    header(meta)
 
-⚖️ *{HUMAN_REVIEW_DISCLAIMER}*
-""")
+    facets = get_facets()
+    corpus = get_corpus_stats()
+    if facets["total"] == 0:
+        st.warning("No analysed cases yet. Run `python scripts/fetch_data.py` then "
+                   "`python scripts/run_pipeline.py`.")
+        return
+
+    sb = st.sidebar
+    sb.markdown("### Authority view")
+    tier = sb.radio("Signed in as", list(TIERS), index=0,
+                    label_visibility="collapsed",
+                    format_func=lambda t: f"{TIERS[t][0]}  {TIERS[t][1]}")
+    sb.caption(TIERS[tier][2])
+    sb.caption("Demo role switcher. Stage-2 roadmap: eSAKSHI SSO with full RBAC "
+               "and audit logging.")
+    sb.divider()
+
+    scope: dict = {}
+    if tier == "mp":
+        opts = facets["constituencies"]
+        if opts:
+            scope["constituencies"] = [sb.selectbox("Your constituency", opts)]
+    elif tier == "district":
+        opts = facets["districts"]
+        if opts:
+            scope["districts"] = [sb.selectbox("Your district", opts)]
+    elif tier == "state":
+        opts = facets["states"]
+        if opts:
+            scope["states"] = [sb.selectbox("Your state", opts)]
+    else:
+        sel = sb.multiselect("Filter states (optional)", facets["states"])
+        if sel:
+            scope["states"] = sel
+
+    sb.markdown("### Filters")
+    min_score = sb.slider("Minimum risk score", 0, 100, 0, 5)
+    statuses = sb.multiselect("Review status", list(STATUS_META),
+                              format_func=lambda s: STATUS_META[s][0])
+    run = get_run_meta()
+    rule_opts = [c["rule_id"] for c in run.get("rule_coverage", []) if c["findings"] > 0]
+    rules = sb.multiselect("Detection type", rule_opts)
+    etypes = sb.multiselect(
+        "Case level", ["work", "constituency", "agency"],
+        format_func=lambda e: {"work": "Individual work",
+                               "constituency": "Constituency",
+                               "agency": "Agency / vendor"}[e])
+    order = sb.selectbox("Sort by", ["risk", "risk_asc", "state"],
+                         format_func=lambda o: {"risk": "Highest risk first",
+                                                "risk_asc": "Lowest risk first",
+                                                "state": "By state"}[o])
+    if sb.button("↻ Refresh data", use_container_width=True):
+        refresh(); st.rerun()
+
+    filters = dict(scope, min_score=min_score, statuses=statuses or None,
+                   rule_ids=rules or None, entity_types=etypes or None)
+
+    with st.expander("📊 Executive overview", expanded=True):
+        overview(tier, dict(scope), corpus)
+
+    st.markdown("### 🔍 Case investigation workspace")
+    left, right = st.columns([1, 2], gap="medium")
+
+    with left:
+        search = st.text_input("Search cases", label_visibility="collapsed",
+                               placeholder="Search work code, title or district…")
+        rows = cached_query(search=search, limit=250, order=order, **filters)
+        total = cached_count(search=search, **filters)
+        st.caption(f"**{total:,}** cases match · showing top {len(rows)}")
+
+        if not rows:
+            st.info("No cases match these filters. Widen the filters in the sidebar.")
+        else:
+            ids = [r["flag_id"] for r in rows]
+            if st.session_state.get("sel") not in ids:
+                st.session_state["sel"] = ids[0]
+            with st.container(height=640, border=False):
+                for r in rows:
+                    st.markdown(case_card_html(r), unsafe_allow_html=True)
+                    if st.button("Investigate →", key=f"sel_{r['flag_id']}",
+                                 use_container_width=True):
+                        st.session_state["sel"] = r["flag_id"]
+                        st.rerun()
+
+    with right:
+        sel = db.get_flag(st.session_state.get("sel") or "")
+        if sel:
+            detail_panel(sel, tier)
+        else:
+            st.info("Select a case from the list to open the investigation workspace.")
 
 
 main()

@@ -102,6 +102,10 @@ class Flag(BaseModel):
     findings: list[Finding]
     narrative: str                           # causal chain, plain language
     tier_views: dict[str, str] = Field(default_factory=dict)  # mp/district/state/ministry
+    # presentation layer (see astra/explain.py) - additive, never replaces the above
+    display_title: Optional[str] = None      # short readable case title
+    primary_signal: Optional[str] = None     # one-line reason, for list views
+    tier_briefs: dict[str, Any] = Field(default_factory=dict)  # structured per tier
     review_status: ReviewStatus = "pending"
     reviewer_note: Optional[str] = None
     created_at: Optional[str] = None

@@ -21,37 +21,37 @@
     },
     "Expenditure on Completed and On-going Works as on Date": {
       "count": null,
-      "display": "2,782.78 Crore",
+      "display": "2,783.37 Crore",
       "raw": [
-        "\u00a027,82,77,91,672.45",
-        "\u00a02,782.78 Crore"
+        "\u00a027,83,37,41,510.45",
+        "\u00a02,783.37 Crore"
       ]
     },
     "Works Recommended": {
-      "count": 107185,
-      "display": "5,741.79 Crore",
+      "count": 107249,
+      "display": "5,746.86 Crore",
       "raw": [
-        "107185",
-        "\u00a057,41,79,15,662.41",
-        "\u00a05,741.79 Crore"
+        "107249",
+        "\u00a057,46,86,07,477.41",
+        "\u00a05,746.86 Crore"
       ]
     },
     "Works Completed": {
-      "count": 34561,
-      "display": "1,692.58 Crore",
+      "count": 34564,
+      "display": "1,692.67 Crore",
       "raw": [
-        "34561",
-        "\u00a016,92,58,11,006.73",
-        "\u00a01,692.58 Crore"
+        "34564",
+        "\u00a016,92,66,90,181.73",
+        "\u00a01,692.67 Crore"
       ]
     },
     "Works Sanctioned": {
-      "count": 79475,
-      "display": "4,186.30 Crore",
+      "count": 79483,
+      "display": "4,186.77 Crore",
       "raw": [
-        "79475",
-        "\u00a041,86,30,04,781.23",
-        "\u00a04,186.30 Crore"
+        "79483",
+        "\u00a041,86,77,13,956.23",
+        "\u00a04,186.77 Crore"
       ]
     },
     "Amount consented for Calamity": {
@@ -66,14 +66,14 @@
     "Current Tenure": "18th Lok Sabha"
   },
   "freshness": {
-    "live_recommended_works": 107185,
+    "live_recommended_works": 107249,
     "local_recommended_works": 107145,
-    "coverage_pct": 99.96,
-    "delta": 40,
-    "live_completed_works": 34561,
-    "live_sanctioned_works": 79475,
+    "coverage_pct": 99.9,
+    "delta": 104,
+    "live_completed_works": 34564,
+    "live_sanctioned_works": 79483,
     "tenure": "18th Lok Sabha",
-    "checked_at": "2026-09-07T12:47:22.049467+00:00"
+    "checked_at": "2026-09-07T16:07:58.216930+00:00"
   },
   "provenance": [
     {
@@ -83,7 +83,7 @@
       "rows": 7,
       "status": "ok",
       "detail": "official pre-login dashboard service",
-      "fetched_at": "2026-09-07T12:47:12.133046+00:00"
+      "fetched_at": "2026-09-07T16:07:52.616247+00:00"
     },
     {
       "source": "MPLADS eSAKSHI official CSV exports (datasets/)",
@@ -92,7 +92,7 @@
       "rows": 107145,
       "status": "ok",
       "detail": "Works Recommended.csv, Works Sanctioned.csv, Works Completed.csv, Expenditure on Completed and On-going Works as on Date.csv, Allocated Limit for Honble MPs (1).csv, Amount consented for Calamity.csv",
-      "fetched_at": "2026-09-07T12:47:12.135110+00:00"
+      "fetched_at": "2026-09-07T16:07:52.618524+00:00"
     },
     {
       "source": "MPLADS eSAKSHI official CSV exports (datasets/)",
@@ -101,7 +101,7 @@
       "rows": 1476,
       "status": "ok",
       "detail": "constituency x FY aggregation + Allocated Limit",
-      "fetched_at": "2026-09-07T12:47:12.135110+00:00"
+      "fetched_at": "2026-09-07T16:07:52.618524+00:00"
     },
     {
       "source": "router decision",
@@ -110,7 +110,7 @@
       "rows": 107145,
       "status": "selected",
       "detail": "official CSV exports selected: complete national corpus; the live work-level interface is state-scoped and returns only a bounded sample. Live portal still used for freshness and the pre-2023 baseline.",
-      "fetched_at": "2026-09-07T12:47:22.017775+00:00"
+      "fetched_at": "2026-09-07T16:07:58.184896+00:00"
     },
     {
       "source": "MPLADS 17th Lok Sabha (2019-2024)",
@@ -119,7 +119,7 @@
       "rows": 557,
       "status": "ok",
       "detail": "cached from an earlier live pull",
-      "fetched_at": "2026-09-07T12:47:22.023947+00:00"
+      "fetched_at": "2026-09-07T16:07:58.192219+00:00"
     },
     {
       "source": "MPLADS 16th Lok Sabha (2014-2019)",
@@ -128,7 +128,7 @@
       "rows": 569,
       "status": "ok",
       "detail": "cached from an earlier live pull",
-      "fetched_at": "2026-09-07T12:47:22.030129+00:00"
+      "fetched_at": "2026-09-07T16:07:58.199394+00:00"
     },
     {
       "source": "MPLADS 15th Lok Sabha (2009-2014)",
@@ -137,7 +137,7 @@
       "rows": 549,
       "status": "ok",
       "detail": "cached from an earlier live pull",
-      "fetched_at": "2026-09-07T12:47:22.039428+00:00"
+      "fetched_at": "2026-09-07T16:07:58.206859+00:00"
     },
     {
       "source": "MPLADS Rajya Sabha (sitting 2022)",
@@ -146,8 +146,8 @@
       "rows": 238,
       "status": "ok",
       "detail": "cached from an earlier live pull",
-      "fetched_at": "2026-09-07T12:47:22.044872+00:00"
+      "fetched_at": "2026-09-07T16:07:58.211882+00:00"
     }
   ],
-  "ingested_at": "2026-09-07T12:47:23.316792+00:00"
+  "ingested_at": "2026-09-07T16:07:59.498271+00:00"
 }

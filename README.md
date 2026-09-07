@@ -188,44 +188,104 @@ rather than hypothetical.
 python -m pip install -r requirements.txt
 python scripts/fetch_data.py        # dual-mode ingestion (auto)
 python scripts/run_pipeline.py      # all agents + orchestrator
-streamlit run dashboard/app.py      # 4-tier dashboard
+streamlit run dashboard/app.py      # investigation workspace
 uvicorn astra.api.main:app --port 8000   # optional JSON API
 ```
 
-## Demo script
+## The dashboard — a risk investigation workspace
 
-1. **Data-source banner** — LIVE/OFFLINE mode + 99.97% freshness vs the official portal.
-2. **Ministry view** — national exception rates by state and rule.
-3. Open a high-risk flag → **causal narrative** chaining compliance + anomaly + network evidence.
-4. **Switch role to MP** — same flag, orchestrator-reframed as a constituency action prompt. *Same data, different synthesis — the orchestration proof point.*
-5. **Vendor network tab** — contractors spanning districts with overrun patterns.
-6. **Map tab** — duplicate clusters with shared identifiers and likely mode.
-7. Click **False positive** → feedback recorded → stage-2 threshold recalibration.
+The interface is a **master-detail investigation workspace**, not a list of records.
 
-### Measured output on the real corpus
+```
+┌───────────────────────────────────────────────────────────────────────┐
+│  ASTRA · AI-Powered MPLADS Risk Intelligence Platform                  │
+│  [OFFLINE MODE]  99.96% current against the live MoSPI portal          │
+│  ⚖️ Decision-support system — every case requires human review          │
+├────────────┬──────────────────────────────────────────────────────────┤
+│ AUTHORITY  │  EXECUTIVE OVERVIEW                                       │
+│ ▸ Ministry │  works analysed · cases · high risk · under review        │
+│   State    │  states/districts by risk · what is being detected · map  │
+│   District ├──────────────────────────────────────────────────────────┤
+│   MP       │  CASE LIST          │  CASE INVESTIGATION                 │
+│            │  risk · title       │  Why flagged │ Agent trace │        │
+│ FILTERS    │  location · signal  │  Evidence │ Work record │           │
+│ risk score │  status             │  Duplicates │ Agency network │      │
+│ status     │  [Investigate →]    │  Pipeline │ Data source            │
+│ detection  │  (scrolls on its    │                                     │
+│ case level │   own)              │  + human review decision            │
+└────────────┴─────────────────────┴─────────────────────────────────────┘
+```
 
-| | |
-|---|---|
-| Works analysed | **107,145** (99.96% of the live portal's count) |
-| Fund-flow rows | **3,389** — 1,913 pre-2023 (live) + 1,476 post-2023 |
-| Flags produced | **36,177**, of which **3,897** cross the review threshold |
-| Multi-agent corroborated cases | **3,699** (evidence from 2+ agents) |
-| Full pipeline runtime | **~87 s** end to end |
-| System tests | **59 passed, 0 failed** (`python tests/test_system.py`) |
+**Every case is explained in plain language.** The agents produce precise
+statistics (`robust z=19.6, n=6509 peers`); `astra/explain.py` turns each finding
+into something a District Magistrate can act on, without inventing anything:
 
-Findings by rule: `R-TIME-01` 14,644 · `D-DUP-01` 14,421 · `R-COST-01` 10,967 ·
-`A-COST-01` 6,062 · `R-PROH-01` 1,039 · `R-PILE-01` 306 · `A-EXP-01` 253 ·
-`D-DUP-02` 158 · `N-NET-01` 129 · `R-SCST-02` 18. Two rules
-(`R-SCST-01`, `R-SPIKE-01`) matched nothing and are **reported as zero rather
-than hidden** — the first because this source lacks SC/ST area attribution, the
-second because the eSAKSHI era does not yet span enough complete financial years
-for a dormancy-then-spike pattern.
+> **Primary risk — Work is overdue against the one-year completion norm**
+> This work was sanctioned 627 days ago (1.7 years) and is still not complete.
+> The scheme expects works to finish within one year of sanction.
+>
+> **Cost is 150% above comparable works** — This work costs ₹5.00 lakh.
+> Comparable works of the same type in Chhattisgarh typically cost ₹2.00 lakh.
+> The comparison uses 283 similar works from the same period.
+>
+> **Very likely the same work recorded twice (2 matches)** — The description is
+> 100% identical to work WS/MP18335/2024-2025/150939 in the same district, and
+> both are sanctioned for the same amount. Approval checks look at one work at a
+> time, so a repeat entry like this is not caught by the normal workflow.
 
-**Live vs roadmap.** Compliance, Anomaly, Entity-Resolution, Network,
-Orchestrator and all four dashboard tiers run live on the real corpus. Roadmap:
-predictive delay forecasting, NL query interface, full RBAC + audit logging, OCR
-for scanned certificates, official SoR integration, automatic threshold
-recalibration from reviewer feedback.
+Each case also shows **how the assessment was reached** — every agent, what it
+measured, what it compared against, and how much risk it contributed:
+
+```
+Compliance Agent            +25 risk · 25%
+  → Work is overdue against the one-year completion norm
+    Measured: 627 days since sanction  ·  Compared with: 365 days (scheme norm)
+Statistical Anomaly Agent   +25 risk · 25%
+  → Cost is 150% above comparable works
+    Measured: ₹5.00 lakh actual  ·  Compared with: ₹2.00 lakh typical (283 works)
+Entity Resolution Agent     +50 risk · 50%
+  → Very likely the same work recorded twice (2 matches)
+    Measured: 100% description match  ·  Compared with: 80% similarity threshold
+                              ▼
+                  SYNTHESISER / ORCHESTRATOR
+     3 independent agents each raised a separate issue with this case
+                              ▼
+          HIGH RISK · 100/100 — HUMAN REVIEW REQUIRED
+```
+
+### Authority-tiered synthesis
+
+Switching authority does **not** hide columns. The orchestrator stores four
+separate briefs per case, each with its own framing and its own first action.
+The same ₹10 lakh cost case, from the dashboard's own comparison panel:
+
+| Authority | Framing | First recommended action |
+|---|---|---|
+| **Ministry** | "This case feeds the national exception statistics." | Track this rule's false-positive rate before changing its threshold. |
+| **State Nodal** | "This case contributes to a pattern worth reviewing across districts." | Check whether this work type or agency recurs across other districts. |
+| **District** | "This work requires verification before further release." | Compare the estimate against the state Schedule of Rates. |
+| **MP** | "One of the works recommended from your office needs attention." | Ask the district authority for a written explanation. |
+
+### Human review workflow
+
+`NEW → UNDER REVIEW → ESCALATED`, or `CLOSED · FALSE POSITIVE`. The authority
+decides the outcome; ASTRA only prioritises what to look at. Decisions persist
+to the local demo database and feed the threshold-recalibration loop.
+
+## Demo journey
+
+1. **Ministry view** — national overview: 107,145 works analysed, 242 high-risk
+   cases, states ranked by risk, what is being detected, geographic concentration.
+2. Pick a high-risk case from the list and click **Investigate →**.
+3. **Why flagged** — primary risk, supporting signals, recommended actions, all
+   in plain language.
+4. **Agent trace** — the four agents, their measurements and benchmarks, their
+   individual risk contributions, feeding the synthesiser.
+5. **Evidence** — the exact numbers and the raw audit trail behind each signal.
+6. **Duplicates** — side-by-side text comparison of the two matching records.
+7. **Switch authority to District Authority** — the same case, reframed with
+   ground-level verification steps. *Same data, different synthesis.*
+8. **Escalate** or **Close as false positive** — the status updates immediately.
 
 ## Repo map
 
@@ -236,6 +296,9 @@ astra/ingestion/router.py  # dual-mode resolution + provenance
 astra/ingestion/live.py    # eSAKSHI portal, CKAN pre-2023, open mirror
 astra/ingestion/offline.py # official CSV -> canonical schema
 astra/agents/              # compliance, anomaly, entity_resolution, network, orchestrator
-astra/api/main.py          # tier endpoints + feedback + /meta/data-source
-dashboard/app.py           # Streamlit 4-tier dashboard
+astra/explain.py           # plain-language layer: titles, signals, per-tier briefs
+astra/db.py                # SQLite + indexed query layer powering the dashboard
+astra/api/main.py          # tier endpoints, /flags/case/{id}, feedback, provenance
+dashboard/app.py           # master-detail investigation workspace
+tests/test_system.py       # 98 end-to-end checks against the real corpus
 ```
