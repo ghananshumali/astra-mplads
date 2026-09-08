@@ -25,7 +25,7 @@ import streamlit as st
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from astra import PLATFORM_NAME, db  # noqa: E402
+from astra import PLATFORM_NAME, db, rbac, synthesis  # noqa: E402
 from astra.config import PROCESSED_DIR  # noqa: E402
 from astra.explain import (AGENT_LABEL, AGENT_ROLE, humanize,  # noqa: E402
                            risk_band, rupees)
@@ -89,6 +89,13 @@ CSS = """
       margin:7px 0; background:rgba(128,128,128,.08);}
   .kv {font-size:.79rem; opacity:.85;}
   .pipe {text-align:center; font-size:.85rem; opacity:.7; margin:3px 0;}
+  .plan-stage {font-size:.72rem;letter-spacing:.7px;font-weight:700;opacity:.78;
+      margin:12px 0 5px 0;}
+  .plan-item {border:1px solid rgba(140,140,140,.3);border-left:4px solid #2471a3;
+      border-radius:6px;padding:8px 12px;margin-bottom:6px;}
+  .plan-why {font-size:.82rem;opacity:.85;margin-top:3px;}
+  .ai-badge {display:inline-block;padding:2px 9px;border-radius:10px;
+      font-size:.7rem;font-weight:700;letter-spacing:.4px;}
   div[data-testid="stMetricValue"] {font-size:1.45rem;}
   section[data-testid="stSidebar"] {width: 320px !important;}
 </style>
@@ -168,6 +175,26 @@ def agency_works(agency: str, limit: int = 40):
     df = db.read_df("works", "UPPER(ia_name) = ? OR UPPER(vendor_name) = ?",
                     (agency.upper(), agency.upper()))
     return df.head(limit)
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def cached_synthesis(flag_id: str, tier: str, fingerprint: str, use_llm: bool):
+    """Cache on (case, role, evidence fingerprint) so switching authority or
+    re-running the pipeline produces a fresh synthesis, but re-selecting the
+    same case does not re-bill the API."""
+    f = db.get_flag(flag_id)
+    if not f:
+        return None
+    work = None
+    if f["entity_type"] == "work":
+        df = db.read_df("works", "work_id = ?", (f["entity_id"],))
+        work = df.iloc[0].to_dict() if not df.empty else None
+    return synthesis.synthesise(f, tier, work, use_llm=use_llm)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def llm_status():
+    return synthesis.llm_status()
 
 
 def refresh():
@@ -350,6 +377,143 @@ def agent_pipeline_view(brief: dict, score: float):
         f"<div style='text-align:center;background:{color};color:#fff;border-radius:8px;"
         f"padding:10px'><b>{band.upper()} · {score:.0f}/100 — HUMAN REVIEW REQUIRED</b></div>",
         unsafe_allow_html=True)
+
+
+
+
+STAGE_COLOR = {"immediate": "#c0392b", "next": "#2471a3",
+               "if_unresolved": "#d68910", "escalation": "#7d3c98"}
+
+
+def render_action_plan(plan: list[dict], tier: str):
+    """The constrained plan, grouped into the stages the RBAC engine assigned."""
+    if not plan:
+        st.info("No actions are available to this authority for this case.")
+        return
+    by_stage: dict[str, list[dict]] = {}
+    for a in plan:
+        by_stage.setdefault(a.get("stage", "next"), []).append(a)
+
+    n = 0
+    for stage in rbac.STAGE_ORDER:
+        items = by_stage.get(stage)
+        if not items:
+            continue
+        color = STAGE_COLOR.get(stage, "#2471a3")
+        st.markdown(f"<div class='plan-stage' style='color:{color}'>"
+                    f"{rbac.STAGE_LABEL[stage]}</div>", unsafe_allow_html=True)
+        for a in items:
+            n += 1
+            st.markdown(
+                f"<div class='plan-item' style='border-left-color:{color}'>"
+                f"<b>{n}. {a['label']}</b>"
+                f"<div class='plan-why'>{a.get('detail', '')}</div>"
+                f"<div class='plan-why' style='opacity:.72'><i>Why: "
+                f"{a.get('reason') or 'Recommended for this evidence.'}</i></div>"
+                f"</div>", unsafe_allow_html=True)
+
+
+def tab_ai_synthesis(f: dict, tier: str):
+    """LLM synthesis + constrained action plan, with the deterministic fallback."""
+    status = llm_status()
+    enabled = st.session_state.get("use_llm", True)
+
+    head = st.columns([3, 1])
+    with head[0]:
+        st.markdown("##### AI synthesis and recommended action plan")
+        st.caption(f"Generated for **{rbac.ROLE_LABEL.get(tier, tier)}** — the same "
+                   f"evidence is synthesised differently for each authority.")
+    with head[1]:
+        if not status["configured"]:
+            st.markdown(chip("DETERMINISTIC", "#5d6d7e"), unsafe_allow_html=True)
+            st.caption("No GROQ_API_KEY set")
+
+    fp = synthesis.evidence_fingerprint(
+        synthesis.build_evidence_packet(f, tier), tier)
+    with st.spinner("Synthesising…"):
+        # When no key is configured the provider returns immediately with
+        # reason="no_api_key", so the UI can report the true cause rather than
+        # claiming the feature was switched off.
+        out = cached_synthesis(f["flag_id"], tier, fp, bool(enabled))
+    if not out:
+        st.warning("Case not found.")
+        return
+
+    if out["source"] == "groq":
+        st.markdown(
+            chip(f"AI SYNTHESIS · {out.get('model', 'groq')}", "#1e8449") +
+            (f"  <span style='font-size:.75rem;opacity:.7'>"
+             f"{out.get('latency_ms', 0)} ms</span>" if out.get("latency_ms") else ""),
+            unsafe_allow_html=True)
+    else:
+        reason = {
+            "no_api_key": "No API key configured — using the deterministic layer.",
+            "llm_disabled": "AI synthesis is switched off in the sidebar.",
+            "timeout": "The AI service did not respond in time.",
+            "rate_limited": "The AI service rate limit was reached.",
+            "unauthorized": "The AI service rejected the configured key.",
+            "language_guardrail": "The AI response failed a safety check and was "
+                                  "discarded.",
+        }.get(out.get("fallback_reason"), "The AI service was unavailable.")
+        st.markdown(chip("DETERMINISTIC SYNTHESIS", "#5d6d7e"), unsafe_allow_html=True)
+        st.caption(f"{reason} The analysis below is produced by the deterministic "
+                   f"layer and is complete — only the wording differs.")
+
+    band, color = risk_band(out["risk_score"])
+    st.markdown(
+        f"<div class='sig-box' style='border-left-color:{color};"
+        f"background:rgba(192,57,43,.09)'>"
+        f"<div style='font-size:.72rem;letter-spacing:.5px;opacity:.75'>"
+        f"KEY RISK · {band.upper()} · {out['risk_score']:.0f}/100</div>"
+        f"<b>{out['key_risk_summary']}</b><br>"
+        f"<span style='font-size:.9rem'>{out['case_explanation']}</span></div>",
+        unsafe_allow_html=True)
+
+    if out.get("authority_specific_summary"):
+        st.markdown(f"**What this means for {rbac.ROLE_LABEL.get(tier, tier)}**")
+        st.info(out["authority_specific_summary"])
+
+    if out.get("supporting_signals"):
+        with st.expander("Supporting signals used", expanded=False):
+            for sg in out["supporting_signals"]:
+                st.markdown(f"- **{sg.get('source_agent', '')}** — {sg.get('signal', '')}  \n"
+                            f"  <span style='font-size:.82rem;opacity:.8'>"
+                            f"{sg.get('evidence', '')}</span>", unsafe_allow_html=True)
+
+    st.markdown("#### AI-generated action plan")
+    render_action_plan(out.get("action_plan", []), tier)
+
+    if out.get("plan_rationale"):
+        st.markdown("**Why these actions were recommended**")
+        st.markdown(out["plan_rationale"])
+
+    if out.get("limitations_or_missing_evidence"):
+        with st.expander("Limitations and missing evidence", expanded=False):
+            for lim in out["limitations_or_missing_evidence"]:
+                st.markdown(f"- {lim}")
+
+    if out.get("rejected_actions"):
+        st.caption(f"⛔ {len(out['rejected_actions'])} suggested action(s) were "
+                   f"outside this authority's permissions and were removed by the "
+                   f"constraint engine before display.")
+    if out.get("unverified_numbers"):
+        st.caption(f"⚠️ Figures that could not be matched to the underlying "
+                   f"evidence: {', '.join(out['unverified_numbers'])}. Treat these "
+                   f"as unverified.")
+
+    st.info(f"🔒 {out['constraint_notice']}")
+    st.warning(f"⚖️ {out['human_review_notice']}")
+
+    with st.expander("Permitted actions for this authority (deterministic allow-list)"):
+        st.caption("Computed from role, risk level and the evidence actually "
+                   "found — with no model involvement. The AI may only select "
+                   "and sequence from this list.")
+        allowed = rbac.allowed_actions(tier, f["risk_score"], f["findings"])
+        st.dataframe(
+            pd.DataFrame([{"Stage": rbac.STAGE_LABEL[a["stage"]],
+                           "Action": a["label"], "id": a["action_id"]}
+                          for a in allowed]),
+            hide_index=True, use_container_width=True, height=240)
 
 
 def tab_why(f: dict, brief: dict, tier: str):
@@ -569,7 +733,7 @@ def tab_source():
                "endpoint being down can never block the platform.")
 
 
-def review_controls(f: dict, tier: str):
+def review_controls(f: dict, tier: str, scope: str = "main"):
     st.markdown("##### Human review decision")
     cur = f["review_status"]
     flow = {"pending": "NEW", "under_review": "UNDER REVIEW",
@@ -578,18 +742,19 @@ def review_controls(f: dict, tier: str):
         f"**{v}**" if k == cur else f"<span style='opacity:.4'>{v}</span>"
         for k, v in flow.items()), unsafe_allow_html=True)
 
-    note = st.text_input("Reviewer note (optional)", key=f"note_{f['flag_id']}",
+    note = st.text_input("Reviewer note (optional)",
+                         key=f"note_{scope}_{f['flag_id']}",
                          placeholder="Record what you verified…")
     c1, c2, c3 = st.columns(3)
-    if c1.button("🔎 Mark under review", key=f"ur_{f['flag_id']}",
+    if c1.button("🔎 Mark under review", key=f"ur_{scope}_{f['flag_id']}",
                  use_container_width=True):
         db.record_feedback(f["flag_id"], "under_review", tier, note)
         refresh(); st.rerun()
-    if c2.button("⬆️ Escalate for action", key=f"cf_{f['flag_id']}",
+    if c2.button("⬆️ Escalate for action", key=f"cf_{scope}_{f['flag_id']}",
                  use_container_width=True, type="primary"):
         db.record_feedback(f["flag_id"], "confirmed", tier, note)
         refresh(); st.rerun()
-    if c3.button("✅ Close as false positive", key=f"fp_{f['flag_id']}",
+    if c3.button("✅ Close as false positive", key=f"fp_{scope}_{f['flag_id']}",
                  use_container_width=True):
         db.record_feedback(f["flag_id"], "false_positive", tier,
                            note or "authority review: not a genuine risk")
@@ -623,25 +788,30 @@ def detail_panel(f: dict, tier: str):
         unsafe_allow_html=True)
     st.caption(f"Viewing as **{brief.get('tier_label', tier)}** — {brief.get('lens', '')}")
 
-    tabs = st.tabs(["Why flagged", "Agent trace", "Evidence", "Work record",
-                    "Duplicates", "Agency network", "Pipeline", "Data source"])
+    tabs = st.tabs(["Why flagged", "🤖 AI synthesis & action plan", "Agent trace",
+                    "Evidence", "Work record", "Duplicates", "Agency network",
+                    "Pipeline", "Data source"])
     with tabs[0]:
         tab_why(f, brief, tier)
         st.divider()
-        review_controls(f, tier)
+        review_controls(f, tier, scope="why")
     with tabs[1]:
-        agent_pipeline_view(brief, f["risk_score"])
+        tab_ai_synthesis(f, tier)
+        st.divider()
+        review_controls(f, tier, scope="ai")
     with tabs[2]:
-        tab_evidence(f, brief)
+        agent_pipeline_view(brief, f["risk_score"])
     with tabs[3]:
-        tab_case(f, w)
+        tab_evidence(f, brief)
     with tabs[4]:
-        tab_duplicates(f)
+        tab_case(f, w)
     with tabs[5]:
-        tab_network(f, w)
+        tab_duplicates(f)
     with tabs[6]:
-        tab_trace()
+        tab_network(f, w)
     with tabs[7]:
+        tab_trace()
+    with tabs[8]:
         tab_source()
 
     with st.expander("🪞 Compare — how the other authorities see this same case"):
@@ -717,6 +887,19 @@ def main():
                          format_func=lambda o: {"risk": "Highest risk first",
                                                 "risk_asc": "Lowest risk first",
                                                 "state": "By state"}[o])
+    sb.markdown("### AI synthesis")
+    status = llm_status()
+    st.session_state.setdefault("use_llm", True)
+    if status["configured"]:
+        st.session_state["use_llm"] = sb.toggle(
+            "Use Groq LLM synthesis", value=st.session_state["use_llm"],
+            help=f"Model: {status['model']}. Turn off to compare against the "
+                 f"deterministic layer.")
+        sb.caption(f"🟢 Connected · key {status['key_hint']}")
+    else:
+        sb.caption("⚪ No GROQ_API_KEY set — the deterministic synthesis layer "
+                   "is in use. Add a key to .env to enable AI synthesis.")
+
     if sb.button("↻ Refresh data", use_container_width=True):
         refresh(); st.rerun()
 

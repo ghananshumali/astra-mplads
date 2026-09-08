@@ -8,6 +8,11 @@ orchestrator's synthesis, not from filtered SQL):
   GET /flags/state?state=                  — SNA: cross-district patterns
   GET /flags/ministry                      — MoSPI: national exception rates
   GET /flags/case/{flag_id}?tier=          — one case, fully explained for a tier
+  GET /flags/case/{flag_id}/synthesis      — LLM synthesis + constrained action
+                                             plan for a tier (falls back to the
+                                             deterministic brief automatically)
+  GET /flags/case/{flag_id}/actions?tier=  — the RBAC allow-list for that tier
+  GET /meta/llm                            — LLM provider status (never the key)
   POST /flags/{flag_id}/feedback           — human-in-the-loop review action
   GET /meta/router-trace                   — why each agent ran / was skipped
   GET /meta/data-source                    — dual-mode ingestion provenance:
@@ -27,7 +32,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from .. import HUMAN_REVIEW_DISCLAIMER, PLATFORM_NAME, PLATFORM_TAGLINE, __version__
-from .. import db
+from .. import db, rbac, synthesis
 from ..config import PROCESSED_DIR
 
 app = FastAPI(title=f"{PLATFORM_NAME} API", description=PLATFORM_TAGLINE, version=__version__)
@@ -133,6 +138,58 @@ def flag_case(flag_id: str, tier: str = "district"):
         "narrative": f["narrative"],
         "disclaimer": HUMAN_REVIEW_DISCLAIMER,
     }
+
+
+@app.get("/flags/case/{flag_id}/synthesis")
+def flag_synthesis(flag_id: str, tier: str = "district", use_llm: bool = True):
+    """Authority-specific synthesis with a constrained action plan.
+
+    Always returns a usable body: `source` is "groq" when the LLM produced it
+    and "deterministic" when the template path did, with `fallback_reason`
+    explaining why. The risk score and level are copied from the deterministic
+    pipeline after generation and can never be altered by the model.
+    """
+    if tier not in rbac.ROLES:
+        raise HTTPException(400, f"tier must be one of {list(rbac.ROLES)}")
+    f = db.get_flag(flag_id)
+    if not f:
+        raise HTTPException(404, f"no such case: {flag_id}")
+    work = None
+    if f["entity_type"] == "work":
+        df = db.read_df("works", "work_id = ?", (f["entity_id"],))
+        work = df.iloc[0].to_dict() if not df.empty else None
+    return synthesis.synthesise_cached(f, tier, work, use_llm=use_llm)
+
+
+@app.get("/flags/case/{flag_id}/actions")
+def flag_actions(flag_id: str, tier: str = "district"):
+    """The deterministic RBAC allow-list for this case and authority.
+
+    This is the authoritative set the synthesis layer is constrained to; it is
+    computed from role, risk level and the evidence actually found, with no
+    model involvement.
+    """
+    if tier not in rbac.ROLES:
+        raise HTTPException(400, f"tier must be one of {list(rbac.ROLES)}")
+    f = db.get_flag(flag_id)
+    if not f:
+        raise HTTPException(404, f"no such case: {flag_id}")
+    actions = rbac.allowed_actions(tier, f["risk_score"], f["findings"])
+    return {
+        "flag_id": flag_id,
+        "tier": tier,
+        "tier_label": rbac.ROLE_LABEL[tier],
+        "risk_score": f["risk_score"],
+        "evidence_present": sorted(rbac.evidence_flags(f["findings"])),
+        "allowed_actions": actions,
+        "constraint_notice": rbac.CONSTRAINT_NOTICE,
+    }
+
+
+@app.get("/meta/llm")
+def llm_meta():
+    """LLM provider status. The API key is never included in this response."""
+    return synthesis.llm_status()
 
 
 class FeedbackIn(BaseModel):

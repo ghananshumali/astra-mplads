@@ -192,6 +192,76 @@ streamlit run dashboard/app.py      # investigation workspace
 uvicorn astra.api.main:app --port 8000   # optional JSON API
 ```
 
+## AI synthesis layer (optional, Groq)
+
+The LLM sits at the **end** of the pipeline and never touches detection. What is
+deterministic stays deterministic:
+
+```
+                DETECTION AND RISK ASSESSMENT          ← rules, statistics, agents
+   compliance · anomaly · entity-resolution · network
+                          ↓
+              deterministic composite risk score       ← never LLM-influenced
+                          ↓
+                RBAC CONSTRAINT ENGINE                 ← astra/rbac.py, pure Python
+       role × risk level × evidence present  →  allow-list
+                          ↓
+                 GROQ LLM SYNTHESIS LAYER              ← astra/synthesis.py
+   explanation · authority framing · action sequencing
+                          ↓
+                  validated + re-grounded              ← guardrails below
+                          ↓
+                    HUMAN DECISION                     ← the authority decides
+```
+
+The model receives a **compact evidence packet** (one case, agent findings,
+measured values and benchmarks, the role, and the allow-list) — never the raw
+dataset. It returns a strict JSON object.
+
+### Guardrails — enforced in code, not just in the prompt
+
+| Risk | Control |
+|---|---|
+| Model invents an action | Plan items carry only `action_id` + `reason`; ids are validated against `rbac.allowed_actions()` and anything else is dropped |
+| Model exceeds its authority | The allow-list is computed per role, so a Ministry action offered to a District plan is rejected |
+| Model changes the risk score | Score and band are copied from the pipeline **after** generation, overwriting anything the model said |
+| Model fabricates figures | Every number is checked against the evidence packet; unmatched values are surfaced as unverified |
+| Model alleges wrongdoing | Output is scanned for accusatory vocabulary; a hit discards the response and falls back |
+| Model unavailable | Any failure (no key, timeout, 429, bad JSON, network) returns the deterministic synthesis |
+
+Punitive actions do not exist in the catalogue at all — no suspension, penalty,
+blacklisting or criminal referral — so they cannot be recommended even if a
+model asked for them.
+
+### Same evidence, different authority, different permitted actions
+
+The RBAC engine produces genuinely disjoint action sets, gated three ways:
+
+| Authority | Permitted actions (for a 100/100 case with delay + cost + duplicate evidence) |
+|---|---|
+| **MP** | request status update · seek clarification · monitor progress · raise with authority |
+| **District** | verify documents · review expenditure · cross-check duplicate · request progress report · compare with benchmark · mark under review · *inspect (risk ≥ 40)* · *escalate (risk ≥ 60)* |
+| **State Nodal** | request district review · compare across districts · prioritise for monitoring · *seek district report (≥ 40)* · *refer systemic pattern (≥ 60)* |
+| **Ministry** | monitor national pattern · review rule threshold · prioritise systemic issue · *request state review (≥ 40)* · *consider guidance update (≥ 60)* |
+
+Gating is by **role**, by **risk** (a low-risk case is never offered escalation
+or inspection) and by **evidence** (`cross_check_duplicate` only appears when
+the entity-resolution agent actually found a match).
+
+### Enabling it
+
+```bash
+cp .env.example .env          # then paste a free key from console.groq.com/keys
+# .env is git-ignored; the key is read server-side only and never reaches the browser
+```
+
+`GROQ_API_KEY=` empty or absent is a fully supported state: the platform runs
+exactly as before on the deterministic synthesis layer, and the UI says which
+layer produced each result. Model defaults to `openai/gpt-oss-20b`
+(strict JSON-schema constrained decoding, fastest Groq production model);
+override with `ASTRA_GROQ_MODEL`. No extra dependency — the OpenAI-compatible
+REST endpoint is called with `requests`.
+
 ## The dashboard — a risk investigation workspace
 
 The interface is a **master-detail investigation workspace**, not a list of records.
@@ -283,9 +353,13 @@ to the local demo database and feed the threshold-recalibration loop.
    individual risk contributions, feeding the synthesiser.
 5. **Evidence** — the exact numbers and the raw audit trail behind each signal.
 6. **Duplicates** — side-by-side text comparison of the two matching records.
-7. **Switch authority to District Authority** — the same case, reframed with
-   ground-level verification steps. *Same data, different synthesis.*
-8. **Escalate** or **Close as false positive** — the status updates immediately.
+7. **AI synthesis & action plan** — the evidence-grounded explanation plus a
+   staged action plan (IMMEDIATE → NEXT → IF CONCERNS PERSIST → ESCALATION),
+   with the deterministic allow-list shown beneath it.
+8. **Switch authority to District Authority** — the same case and same evidence,
+   reframed *and* given a different permitted action plan. *Same evidence →
+   different authority → different permitted actions.*
+9. **Escalate** or **Close as false positive** — the status updates immediately.
 
 ## Repo map
 
@@ -297,8 +371,13 @@ astra/ingestion/live.py    # eSAKSHI portal, CKAN pre-2023, open mirror
 astra/ingestion/offline.py # official CSV -> canonical schema
 astra/agents/              # compliance, anomaly, entity_resolution, network, orchestrator
 astra/explain.py           # plain-language layer: titles, signals, per-tier briefs
+astra/rbac.py              # deterministic action catalogue + constraint engine
+astra/synthesis.py         # evidence packet -> LLM -> validation -> fallback
+astra/llm/provider.py      # isolated Groq client (server-side, never raises)
 astra/db.py                # SQLite + indexed query layer powering the dashboard
-astra/api/main.py          # tier endpoints, /flags/case/{id}, feedback, provenance
+astra/api/main.py          # tier endpoints, /flags/case/{id}[/synthesis|/actions],
+                           # feedback, provenance, /meta/llm
 dashboard/app.py           # master-detail investigation workspace
-tests/test_system.py       # 98 end-to-end checks against the real corpus
+tests/test_system.py       # end-to-end checks against the real corpus,
+                           # including RBAC and LLM-guardrail tests
 ```

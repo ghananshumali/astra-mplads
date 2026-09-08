@@ -13,3 +13,7 @@ rapidfuzz>=3.6
 PyYAML>=6.0
 networkx>=3.2
 pdfplumber>=0.11
+
+# Optional: the Groq LLM synthesis layer uses the OpenAI-compatible
+# REST endpoint over `requests` (already required above), so no extra
+# package is needed. Set GROQ_API_KEY in .env to enable it.

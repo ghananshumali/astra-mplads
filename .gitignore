@@ -4,3 +4,8 @@ data/raw/
 data/astra.db
 .streamlit/
 .venv/
+
+# secrets — never commit
+.env
+.env.local
+*.key

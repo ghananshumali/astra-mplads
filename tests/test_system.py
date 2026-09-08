@@ -9,6 +9,7 @@ are skipped automatically when the network is unavailable.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -417,6 +418,307 @@ def test_dashboard_renders() -> None:
               db.read_df("works", "work_id = ?", (agf[0]["entity_id"],)).empty)
 
 
+# ------------------------------------------------- RBAC + LLM synthesis layer
+
+def _rich_case():
+    """A case with evidence from three agents, for the synthesis tests."""
+    for f in db.query_flags(min_score=90, limit=60):
+        if len({x["agent"] for x in f["findings"]}) >= 3:
+            work = db.read_df("works", "work_id = ?", (f["entity_id"],))
+            return f, (work.iloc[0].to_dict() if not work.empty else None)
+    f = db.query_flags(limit=1)[0]
+    return f, None
+
+
+def test_rbac_engine() -> None:
+    """Deterministic action constraints — the security boundary for the LLM."""
+    print("\n[12] RBAC constraint engine")
+    from astra import rbac
+
+    case, _ = _rich_case()
+    score, findings = case["risk_score"], case["findings"]
+
+    plans = {r: rbac.allowed_ids(r, score, findings) for r in rbac.ROLES}
+    check("every authority gets a non-empty action set",
+          all(plans.values()), {r: len(v) for r, v in plans.items()})
+    check("authorities get genuinely different actions",
+          len({frozenset(v) for v in plans.values()}) == 4)
+    check("no action is offered to two different authorities",
+          not any(plans[a] & plans[b] for a in rbac.ROLES for b in rbac.ROLES if a < b))
+
+    # the catalogue must contain no punitive/enforcement powers at all
+    banned = ("suspend", "penalt", "blacklist", "criminal", "fir", "prosecut",
+              "terminate", "debar", "recover", "fine")
+    offenders = [aid for aid in rbac.ACTION_CATALOGUE
+                 if any(b in aid.lower() for b in banned)]
+    check("catalogue contains no punitive actions", not offenders, str(offenders))
+
+    # risk gating
+    low = rbac.allowed_ids("district", 10, findings)
+    high = rbac.allowed_ids("district", 100, findings)
+    check("escalation is withheld at low risk",
+          "escalate_case" not in low and "escalate_case" in high)
+    check("physical inspection is withheld at low risk",
+          "conduct_physical_inspection" not in low)
+
+    # evidence gating
+    no_dup = [f for f in findings if not str(f["rule_id"]).startswith("D-")]
+    check("duplicate action requires duplicate evidence",
+          "cross_check_duplicate" in rbac.allowed_ids("district", score, findings)
+          and "cross_check_duplicate" not in rbac.allowed_ids("district", score, no_dup))
+
+    # validation strips anything not permitted
+    accepted, rejected = rbac.validate_plan([
+        {"action_id": "verify_documents", "reason": "ok"},
+        {"action_id": "suspend_contractor", "reason": "invented"},
+        {"action_id": "file_criminal_case", "reason": "invented"},
+        {"action_id": "monitor_national_pattern", "reason": "wrong role"},
+    ], "district", score, findings)
+    check("validation keeps only permitted actions",
+          [a["action_id"] for a in accepted] == ["verify_documents"])
+    check("validation reports every rejection",
+          set(rejected) == {"suspend_contractor", "file_criminal_case",
+                            "monitor_national_pattern"})
+    check("validation cannot be bypassed with an empty/garbage plan",
+          rbac.validate_plan([], "district", score, findings)[0] == []
+          and rbac.validate_plan([{"x": 1}], "district", score, findings)[0] == [])
+
+
+def test_llm_provider_safety() -> None:
+    """Key handling and graceful failure of the provider layer."""
+    print("\n[13] LLM provider safety")
+    from astra.llm import provider
+
+    status = provider.provider_status()
+    check("status never exposes the API key",
+          "GROQ_API_KEY" not in str(status)
+          and not str(status.get("key_hint") or "").startswith("gsk_"))
+    check("status reports provider and model",
+          status["provider"] == "groq" and bool(status["model"]))
+
+    saved = os.environ.pop("GROQ_API_KEY", None)
+    provider._ENV_LOADED = True          # skip .env for this check
+    try:
+        r = provider.complete_json("s", "u", {"type": "object"})
+        check("missing key fails fast without a network call",
+              r.ok is False and r.reason == "no_api_key")
+    finally:
+        if saved:
+            os.environ["GROQ_API_KEY"] = saved
+
+    check("provider never raises on a bad base url",
+          _no_raise(lambda: provider.complete_json("s", "u", {"type": "object"})))
+
+
+def _no_raise(fn) -> bool:
+    try:
+        fn()
+        return True
+    except Exception:
+        return False
+
+
+def test_synthesis_guardrails() -> None:
+    """The LLM may explain evidence; it may not widen its own authority."""
+    print("\n[14] Synthesis guardrails")
+    from astra import rbac, synthesis
+    from astra.llm.provider import LLMResult
+
+    case, work = _rich_case()
+    real = synthesis.complete_json
+
+    good = {
+        "key_risk_summary": "The work is overdue and priced above comparable works.",
+        "case_explanation": "The system detected that this work requires verification.",
+        "supporting_signals": [{"source_agent": "Compliance Agent",
+                                "signal": "Overdue", "evidence": "627 days"}],
+        "authority_specific_summary": "Verification is needed before further release.",
+        "action_plan": [{"action_id": "verify_documents", "reason": "Records first."}],
+        "plan_rationale": "Document checks before escalation.",
+        "limitations_or_missing_evidence": ["Cannot verify physical work on site."],
+    }
+
+    def stub(payload):
+        return lambda system, user, schema, **kw: LLMResult(
+            True, data=payload, model="stub-model", latency_ms=5)
+
+    try:
+        synthesis.complete_json = stub(good)
+        r = synthesis.synthesise(case, "district", work)
+        check("a valid model response is accepted", r["source"] == "groq")
+
+        # invented and cross-role actions
+        synthesis.complete_json = stub(dict(good, action_plan=[
+            {"action_id": "verify_documents", "reason": "ok"},
+            {"action_id": "suspend_contractor", "reason": "invented"},
+            {"action_id": "issue_penalty", "reason": "invented"},
+            {"action_id": "monitor_national_pattern", "reason": "wrong role"}]))
+        r = synthesis.synthesise(case, "district", work)
+        check("invented actions never reach the action plan",
+              [a["action_id"] for a in r["action_plan"]] == ["verify_documents"],
+              f"rejected {r['rejected_actions']}")
+
+        # accusatory language
+        for phrase in ("This is clear fraud by the contractor.",
+                       "The agency is guilty of corruption.",
+                       "Criminal misappropriation occurred."):
+            synthesis.complete_json = stub(dict(good, key_risk_summary=phrase))
+            r = synthesis.synthesise(case, "district", work)
+            if r["source"] != "deterministic":
+                break
+        check("accusatory language forces the deterministic fallback",
+              r["source"] == "deterministic"
+              and r["fallback_reason"] == "language_guardrail")
+        check("no banned term survives into the output",
+              not synthesis.scan_language(r["key_risk_summary"],
+                                          r["case_explanation"]))
+
+        # the model cannot move the deterministic score
+        synthesis.complete_json = stub(dict(good, risk_score=5, risk_level="Low risk"))
+        r = synthesis.synthesise(case, "district", work)
+        check("model cannot alter the deterministic risk score",
+              r["risk_score"] == case["risk_score"] and r["risk_level"] == "High risk")
+
+        # fabricated figures are caught, genuine ones are not
+        synthesis.complete_json = stub(dict(
+            good, case_explanation="Cost was 9999999 against a benchmark of 4242424."))
+        r = synthesis.synthesise(case, "district", work)
+        check("fabricated figures are flagged as unverified",
+              {"9999999", "4242424"} <= set(r["unverified_numbers"]))
+        # take a figure that genuinely appears in THIS case's evidence, rather
+        # than hardcoding one - the selected case varies between runs
+        packet = synthesis.build_evidence_packet(case, "district", work)
+        genuine = next(
+            (n for n in synthesis._numbers_in(json.dumps(packet, default=str))
+             if n.isdigit() and int(n) > 12), None)
+        if genuine:
+            synthesis.complete_json = stub(dict(
+                good, case_explanation=f"The system recorded a value of {genuine}."))
+            r = synthesis.synthesise(case, "district", work)
+            check("genuine figures are not falsely flagged",
+                  r["unverified_numbers"] == [],
+                  f"used {genuine} from the evidence; flagged "
+                  f"{r['unverified_numbers']}")
+        else:
+            skip("genuine figures are not falsely flagged",
+                 "no numeric evidence in the selected case")
+
+        # every transport failure degrades to a complete deterministic answer
+        modes = ("timeout", "rate_limited", "invalid_json", "network",
+                 "http_500", "unauthorized")
+        ok = True
+        for reason in modes:
+            synthesis.complete_json = (
+                lambda s, u, sc, _r=reason, **k: LLMResult(False, reason=_r))
+            r = synthesis.synthesise(case, "district", work)
+            ok &= (r["source"] == "deterministic"
+                   and r["fallback_reason"] == reason
+                   and bool(r["action_plan"]) and bool(r["key_risk_summary"]))
+        check("every failure mode falls back to a complete answer", ok,
+              f"{len(modes)} modes tested")
+    finally:
+        synthesis.complete_json = real
+
+
+def test_synthesis_authority_and_cache() -> None:
+    """Authority-specific synthesis, permission containment, caching."""
+    print("\n[15] Authority synthesis and caching")
+    from astra import rbac, synthesis
+
+    case, work = _rich_case()
+    outs = {r: synthesis.synthesise(case, r, work, use_llm=False) for r in rbac.ROLES}
+
+    check("every authority receives a synthesis",
+          all(o["key_risk_summary"] and o["action_plan"] for o in outs.values()))
+    check("each authority gets a different action plan",
+          len({tuple(a["action_id"] for a in o["action_plan"])
+               for o in outs.values()}) == 4)
+    contained = all(
+        {a["action_id"] for a in o["action_plan"]}
+        <= rbac.allowed_ids(role, case["risk_score"], case["findings"])
+        for role, o in outs.items())
+    check("no plan exceeds its authority's permissions", contained)
+    check("every synthesis carries the constraint and review notices",
+          all(o["constraint_notice"] and o["human_review_notice"]
+              for o in outs.values()))
+    check("the risk score is identical across authorities",
+          len({o["risk_score"] for o in outs.values()}) == 1,
+          "the LLM layer never changes the deterministic score")
+
+    # MP must not be handed operational enforcement steps
+    mp_ids = {a["action_id"] for a in outs["mp"]["action_plan"]}
+    check("MP is never asked to inspect or escalate operationally",
+          not (mp_ids & {"conduct_physical_inspection", "escalate_case",
+                         "verify_documents", "review_expenditure"}),
+          str(sorted(mp_ids)))
+
+    # evidence packet must be a summary, not the dataset
+    packet = synthesis.build_evidence_packet(case, "district", work)
+    check("evidence packet stays small and case-scoped",
+          len(json.dumps(packet, default=str)) < 12000
+          and packet["work_id"] == case["entity_id"])
+    check("evidence packet carries measurements and benchmarks",
+          all(s.get("measured_value") is not None
+              for s in packet["agent_findings"]))
+
+    synthesis._CACHE.clear()
+    a = synthesis.synthesise_cached(case, "district", work, use_llm=False)
+    b = synthesis.synthesise_cached(case, "district", work, use_llm=False)
+    c = synthesis.synthesise_cached(case, "ministry", work, use_llm=False)
+    check("repeat views hit the cache",
+          a["cached"] is False and b["cached"] is True)
+    check("a different authority is cached separately", c["cached"] is False)
+
+    fp1 = synthesis.evidence_fingerprint(packet, "district")
+    fp2 = synthesis.evidence_fingerprint(packet, "ministry")
+    check("cache key separates authorities", fp1 != fp2)
+
+
+def test_synthesis_api() -> None:
+    """The new endpoints, including that the key is never returned."""
+    print("\n[16] Synthesis API")
+    from fastapi.testclient import TestClient
+    from astra import rbac
+    from astra.api.main import app
+    client = TestClient(app)
+
+    case, _ = _rich_case()
+    fid = case["flag_id"]
+
+    r = client.get("/meta/llm")
+    check("GET /meta/llm", r.status_code == 200,
+          f"configured={r.json().get('configured')}")
+    body = str(r.json())
+    check("API never returns the API key",
+          "gsk_" not in body and "GROQ_API_KEY" not in body)
+
+    r = client.get(f"/flags/case/{fid}/actions?tier=district")
+    check("GET /flags/case/{id}/actions", r.status_code == 200,
+          f"{len(r.json()['allowed_actions'])} permitted")
+    district_ids = {a["action_id"] for a in r.json()["allowed_actions"]}
+    mp_ids = {a["action_id"] for a in
+              client.get(f"/flags/case/{fid}/actions?tier=mp").json()["allowed_actions"]}
+    check("the allow-list differs per authority", district_ids != mp_ids)
+
+    r = client.get(f"/flags/case/{fid}/synthesis?tier=district")
+    check("GET /flags/case/{id}/synthesis", r.status_code == 200)
+    syn = r.json()
+    check("synthesis reports which layer produced it",
+          syn["source"] in ("groq", "deterministic"),
+          f"source={syn['source']}, reason={syn.get('fallback_reason')}")
+    check("synthesis preserves the deterministic score",
+          syn["risk_score"] == case["risk_score"])
+    check("synthesis action plan respects permissions",
+          {a["action_id"] for a in syn["action_plan"]} <= district_ids)
+
+    check("invalid tier is rejected",
+          client.get(f"/flags/case/{fid}/synthesis?tier=nope").status_code == 400)
+    check("unknown case returns 404",
+          client.get("/flags/case/F-NOPE/synthesis").status_code == 404)
+    check("actions endpoint validates tier too",
+          client.get(f"/flags/case/{fid}/actions?tier=nope").status_code == 400)
+
+
 def main() -> int:
     print("=" * 78)
     print("ASTRA system test — real MPLADS data")
@@ -440,6 +742,11 @@ def main() -> int:
     test_query_layer()
     test_review_workflow()
     test_dashboard_renders()
+    test_rbac_engine()
+    test_llm_provider_safety()
+    test_synthesis_guardrails()
+    test_synthesis_authority_and_cache()
+    test_synthesis_api()
 
     # The offline-mode test above rewrote the database without live enrichment.
     # Restore the full dual-mode batch so the dashboard is left demo-ready.
