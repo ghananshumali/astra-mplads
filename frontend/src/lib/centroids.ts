@@ -1,0 +1,43 @@
+/** Approximate state centroids, mirrored from the Python dashboard.
+ *
+ * Used ONLY to place state-level aggregate markers. The eSAKSHI exports carry
+ * no asset coordinates, and none are invented here.
+ */
+export const STATE_CENTROIDS: Record<string, [number, number]> = {
+  "ANDHRA PRADESH": [15.91, 79.74],
+  "ARUNACHAL PRADESH": [28.21, 94.72],
+  "ASSAM": [26.20, 92.94],
+  "BIHAR": [25.10, 85.31],
+  "CHHATTISGARH": [21.28, 81.87],
+  "GOA": [15.30, 74.12],
+  "GUJARAT": [22.26, 71.19],
+  "HARYANA": [29.06, 76.09],
+  "HIMACHAL PRADESH": [31.10, 77.17],
+  "JHARKHAND": [23.61, 85.28],
+  "KARNATAKA": [15.32, 75.71],
+  "KERALA": [10.85, 76.27],
+  "MADHYA PRADESH": [22.97, 78.66],
+  "MAHARASHTRA": [19.75, 75.71],
+  "MANIPUR": [24.66, 93.91],
+  "MEGHALAYA": [25.47, 91.37],
+  "MIZORAM": [23.16, 92.94],
+  "NAGALAND": [26.16, 94.56],
+  "ODISHA": [20.95, 85.10],
+  "PUNJAB": [31.15, 75.34],
+  "RAJASTHAN": [27.02, 74.22],
+  "SIKKIM": [27.53, 88.51],
+  "TAMIL NADU": [11.13, 78.66],
+  "TELANGANA": [18.11, 79.02],
+  "TRIPURA": [23.94, 91.99],
+  "UTTAR PRADESH": [26.85, 80.91],
+  "UTTARAKHAND": [30.07, 79.09],
+  "WEST BENGAL": [22.99, 87.85],
+  "DELHI": [28.70, 77.10],
+  "JAMMU AND KASHMIR": [33.78, 76.58],
+  "LADAKH": [34.21, 77.62],
+  "PUDUCHERRY": [11.94, 79.81],
+  "CHANDIGARH": [30.73, 76.78],
+  "ANDAMAN AND NICOBAR ISLANDS": [11.74, 92.66],
+  "LAKSHADWEEP": [10.57, 72.64],
+  "DADRA AND NAGAR HAVELI AND DAMAN AND DIU": [20.18, 73.02],
+};

@@ -184,13 +184,34 @@ rather than hypothetical.
 
 ## Quickstart
 
+**1 · Backend (once)**
+
 ```bash
 python -m pip install -r requirements.txt
 python scripts/fetch_data.py        # dual-mode ingestion (auto)
 python scripts/run_pipeline.py      # all agents + orchestrator
-streamlit run dashboard/app.py      # investigation workspace
-uvicorn astra.api.main:app --port 8000   # optional JSON API
 ```
+
+**2 · Run both services**
+
+```bash
+powershell -ExecutionPolicy Bypass -File run_dev.ps1   # Windows
+bash run_dev.sh                                        # macOS / Linux
+```
+
+Or in two terminals:
+
+```bash
+python -m uvicorn astra.api.main:app --port 8000   # API   → :8000/docs
+cd frontend && npm install && npm run dev          # React → :5173
+```
+
+Open **http://localhost:5173**. Point the client at a different API with
+`VITE_API_BASE` in `frontend/.env`.
+
+The original Streamlit dashboard remains at `dashboard/app.py`
+(`streamlit run dashboard/app.py`) as a fallback; the React client is the
+primary interface.
 
 ## AI synthesis layer (optional, Groq)
 
@@ -262,85 +283,77 @@ layer produced each result. Model defaults to `openai/gpt-oss-20b`
 override with `ASTRA_GROQ_MODEL`. No extra dependency — the OpenAI-compatible
 REST endpoint is called with `requests`.
 
-## The dashboard — a risk investigation workspace
+## The interface — a React risk investigation workspace
 
-The interface is a **master-detail investigation workspace**, not a list of records.
-
-```
-┌───────────────────────────────────────────────────────────────────────┐
-│  ASTRA · AI-Powered MPLADS Risk Intelligence Platform                  │
-│  [OFFLINE MODE]  99.96% current against the live MoSPI portal          │
-│  ⚖️ Decision-support system — every case requires human review          │
-├────────────┬──────────────────────────────────────────────────────────┤
-│ AUTHORITY  │  EXECUTIVE OVERVIEW                                       │
-│ ▸ Ministry │  works analysed · cases · high risk · under review        │
-│   State    │  states/districts by risk · what is being detected · map  │
-│   District ├──────────────────────────────────────────────────────────┤
-│   MP       │  CASE LIST          │  CASE INVESTIGATION                 │
-│            │  risk · title       │  Why flagged │ Agent trace │        │
-│ FILTERS    │  location · signal  │  Evidence │ Work record │           │
-│ risk score │  status             │  Duplicates │ Agency network │      │
-│ status     │  [Investigate →]    │  Pipeline │ Data source            │
-│ detection  │  (scrolls on its    │                                     │
-│ case level │   own)              │  + human review decision            │
-└────────────┴─────────────────────┴─────────────────────────────────────┘
-```
-
-**Every case is explained in plain language.** The agents produce precise
-statistics (`robust z=19.6, n=6509 peers`); `astra/explain.py` turns each finding
-into something a District Magistrate can act on, without inventing anything:
-
-> **Primary risk — Work is overdue against the one-year completion norm**
-> This work was sanctioned 627 days ago (1.7 years) and is still not complete.
-> The scheme expects works to finish within one year of sanction.
->
-> **Cost is 150% above comparable works** — This work costs ₹5.00 lakh.
-> Comparable works of the same type in Chhattisgarh typically cost ₹2.00 lakh.
-> The comparison uses 283 similar works from the same period.
->
-> **Very likely the same work recorded twice (2 matches)** — The description is
-> 100% identical to work WS/MP18335/2024-2025/150939 in the same district, and
-> both are sanctioned for the same amount. Approval checks look at one work at a
-> time, so a repeat entry like this is not caught by the normal workflow.
-
-Each case also shows **how the assessment was reached** — every agent, what it
-measured, what it compared against, and how much risk it contributed:
+The frontend is a Vite + React + TypeScript application in `frontend/`. It is a
+pure client of the FastAPI backend: no risk scores, permissions or synthesis are
+computed in the browser.
 
 ```
-Compliance Agent            +25 risk · 25%
-  → Work is overdue against the one-year completion norm
-    Measured: 627 days since sanction  ·  Compared with: 365 days (scheme norm)
-Statistical Anomaly Agent   +25 risk · 25%
-  → Cost is 150% above comparable works
-    Measured: ₹5.00 lakh actual  ·  Compared with: ₹2.00 lakh typical (283 works)
-Entity Resolution Agent     +50 risk · 50%
-  → Very likely the same work recorded twice (2 matches)
-    Measured: 100% description match  ·  Compared with: 80% similarity threshold
-                              ▼
-                  SYNTHESISER / ORCHESTRATOR
-     3 independent agents each raised a separate issue with this case
-                              ▼
-          HIGH RISK · 100/100 — HUMAN REVIEW REQUIRED
+┌──────────────────────────────────────────────────────────────────────────┐
+│ ASTRA  MPLADS Risk Intelligence      [AI synthesis] [OFFLINE 99.9%] [MP▾] │
+├───────────┬──────────────────────────────────────────────────────────────┤
+│ Overview  │  EXECUTIVE OVERVIEW                                           │
+│ Risk cases│  works · cases · high risk · under review · closed  (clickable)│
+│ Geography │  states by risk │ what is being detected │ priority queue      │
+│ Network   ├──────────────────────────────────────────────────────────────┤
+│ Pipeline  │  CASE TABLE                │  CASE INVESTIGATION              │
+│ Data      │  search · filters · sort   │  Why flagged │ AI synthesis │    │
+│           │  risk · title · location   │  Agent trace │ Evidence │        │
+│           │  signals · status          │  Work record │ Duplicates        │
+│           │  pagination                │  + human review decision         │
+└───────────┴────────────────────────────┴──────────────────────────────────┘
 ```
 
-### Authority-tiered synthesis
+**Design system.** Tokens in `frontend/src/styles/tokens.css`: a navy
+government palette, one accent, and a **fixed severity ramp** that means the
+same thing on every surface — a chart bar, a table chip and a map marker all
+use the same red for high risk. Chart series colours are deliberately drawn
+from a separate palette so a category colour is never mistaken for a risk level.
 
-Switching authority does **not** hide columns. The orchestrator stores four
-separate briefs per case, each with its own framing and its own first action.
-The same ₹10 lakh cost case, from the dashboard's own comparison panel:
+**Authority experience.** The switcher in the header changes both the data scope
+and the synthesis. Each tier remembers its own scope selection, and the case
+list, overview charts and action plans all re-derive from the backend for that
+role — Ministry sees state rankings and national detection mix, State Nodal sees
+cross-district comparison, District and MP see their own scoped queue.
 
-| Authority | Framing | First recommended action |
-|---|---|---|
-| **Ministry** | "This case feeds the national exception statistics." | Track this rule's false-positive rate before changing its threshold. |
-| **State Nodal** | "This case contributes to a pattern worth reviewing across districts." | Check whether this work type or agency recurs across other districts. |
-| **District** | "This work requires verification before further release." | Compare the estimate against the state Schedule of Rates. |
-| **MP** | "One of the works recommended from your office needs attention." | Ask the district authority for a written explanation. |
+**Interactions that do something.** KPI tiles, chart bars, detection rows, map
+markers and district rows all drill into a pre-filtered case list. The case
+table supports debounced search, risk/status/detection filters, sorting and
+pagination; selecting a case opens the investigation panel without leaving the
+list, and the list widens when nothing is selected.
 
-### Human review workflow
+### Frontend architecture
 
-`NEW → UNDER REVIEW → ESCALATED`, or `CLOSED · FALSE POSITIVE`. The authority
-decides the outcome; ASTRA only prioritises what to look at. Decisions persist
-to the local demo database and feed the threshold-recalibration loop.
+```
+frontend/src
+  api/client.ts        single service layer; every backend call goes through it
+  api/types.ts         TypeScript mirror of the FastAPI contract
+  state/               authority (RBAC role) context, persisted per tier
+  components/ui/       Card, Chip, RiskBadge, Banner, Empty, Skeleton, Tabs…
+  components/shell/    header, authority switcher, sidebar navigation
+  components/case/     the case investigation panel and its tabs
+  pages/               Overview · Cases · Geography · Network · Pipeline · Data
+  lib/format.ts        presentation helpers + the shared risk/severity mapping
+  lib/centroids.ts     state centroids, generated from the Python source
+```
+
+### Endpoints added for the client
+
+CORS, plus read-only pass-throughs that expose data the previous Streamlit app
+read directly from `astra.db`. None of them contain business logic:
+
+| Endpoint | Wraps |
+|---|---|
+| `GET /cases` | `db.query_flags` + `db.count_flags` (filter, sort, paginate) |
+| `GET /stats` | `db.flag_stats` + corpus counts |
+| `GET /meta/facets` | `db.flag_facets` + rule coverage |
+| `GET /analytics/states` · `/districts` · `/detections` | the matching `db` summaries |
+| `GET /works/{id}` · `/agencies/works` | canonical work rows |
+| `GET /meta/pipeline` | the last run's router trace and rule coverage |
+
+The pre-existing endpoints (`/flags/{tier}`, `/flags/case/{id}`, `/synthesis`,
+`/actions`, `/feedback`, `/meta/*`) are unchanged.
 
 ## Demo journey
 
@@ -377,7 +390,10 @@ astra/llm/provider.py      # isolated Groq client (server-side, never raises)
 astra/db.py                # SQLite + indexed query layer powering the dashboard
 astra/api/main.py          # tier endpoints, /flags/case/{id}[/synthesis|/actions],
                            # feedback, provenance, /meta/llm
-dashboard/app.py           # master-detail investigation workspace
-tests/test_system.py       # end-to-end checks against the real corpus,
+frontend/                  # React + Vite + TypeScript client (primary UI)
+dashboard/app.py           # original Streamlit UI, kept as a fallback
+tests/test_system.py       # 142 end-to-end checks against the real corpus,
                            # including RBAC and LLM-guardrail tests
+tests/test_frontend_api.py # 51 API contract tests for the React client
+run_dev.ps1 / run_dev.sh   # start API + frontend together
 ```

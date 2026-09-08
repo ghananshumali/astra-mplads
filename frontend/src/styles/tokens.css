@@ -1,0 +1,206 @@
+/* ASTRA design system — tokens.
+ *
+ * A restrained government-intelligence palette: deep navy for authority,
+ * a single warm accent for interaction, and a fixed severity ramp that means
+ * the same thing everywhere in the product (chart, chip, table row, map).
+ */
+
+:root {
+  /* ---------------------------------------------------------- brand */
+  --navy-900: #0a1f3d;
+  --navy-800: #0f2a52;
+  --navy-700: #143566;
+  --navy-600: #1a437f;
+  --navy-500: #22539b;
+  --navy-400: #3d6db5;
+  --navy-300: #7f9fd0;
+  --navy-100: #dbe4f2;
+  --navy-50: #f2f6fc;
+
+  --accent-600: #b45309;
+  --accent-500: #d97706;
+  --accent-400: #f59e0b;
+  --accent-100: #fef3c7;
+
+  /* ---------------------------------------------------------- severity
+   * One ramp, used identically across every surface. */
+  --risk-high: #b3261e;
+  --risk-high-bg: #fdecea;
+  --risk-high-border: #f3b7b2;
+  --risk-medium: #b26a00;
+  --risk-medium-bg: #fff5e5;
+  --risk-medium-border: #f6d9a8;
+  --risk-low: #5b6b7c;
+  --risk-low-bg: #f1f4f7;
+  --risk-low-border: #d7dee6;
+
+  --sev-critical: #8c1d18;
+  --sev-high: #b3261e;
+  --sev-medium: #b26a00;
+  --sev-low: #5b6b7c;
+
+  /* ---------------------------------------------------------- status */
+  --status-new: #5b6b7c;
+  --status-review: #1a437f;
+  --status-escalated: #b3261e;
+  --status-cleared: #1b7a4b;
+
+  --success: #1b7a4b;
+  --success-bg: #e8f5ee;
+  --info: #1a437f;
+  --info-bg: #eaf1fb;
+  --warn: #b26a00;
+  --warn-bg: #fff8ea;
+  --danger: #b3261e;
+
+  /* ---------------------------------------------------------- surface */
+  --bg: #f6f8fb;
+  --surface: #ffffff;
+  --surface-2: #fbfcfe;
+  --surface-3: #f1f4f9;
+  --border: #e2e8f0;
+  --border-strong: #cbd5e1;
+
+  --text: #0f1c2e;
+  --text-2: #475569;
+  --text-3: #7b8794;
+  --text-inverse: #ffffff;
+
+  /* ---------------------------------------------------------- type */
+  --font: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, "SF Mono",
+    Menlo, Consolas, monospace;
+
+  --text-xs: 0.6875rem;
+  --text-sm: 0.8125rem;
+  --text-base: 0.875rem;
+  --text-md: 0.9375rem;
+  --text-lg: 1.0625rem;
+  --text-xl: 1.375rem;
+  --text-2xl: 1.75rem;
+  --text-3xl: 2.25rem;
+
+  --weight-normal: 400;
+  --weight-medium: 500;
+  --weight-semibold: 600;
+  --weight-bold: 700;
+
+  /* ---------------------------------------------------------- space */
+  --s-1: 4px;
+  --s-2: 8px;
+  --s-3: 12px;
+  --s-4: 16px;
+  --s-5: 20px;
+  --s-6: 24px;
+  --s-8: 32px;
+  --s-10: 40px;
+  --s-12: 48px;
+
+  --radius-sm: 4px;
+  --radius: 8px;
+  --radius-lg: 12px;
+  --radius-full: 999px;
+
+  --shadow-xs: 0 1px 2px rgba(15, 28, 46, 0.06);
+  --shadow-sm: 0 1px 3px rgba(15, 28, 46, 0.08), 0 1px 2px rgba(15, 28, 46, 0.04);
+  --shadow: 0 4px 12px rgba(15, 28, 46, 0.08), 0 1px 3px rgba(15, 28, 46, 0.05);
+  --shadow-lg: 0 12px 32px rgba(15, 28, 46, 0.12), 0 2px 8px rgba(15, 28, 46, 0.06);
+
+  --header-h: 58px;
+  --sidebar-w: 232px;
+
+  --ease: cubic-bezier(0.4, 0, 0.2, 1);
+  --dur-fast: 120ms;
+  --dur: 200ms;
+}
+
+/* Chart series — deliberately distinct from the severity ramp so a category
+ * colour is never mistaken for a risk level. */
+:root {
+  --chart-1: #1a437f;
+  --chart-2: #2e7d9a;
+  --chart-3: #4a9d7f;
+  --chart-4: #8a9a5b;
+  --chart-5: #b58b4c;
+  --chart-6: #9c6b8e;
+  --chart-grid: #e8edf4;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: var(--text-base);
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+h1,
+h2,
+h3,
+h4 {
+  margin: 0;
+  font-weight: var(--weight-semibold);
+  letter-spacing: -0.011em;
+  color: var(--text);
+}
+
+a {
+  color: var(--navy-600);
+  text-decoration: none;
+}
+
+button {
+  font-family: inherit;
+  font-size: inherit;
+}
+
+code,
+.mono {
+  font-family: var(--font-mono);
+  font-size: 0.92em;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: var(--radius-full);
+  border: 2px solid var(--bg);
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-3);
+}
+
+:focus-visible {
+  outline: 2px solid var(--navy-500);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

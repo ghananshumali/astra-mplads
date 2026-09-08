@@ -396,7 +396,11 @@ def synthesise(flag: dict, tier: str, work: dict | None = None,
     accepted, rejected = rbac.validate_plan(
         d.get("action_plan") or [], tier, score, findings)
     if not accepted:
-        accepted = rbac.default_plan(tier, score, findings, packet["agent_findings"])
+        # The model returned no usable plan. Fall back to the deterministic one,
+        # built from the BRIEF signals so each action still cites the finding
+        # that motivates it.
+        brief = (flag.get("tier_briefs") or {}).get(tier) or build_brief(flag, tier)
+        accepted = rbac.default_plan(tier, score, findings, brief.get("signals", []))
 
     # Guardrail 3 — figures must be traceable to the evidence packet.
     unverified = verify_numbers(" ".join(text_fields), packet)

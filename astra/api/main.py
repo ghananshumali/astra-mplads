@@ -27,15 +27,46 @@ path segment so the demo can show all four synthesized framings side by side.
 from __future__ import annotations
 
 import json
+import os
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from .. import HUMAN_REVIEW_DISCLAIMER, PLATFORM_NAME, PLATFORM_TAGLINE, __version__
+import pandas as pd
+
 from .. import db, rbac, synthesis
 from ..config import PROCESSED_DIR
+from ..explain import AGENT_LABEL
 
 app = FastAPI(title=f"{PLATFORM_NAME} API", description=PLATFORM_TAGLINE, version=__version__)
+
+# The React client is served from a different origin in development and from
+# the same origin once built.
+#
+# A fixed list of dev origins is fragile: Vite increments its port when 5173 is
+# busy (5174, 5175, ...), and a preflight from an origin that is not on the list
+# makes Starlette reject OPTIONS with "400 Disallowed CORS origin". The browser
+# then reports only a generic network failure, which is hard to diagnose.
+#
+# So in development any loopback origin is accepted, on any port, over http or
+# https. Setting ASTRA_CORS_ORIGINS switches to an explicit allow-list, which is
+# what a real deployment should do.
+_CORS_ENV = os.environ.get("ASTRA_CORS_ORIGINS", "").strip()
+_CORS_KWARGS: dict = (
+    {"allow_origins": [o.strip() for o in _CORS_ENV.split(",") if o.strip()]}
+    if _CORS_ENV
+    else {"allow_origin_regex": r"^https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$"}
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+    **_CORS_KWARGS,
+)
 
 
 def _tier_payload(flags: list[dict], tier: str, aggregate: dict | None = None) -> dict:
@@ -190,6 +221,156 @@ def flag_actions(flag_id: str, tier: str = "district"):
 def llm_meta():
     """LLM provider status. The API key is never included in this response."""
     return synthesis.llm_status()
+
+
+def _case_summary(f: dict) -> dict:
+    """List-view projection of a case. Heavy fields stay out of list payloads."""
+    return {
+        "flag_id": f["flag_id"],
+        "display_title": f.get("display_title") or f.get("entity_label"),
+        "entity_id": f["entity_id"],
+        "entity_type": f["entity_type"],
+        "state": f["state"],
+        "district": f["district"],
+        "constituency": f["constituency"],
+        "era": f["era"],
+        "risk_score": f["risk_score"],
+        "alert": f["alert"],
+        "review_status": f["review_status"],
+        "primary_signal": f.get("primary_signal"),
+        "agents": sorted({x["agent"] for x in f.get("findings", [])}),
+        "rule_ids": sorted({x["rule_id"] for x in f.get("findings", [])}),
+        "finding_count": len(f.get("findings", [])),
+    }
+
+
+@app.get("/cases")
+def list_cases(
+    states: list[str] | None = Query(None),
+    districts: list[str] | None = Query(None),
+    constituencies: list[str] | None = Query(None),
+    entity_types: list[str] | None = Query(None),
+    statuses: list[str] | None = Query(None),
+    rule_ids: list[str] | None = Query(None),
+    min_score: float = 0,
+    search: str = "",
+    order: str = "risk",
+    limit: int = 50,
+    offset: int = 0,
+):
+    """Filtered, sorted, paginated case list — wraps db.query_flags/count_flags."""
+    filters = dict(states=states, districts=districts,
+                   constituencies=constituencies, entity_types=entity_types,
+                   statuses=statuses, rule_ids=rule_ids,
+                   min_score=min_score, search=search)
+    rows = db.query_flags(order=order, limit=min(limit, 200), offset=offset, **filters)
+    return {
+        "total": db.count_flags(**filters),
+        "limit": limit,
+        "offset": offset,
+        "disclaimer": HUMAN_REVIEW_DISCLAIMER,
+        "cases": [_case_summary(f) for f in rows],
+    }
+
+
+@app.get("/stats")
+def stats(
+    states: list[str] | None = Query(None),
+    districts: list[str] | None = Query(None),
+    constituencies: list[str] | None = Query(None),
+    min_score: float = 0,
+):
+    """Headline counts and risk-band distribution — wraps db.flag_stats."""
+    with db.connect() as con:
+        works = con.execute("SELECT COUNT(*) FROM works").fetchone()[0]
+        districts_n = con.execute(
+            "SELECT COUNT(DISTINCT district) FROM works "
+            "WHERE district IS NOT NULL").fetchone()[0]
+        states_n = con.execute(
+            "SELECT COUNT(DISTINCT state) FROM works "
+            "WHERE state IS NOT NULL").fetchone()[0]
+    out = db.flag_stats(states=states, districts=districts,
+                        constituencies=constituencies, min_score=min_score)
+    out["corpus"] = {"works": works, "districts": districts_n, "states": states_n}
+    return out
+
+
+@app.get("/meta/facets")
+def facets():
+    """Distinct filter values for the UI controls — wraps db.flag_facets."""
+    f = db.flag_facets()
+    run = {}
+    p = PROCESSED_DIR / "run_meta.json"
+    if p.exists():
+        run = json.loads(p.read_text(encoding="utf-8"))
+    f["rules"] = [
+        {"rule_id": c["rule_id"], "title": c["title"], "count": c["findings"]}
+        for c in run.get("rule_coverage", [])
+    ]
+    f["agents"] = list(AGENT_LABEL.items())
+    return f
+
+
+@app.get("/analytics/states")
+def analytics_states():
+    """Per-state flag counts and mean risk — wraps db.state_risk_summary."""
+    return db.state_risk_summary().to_dict(orient="records")
+
+
+@app.get("/analytics/districts")
+def analytics_districts(state: str | None = None, limit: int = 25):
+    """Per-district rollup — wraps db.district_risk_summary."""
+    return db.district_risk_summary(state, limit).to_dict(orient="records")
+
+
+@app.get("/analytics/detections")
+def analytics_detections(
+    states: list[str] | None = Query(None),
+    districts: list[str] | None = Query(None),
+    constituencies: list[str] | None = Query(None),
+):
+    """Detection-type frequency — wraps db.rule_histogram_scoped."""
+    hist = db.rule_histogram_scoped(states=states, districts=districts,
+                                    constituencies=constituencies)
+    titles = {}
+    p = PROCESSED_DIR / "run_meta.json"
+    if p.exists():
+        titles = {c["rule_id"]: c["title"]
+                  for c in json.loads(p.read_text(encoding="utf-8"))
+                  .get("rule_coverage", [])}
+    return [{"rule_id": k, "title": titles.get(k, k), "count": v}
+            for k, v in sorted(hist.items(), key=lambda kv: -kv[1])]
+
+
+@app.get("/works/{work_id:path}")
+def work_record(work_id: str):
+    """One work row from the canonical table. Read-only."""
+    df = db.read_df("works", "work_id = ?", (work_id,))
+    if df.empty:
+        raise HTTPException(404, f"no such work: {work_id}")
+    row = df.iloc[0].to_dict()
+    return {k: (None if pd.isna(v) else v) for k, v in row.items()}
+
+
+@app.get("/agencies/works")
+def agency_works(name: str, limit: int = 40):
+    """Other works handled by an implementing agency or vendor. Read-only."""
+    df = db.read_df("works", "UPPER(ia_name) = ? OR UPPER(vendor_name) = ?",
+                    (name.upper(), name.upper())).head(limit)
+    cols = ["work_id", "district", "state", "category", "sanctioned_amount",
+            "status", "vendor_name", "ia_name"]
+    df = df[[c for c in cols if c in df.columns]]
+    return [{k: (None if pd.isna(v) else v) for k, v in r.items()}
+            for r in df.to_dict(orient="records")]
+
+
+@app.get("/meta/pipeline")
+def pipeline_meta():
+    """Router trace + rule coverage from the last pipeline run. Read-only."""
+    p = PROCESSED_DIR / "run_meta.json"
+    if not p.exists():
+        return {"router_trace": [], "rule_coverage": [], "ran_at": None}
+    return json.loads(p.read_text(encoding="utf-8"))
 
 
 class FeedbackIn(BaseModel):

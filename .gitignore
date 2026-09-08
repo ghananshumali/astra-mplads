@@ -9,3 +9,8 @@ data/astra.db
 .env
 .env.local
 *.key
+
+# frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.env
