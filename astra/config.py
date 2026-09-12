@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import functools
+import os
 from pathlib import Path
 
 import yaml
@@ -10,10 +11,22 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = PROJECT_ROOT / "config" / "rules.yaml"
 DATA_DIR = PROJECT_ROOT / "data"
 RAW_DIR = DATA_DIR / "raw"
-PROCESSED_DIR = DATA_DIR / "processed"
-DB_PATH = DATA_DIR / "astra.db"
 
-for _d in (RAW_DIR, PROCESSED_DIR):
+#: Overridable so tests never touch the real corpus. `tests/test_system.py`
+#: re-ingests from the CSV exports, which DELETEs `works` — pointing that at
+#: data/astra.db would destroy anything the live poller has collected.
+DB_PATH = Path(os.environ.get("ASTRA_DB_PATH") or (DATA_DIR / "astra.db"))
+
+#: Redirected alongside the database, so a test run cannot leave its own
+#: ingest_meta.json / run_meta.json behind for the dashboard to read.
+PROCESSED_DIR = Path(os.environ.get("ASTRA_PROCESSED_DIR")
+                     or (DB_PATH.parent / "processed" if os.environ.get("ASTRA_DB_PATH")
+                         else DATA_DIR / "processed"))
+
+#: Raw per-shard response cache written by the live ingestion path.
+SHARD_CACHE_DIR = Path(os.environ.get("ASTRA_SHARD_CACHE") or (RAW_DIR / "shards"))
+
+for _d in (RAW_DIR, PROCESSED_DIR, DB_PATH.parent):
     _d.mkdir(parents=True, exist_ok=True)
 
 
