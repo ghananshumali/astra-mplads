@@ -265,6 +265,11 @@ def swap() -> Path | None:
     REAL_PROCESSED.mkdir(parents=True, exist_ok=True)
     for item in STAGING_PROCESSED.glob("*.json"):
         shutil.copy2(item, REAL_PROCESSED / item.name)
+    # The report sits at the staging root, not in processed/, so a --swap-only
+    # run would otherwise delete the only record of the build it swapped in.
+    report = STAGING / "switch_report.json"
+    if report.exists():
+        shutil.copy2(report, REAL_PROCESSED / report.name)
     shutil.rmtree(STAGING, ignore_errors=True)
     return kept
 

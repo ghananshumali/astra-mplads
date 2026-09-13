@@ -156,10 +156,10 @@ def init_db(force: bool = False) -> None:
         # It is a persistent property of the file, so setting it once is enough.
         #
         # WAL keeps a `-wal` sidecar next to the database. A cloud-sync client
-        # (this repository sits under OneDrive) can lock or half-upload that
-        # file, so set ASTRA_SQLITE_WAL=0 to stay on the rollback journal, or
-        # better, point ASTRA_DB_PATH somewhere outside the synced tree. A
-        # failure here is not fatal: the previous journal mode still works.
+        # (OneDrive, Dropbox, Google Drive) can lock or half-upload that file, so
+        # keep the database outside any synced folder, or set ASTRA_SQLITE_WAL=0
+        # to stay on the rollback journal. A failure here is not fatal: the
+        # previous journal mode still works.
         if os.environ.get("ASTRA_SQLITE_WAL", "1") != "0":
             try:
                 con.execute("PRAGMA journal_mode=WAL")
