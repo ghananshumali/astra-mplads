@@ -223,6 +223,53 @@ def llm_meta():
     return synthesis.llm_status()
 
 
+@app.get("/meta/freshness")
+def freshness_meta():
+    """Per-shard ingestion freshness, with staleness that degrades the figure.
+
+    Deliberately not a single "last updated" label. A slice we have failed to
+    read for days must lower what this reports and be named, not be quietly
+    dropped from an average that then looks healthy. `stale` carries the
+    offenders by place name; `reconciled_pct` counts only slices whose stored
+    record count actually matched the portal's own counter for them.
+    """
+    summary = db.watermark_summary()
+    stale = db.stale_shards(min_failures=3)
+    registered = summary.get("registered_shards") or 0
+    reconciled = summary.get("reconciled") or 0
+    status = "no data" if not registered else (
+        "degraded" if stale or summary.get("mismatched") else "ok")
+    alerts = PROCESSED_DIR / "ingest_alerts.json"
+    poller = PROCESSED_DIR / "poller_status.json"
+    return {
+        "status": status,
+        "registered_shards": registered,
+        "reconciled_shards": reconciled,
+        "reconciled_pct": round(100 * reconciled / registered, 2)
+        if registered else None,
+        "quarantined": summary.get("quarantined") or 0,
+        "count_mismatched": summary.get("mismatched") or 0,
+        "never_fetched": summary.get("never_fetched") or 0,
+        "oldest_shard_fetch": summary.get("oldest_fetch"),
+        "newest_shard_fetch": summary.get("newest_fetch"),
+        "stale": [{
+            "shard_id": s["shard_id"],
+            "place": s.get("constituency_name") or s.get("state_name"),
+            "state": s.get("state_name"),
+            "house": "LS" if s.get("house") == 2 else "RS",
+            "consecutive_failures": s.get("consecutive_failures"),
+            "stale_since": s.get("stale_since"),
+            "last_fetch": s.get("fetched_at"),
+            "last_error": s.get("last_error"),
+        } for s in stale],
+        "alerts_written_at": (
+            json.loads(alerts.read_text(encoding="utf-8")).get("generated_at")
+            if alerts.exists() else None),
+        "poller": (json.loads(poller.read_text(encoding="utf-8")).get("last_cycle")
+                   if poller.exists() else None),
+    }
+
+
 def _case_summary(f: dict) -> dict:
     """List-view projection of a case. Heavy fields stay out of list payloads."""
     return {

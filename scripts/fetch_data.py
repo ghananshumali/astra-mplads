@@ -3,6 +3,7 @@
   python scripts/fetch_data.py                 # auto  (default)
   python scripts/fetch_data.py --mode live     # live official/open interfaces only
   python scripts/fetch_data.py --mode offline  # official CSV exports in datasets/
+  python scripts/fetch_data.py --mode api      # one full sweep of the eSAKSHI REST API
   python scripts/fetch_data.py --no-enrich     # skip live enrichment entirely
 
 auto never blocks: it probes the live official interfaces, uses the most
@@ -20,7 +21,8 @@ from astra.ingestion.router import ingest
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="ASTRA dual-mode MPLADS ingestion")
-    ap.add_argument("--mode", choices=("auto", "live", "offline"), default="auto")
+    ap.add_argument("--mode", choices=("auto", "live", "offline", "api"),
+                    default="auto")
     ap.add_argument("--no-enrich", action="store_true",
                     help="skip live freshness check and pre-2023 baseline pull")
     args = ap.parse_args()
