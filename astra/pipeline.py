@@ -10,6 +10,12 @@ from .agents.orchestrator import Orchestrator
 def run_pipeline(verbose: bool = True) -> dict:
     works = db.read_df("works")
     flows = db.read_df("fundflows")
+    # Which portal report lists each work. Analysis-only: the duplicate check
+    # uses it to tell one work's two portal records from a real double entry.
+    # Empty for a CSV-built corpus, in which case nothing depends on it.
+    listing = db.read_df("work_listing")
+    if not listing.empty and not works.empty:
+        works = works.merge(listing[["work_id", "in_recommended"]], on="work_id", how="left")
     orch = Orchestrator()
     flags = orch.run(works, flows)
     n = db.save_flags(flags)

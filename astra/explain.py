@@ -112,7 +112,7 @@ def humanize(finding: dict) -> dict:
         "agent_label": AGENT_LABEL.get(finding.get("agent", ""), finding.get("agent", "")),
         "severity": sev,
         "severity_label": SEVERITY_LABEL.get(sev, sev.title()),
-        "contribution": weights.get(sev, 0),
+        "contribution": 0 if d.get("portal_record_pair") else weights.get(sev, 0),
         "clause": finding.get("clause"),
         "headline": finding.get("rule_title", rid),
         "plain": finding.get("summary", ""),
@@ -257,6 +257,24 @@ def humanize(finding: dict) -> dict:
         out["actions"] = ["Review the year's sanction and release records for this constituency."]
 
     # ---- entity resolution: near-duplicate
+    elif rid == "D-DUP-01" and d.get("portal_record_pair"):
+        out["headline"] = "Listed twice on the portal: recommendation and sanctioned record"
+        out["plain"] = (
+            f"The portal still lists the original recommendation {d.get('pending_work_id')}"
+            f" (stage \"{d.get('pending_stage') or 'not recorded'}\") alongside the "
+            f"sanctioned record {d.get('sanctioned_work_id')}, for the same member and "
+            f"the same recommendation date ({d.get('recommended_date')}). This is how "
+            f"the portal keeps a work that has moved from recommendation to sanction, "
+            f"so it is probably one work rather than a double entry. It is shown for "
+            f"completeness and does not add to the risk score.")
+        out["metric"] = (f"{d.get('semantic_sim', 0) * 100:.0f}% description match, "
+                         f"same member and date")
+        out["benchmark"] = "one record per work expected"
+        out["actions"] = [
+            f"If needed, confirm on the portal that {d.get('pending_work_id')} is the "
+            f"recommendation that became {d.get('sanctioned_work_id')}.",
+        ]
+
     elif rid == "D-DUP-01":
         same_cost = d.get("same_sanction_amount")
         strong = d.get("evidence_strength") == "strong"

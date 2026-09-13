@@ -150,7 +150,11 @@ class Orchestrator:
         flags: list[Flag] = []
         for (etype, eid), fs in sorted(by_entity.items()):
             fs.sort(key=lambda f: ["critical", "high", "medium", "low"].index(f.severity))
-            score = min(100.0, sum(weights[f.severity] for f in fs))
+            # A portal record pair (one work's recommendation and sanctioned
+            # record, both listed by the portal) stays visible but carries no
+            # weight: it is how the portal records a work, not evidence of risk.
+            score = min(100.0, sum(weights[f.severity] for f in fs
+                                   if not f.details.get("portal_record_pair")))
             meta = self._entity_meta(etype, eid, widx)
             context = {
                 "agency_other_flags": max(0, agency_flagged.get(meta.get("ia_name") or "", 1) - 1),

@@ -26,6 +26,24 @@ false positives. Instead:
 
 Findings are capped per work so one templated cluster cannot dominate the
 review queue.
+
+Records the portal keeps for one work at two stages
+---------------------------------------------------
+When a work is sanctioned, the eSAKSHI portal lists the sanctioned record under
+a new id and work code, and keeps the original recommendation — still at stage
+"NA" — in its recommended report. Both are genuine portal records, and ASTRA
+stores both so its figures equal the portal's. As text they are identical, so
+they clear every gate above; measured on 13 Sep 2026 there were 595 such pairs,
+591 with the same recommendation date and 568 with the same amount.
+
+Calling those "identical recommendation double-entry" would overstate the
+evidence. A pair of a pending recommendation at stage "NA" and a sanctioned
+record the portal lists only from the sanctioned report onward, from the same
+member on the same recommendation date, is therefore reported as a portal
+record pair: kept visible, at low severity, and excluded from the risk score
+(see `portal_record_pair` and `Orchestrator._aggregate`). Two separate
+recommendations of one work, one sanctioned and one still pending, remain an
+ordinary duplicate finding, as does every other near-duplicate.
 """
 from __future__ import annotations
 
@@ -55,6 +73,60 @@ def _locators(text: str) -> set[str]:
     works on the same road or in the same ward - not of duplication.
     """
     return set(re.findall(r"\d+", str(text).lower()))
+
+
+#: How a portal record pair is described wherever a duplication mode is shown.
+PORTAL_RECORD_PAIR = ("the portal lists both the original recommendation and a "
+                      "sanctioned record")
+
+
+def _same_text(a, b) -> bool:
+    """Equal after case and spacing are normalised; a missing value never matches."""
+    def norm(v):
+        if v is None or (not isinstance(v, str) and pd.isna(v)):
+            return ""
+        return " ".join(str(v).upper().split())
+    return bool(norm(a)) and norm(a) == norm(b)
+
+
+def portal_record_pair(ra, rb) -> tuple | None:
+    """(pending, sanctioned) if two matched records look like one work at two
+    stages on the portal, else None.
+
+    All of these must hold, because together they are the pattern measured on
+    the portal and nothing weaker is:
+
+    * one record is a pending recommendation (an `ES-` id, which the portal
+      gives only before sanction) at stage "NA";
+    * the other is a sanctioned record (a `WS/` work code) that the portal
+      does NOT list in its recommended report (`in_recommended` == 0, joined
+      from `work_listing` by the pipeline) — so the pending row is the only
+      recommendation it has;
+    * both name the same member and the same recommendation date.
+
+    A pending record at "Pending for Sanction" beside a sanctioned record that
+    is itself in the recommended report is two separate recommendations — 180
+    such pairs on 13 Sep 2026, usually with consecutive portal ids — and stays
+    an ordinary duplicate finding. Without listing data, nothing is relabelled.
+    Amounts are not required to agree: a sanction can differ from the estimate.
+    """
+    a_id, b_id = str(ra["work_id"]), str(rb["work_id"])
+    if a_id.startswith("ES-") and b_id.startswith("WS/"):
+        pending, sanctioned = ra, rb
+    elif b_id.startswith("ES-") and a_id.startswith("WS/"):
+        pending, sanctioned = rb, ra
+    else:
+        return None
+    if not _same_text(pending.get("status"), "NA"):
+        return None
+    listed = sanctioned.get("in_recommended")
+    if listed is None or pd.isna(listed) or int(listed) != 0:
+        return None
+    if not _same_text(pending.get("mp_name"), sanctioned.get("mp_name")):
+        return None
+    if not _same_text(pending.get("recommended_date"), sanctioned.get("recommended_date")):
+        return None
+    return pending, sanctioned
 
 
 def _haversine_km(lat1, lon1, lat2, lon2) -> float:
@@ -186,7 +258,11 @@ class EntityResolutionAgent(BaseAgent):
                     strong = (sem >= 0.97 and len(shared) >= 4) or (exact and same_cost)
                     severity = cfg["severity"] if strong else "medium"
                     same_mp = str(ra.get("mp_name")) == str(rb.get("mp_name"))
-                    if cross_era:
+                    record_pair = portal_record_pair(ra, rb)
+                    if record_pair is not None:
+                        severity = "low"
+                        mode = PORTAL_RECORD_PAIR
+                    elif cross_era:
                         mode = "cross-era re-entry (physical -> eSAKSHI migration)"
                     elif not same_mp:
                         mode = "cross-MP overlap (constituency-boundary duplication)"
@@ -200,6 +276,47 @@ class EntityResolutionAgent(BaseAgent):
                         if per_work.get(wid, 0) >= cfg["max_findings_per_work"]:
                             continue
                         per_work[wid] = per_work.get(wid, 0) + 1
+                        if record_pair is not None:
+                            pending, sanctioned = record_pair
+                            out.append(Finding(
+                                agent="entity_resolution",
+                                rule_id=cfg["id"],
+                                rule_title=cfg["title"],
+                                severity=severity,
+                                entity_type="work",
+                                entity_id=wid,
+                                summary=(
+                                    f"Probably the same work as {other['work_id']}: the "
+                                    f"portal lists the original recommendation "
+                                    f"{pending['work_id']} (stage "
+                                    f"{pending.get('status') or 'not recorded'}) and the "
+                                    f"sanctioned record {sanctioned['work_id']} separately, "
+                                    f"both recommended by {pending.get('mp_name')} on "
+                                    f"{pending.get('recommended_date')}. Shown for "
+                                    f"completeness; it adds nothing to the risk score."
+                                ),
+                                details={
+                                    "pair_work_id": str(other["work_id"]),
+                                    "portal_record_pair": True,
+                                    "pending_work_id": str(pending["work_id"]),
+                                    "sanctioned_work_id": str(sanctioned["work_id"]),
+                                    "pending_stage": pending.get("status"),
+                                    "recommended_date": pending.get("recommended_date"),
+                                    "semantic_sim": round(min(score, 1.0), 3),
+                                    "fuzzy_score": float(fz),
+                                    "duplication_mode": mode,
+                                    "evidence_strength": "portal record pair",
+                                    "same_amount": bool(
+                                        pd.notna(pending.get("estimated_cost"))
+                                        and pd.notna(sanctioned.get("sanctioned_amount"))
+                                        and float(pending["estimated_cost"])
+                                        == float(sanctioned["sanctioned_amount"])),
+                                    "other_description": str(other["description"])[:180],
+                                    "this_description": str(this["description"])[:180],
+                                    "other_mp": other.get("mp_name"),
+                                },
+                            ))
+                            continue
                         out.append(Finding(
                             agent="entity_resolution",
                             rule_id=cfg["id"],
