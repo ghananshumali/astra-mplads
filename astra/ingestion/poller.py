@@ -56,7 +56,7 @@ import signal
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from .. import db
 from ..config import PROCESSED_DIR
@@ -70,8 +70,19 @@ from .esakshi_api import (HOUSE_LS, HOUSE_RS, RECORD_TILES, EsakshiClient,
 #: over-samples; going faster multiplies load on the portal for latency that
 #: the portal's own data-entry lag dwarfs.
 POLL_INTERVAL = float(os.environ.get("ASTRA_POLL_INTERVAL", "60"))
-#: Local clock time for the nightly record-level reconciliation, HH:MM.
+#: Local clock time for the nightly record-level reconciliation, HH:MM, or
+#: "off". This is a preferred slot, not a trigger: a sweep that misses its
+#: slot runs as soon as the poller is next awake.
 RECONCILE_AT = os.environ.get("ASTRA_RECONCILE_AT", "03:00")
+#: A failed or partial sweep is not recorded as done; wait this long before
+#: trying again, so an unreachable portal is not hammered every minute.
+RETRY_GAP = timedelta(minutes=int(os.environ.get("ASTRA_RETRY_GAP_MIN", "30")))
+#: Share of shards a sweep must read successfully to count as a real sweep.
+#: A sweep run while the circuit breaker is open fails every shard in
+#: seconds; recording that as "done" would skip the safety net for a day.
+HEALTHY_SWEEP = float(os.environ.get("ASTRA_HEALTHY_SWEEP", "0.9"))
+#: How often the shard registry is re-enumerated from the portal.
+REGISTRY_EVERY = timedelta(hours=24)
 #: Houses to watch: 2 = Lok Sabha, 1 = Rajya Sabha.
 HOUSES = tuple(int(h) for h in
                os.environ.get("ASTRA_HOUSES", "2,1").replace(" ", "").split(",") if h)
@@ -90,6 +101,50 @@ PENDING = (validate.DIRTY, validate.FETCHED, validate.RETRY, validate.QUARANTINE
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _parse_ts(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        stamp = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)
+
+
+def parse_reconcile_at(at: str | None) -> tuple[int, int] | None:
+    """`"03:00"` -> (3, 0). `"off"`, blanks and invalid times disable it."""
+    text = (at or "").strip().lower()
+    if text in ("", "off", "none", "disabled"):
+        return None
+    try:
+        hour, minute = (int(part) for part in text.split(":"))
+    except ValueError:
+        return None
+    if not (0 <= hour < 24 and 0 <= minute < 60):
+        return None
+    return hour, minute
+
+
+def most_recent_slot(now: datetime, at: str | None = RECONCILE_AT) -> datetime | None:
+    """The latest scheduled sweep time at or before `now`.
+
+    The sweep is due whenever the last successful one is older than this
+    slot. That single rule covers every case: the normal 03:00 run, a slot
+    slept through (runs on waking), a heartbeat that ran long across the
+    slot (runs on the next loop), several days asleep (runs once, not once
+    per missed day), and never having run at all.
+    """
+    parsed = parse_reconcile_at(at)
+    if parsed is None:
+        return None
+    if now.tzinfo is None:
+        now = now.astimezone()
+    slot = now.replace(hour=parsed[0], minute=parsed[1], second=0, microsecond=0)
+    if slot > now:
+        slot -= timedelta(days=1)
+    return slot
 
 
 def national_shard_id(house: int) -> str:
@@ -150,6 +205,7 @@ class Poller:
                  "constituency_id": s.constituency_id, "state_name": s.state_name,
                  "constituency_name": s.constituency_name} for s in shards]
         db.save_shards(rows)
+        db.set_state("last_registry_at", _now())
         self.log(f"registry: {len(rows)} shards "
                  + ", ".join(f"house {h}={sum(1 for s in shards if s.house == h)}"
                              for h in self.houses))
@@ -465,6 +521,10 @@ class Poller:
                    "unchanged": 0, "changed": 0, "versions": 0,
                    "quarantined": [], "count_mismatch": [], "missing_locally": {}}
         self.log(f"full reconciliation over {len(shards)} shards")
+        full = house is None
+        if full:
+            db.set_state("last_reconcile_attempt_at", _now())
+        ok_shards = 0
         summary["upper_levels_recorded"] = self._snapshot_upper_levels(
             (house,) if house else self.houses)
         for index, shard in enumerate(shards, 1):
@@ -486,6 +546,8 @@ class Poller:
                 summary["unchanged"] += 1
             else:
                 summary["quarantined"].append(shard.shard_id)
+            if outcome["status"] in (validate.STORED, "unchanged"):
+                ok_shards += 1
             if self.verbose and index % 50 == 0:
                 self.log(f"  {index}/{len(shards)} "
                          f"({time.monotonic() - started:.0f}s)")
@@ -494,11 +556,21 @@ class Poller:
                 break
         summary["seconds"] = round(time.monotonic() - started, 1)
         summary["finished_at"] = _now()
+        summary["ok_shards"] = ok_shards
+        # Only a whole, healthy sweep counts. A partial one (--house), one
+        # stopped early, or one run against an unreachable portal must stay
+        # due, or the safety net would be skipped for a day while looking done.
+        healthy = (full and "stopped_early_at" not in summary and bool(shards)
+                   and ok_shards / len(shards) >= HEALTHY_SWEEP)
+        summary["recorded_as_complete"] = healthy
+        if healthy:
+            db.set_state("last_reconcile_at", summary["finished_at"])
         self.log(f"reconciliation done in {summary['seconds']}s: "
                  f"{summary['stored']:,} records, "
                  f"{summary['changed']} changed, "
                  f"{len(summary['quarantined'])} quarantined, "
-                 f"{len(summary['count_mismatch'])} count mismatches")
+                 f"{len(summary['count_mismatch'])} count mismatches"
+                 + ("" if healthy else " — NOT recorded as complete; still due"))
         return summary
 
     def _snapshot_upper_levels(self, houses: tuple[int, ...]) -> int:
@@ -546,6 +618,38 @@ class Poller:
                 recorded += 1
         return recorded
 
+    # ------------------------------------------------------------- schedule
+    def reconcile_due(self, now: datetime | None = None,
+                      at: str | None = RECONCILE_AT) -> bool:
+        """Is the nightly sweep owed? Decided from the database, not memory.
+
+        This replaces an exact-minute check that silently skipped the whole
+        safety net whenever the machine slept through 03:00 or a heartbeat
+        happened to run long across it.
+        """
+        now = now or datetime.now().astimezone()
+        slot = most_recent_slot(now, at)
+        if slot is None:
+            return False
+        last_ok = _parse_ts(db.get_state("last_reconcile_at"))
+        if last_ok is not None and last_ok >= slot:
+            return False
+        last_try = _parse_ts(db.get_state("last_reconcile_attempt_at"))
+        if last_try is not None and now - last_try < RETRY_GAP:
+            return False
+        return True
+
+    def registry_due(self, now: datetime | None = None) -> bool:
+        """Wall-clock and persisted, so sleep and restarts cannot postpone it."""
+        now = now or datetime.now(timezone.utc)
+        last_ok = _parse_ts(db.get_state("last_registry_at"))
+        if last_ok is not None and now - last_ok < REGISTRY_EVERY:
+            return False
+        last_try = _parse_ts(db.get_state("last_registry_attempt_at"))
+        if last_try is not None and now - last_try < RETRY_GAP:
+            return False
+        return True
+
     # ------------------------------------------------------------ the loop
     def _write_status(self, report: CycleReport) -> None:
         PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
@@ -553,6 +657,8 @@ class Poller:
             {"last_cycle": report.as_dict(),
              "poll_interval_seconds": POLL_INTERVAL,
              "reconcile_at": RECONCILE_AT,
+             "last_reconcile_at": db.get_state("last_reconcile_at"),
+             "last_registry_at": db.get_state("last_registry_at"),
              "houses": list(self.houses),
              "watermarks": db.watermark_summary(),
              "cache": shard_cache.usage()}, indent=2, default=str),
@@ -566,8 +672,6 @@ class Poller:
         signal.signal(signal.SIGTERM, self.stop)
         if not db.load_shards():
             self.refresh_registry()
-        last_registry = time.monotonic()
-        last_reconcile_day = None
         self.log(f"watching every {POLL_INTERVAL:.0f}s; nightly sweep at "
                  f"{RECONCILE_AT}; houses {self.houses}")
         while not self._stop:
@@ -581,17 +685,17 @@ class Poller:
             except Exception as exc:                 # a cycle must never kill it
                 self.log(f"cycle error: {type(exc).__name__}: {exc}")
 
-            if time.monotonic() - last_registry > 86_400:
+            if self.registry_due():
+                db.set_state("last_registry_attempt_at", _now())
                 try:
                     self.refresh_registry()
-                    last_registry = time.monotonic()
                 except SourceError as exc:
                     self.log(f"registry refresh failed: {exc}")
 
-            today = datetime.now().strftime("%Y-%m-%d")
-            if (datetime.now().strftime("%H:%M") == RECONCILE_AT
-                    and last_reconcile_day != today):
-                last_reconcile_day = today
+            if self.reconcile_due():
+                last = db.get_state("last_reconcile_at")
+                self.log("nightly sweep is due "
+                         + (f"(last completed {last})" if last else "(never completed)"))
                 try:
                     self.reconcile_all()
                 except Exception as exc:

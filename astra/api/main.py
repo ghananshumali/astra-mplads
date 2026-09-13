@@ -237,8 +237,23 @@ def freshness_meta():
     stale = db.stale_shards(min_failures=3)
     registered = summary.get("registered_shards") or 0
     reconciled = summary.get("reconciled") or 0
+    last_sweep = db.get_state("last_reconcile_at")
+    sweep_age_h = None
+    if last_sweep:
+        from datetime import datetime, timezone
+        stamp = datetime.fromisoformat(last_sweep)
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        sweep_age_h = round(
+            (datetime.now(timezone.utc) - stamp).total_seconds() / 3600, 1)
+    # The safety net not having run is itself a freshness problem: the
+    # heartbeat cannot see edits that move no count. Allow a day plus slack.
+    sweep_overdue = bool(registered) and (sweep_age_h is None or sweep_age_h > 26)
+    # A count that differs from the portal by the tolerated single record is
+    # reported, but does not degrade the status: the tolerance exists because
+    # that skew is expected, and a permanent warning would be ignored.
     status = "no data" if not registered else (
-        "degraded" if stale or summary.get("mismatched") else "ok")
+        "degraded" if stale or sweep_overdue else "ok")
     alerts = PROCESSED_DIR / "ingest_alerts.json"
     poller = PROCESSED_DIR / "poller_status.json"
     return {
@@ -250,6 +265,9 @@ def freshness_meta():
         "quarantined": summary.get("quarantined") or 0,
         "count_mismatched": summary.get("mismatched") or 0,
         "never_fetched": summary.get("never_fetched") or 0,
+        "last_full_reconciliation": last_sweep,
+        "hours_since_reconciliation": sweep_age_h,
+        "reconciliation_overdue": sweep_overdue,
         "oldest_shard_fetch": summary.get("oldest_fetch"),
         "newest_shard_fetch": summary.get("newest_fetch"),
         "stale": [{

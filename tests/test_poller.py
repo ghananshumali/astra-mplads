@@ -441,6 +441,93 @@ def test_after_sweep(tiles) -> None:
           report.dirty == ("2:33:418",), str(report.dirty))
 
 
+def test_schedule(tiles) -> None:
+    print("\n[8d] the schedule survives sleep, restarts and a busy loop")
+    from datetime import datetime, timedelta, timezone
+    IST = timezone(timedelta(hours=5, minutes=30))
+
+    def at(day: int, hh: int, mm: int) -> datetime:
+        return datetime(2026, 9, day, hh, mm, tzinfo=IST)
+
+    def stamp(dt: datetime) -> str:
+        return dt.astimezone(timezone.utc).isoformat()
+
+    check("03:00 parses", pmod.parse_reconcile_at("03:00") == (3, 0))
+    check("'off' disables the sweep", pmod.parse_reconcile_at("off") is None)
+    check("an impossible time disables it rather than crashing",
+          pmod.parse_reconcile_at("99:99") is None)
+    check("the slot before 03:00 is yesterday's",
+          pmod.most_recent_slot(at(13, 2, 0), "03:00") == at(12, 3, 0))
+    check("the slot after 03:00 is today's",
+          pmod.most_recent_slot(at(13, 8, 0), "03:00") == at(13, 3, 0))
+
+    portal = FakePortal(tiles)
+    poller = fresh_poller(portal)
+    check("a sweep that has never run is due",
+          poller.reconcile_due(now=at(13, 14, 0), at="03:00"))
+
+    # the bug this fixes: the laptop slept from 01:00 to 08:00, straight
+    # through the 03:00 slot
+    db.set_state("last_reconcile_at", stamp(at(12, 3, 10)))
+    check("sleeping through 03:00 leaves the sweep due on waking at 08:00",
+          poller.reconcile_due(now=at(13, 8, 0), at="03:00"))
+    check("but it is not due before today's slot has arrived",
+          not poller.reconcile_due(now=at(13, 2, 0), at="03:00"))
+    check("a heartbeat that ran long across 03:00 still finds it due at 03:02",
+          poller.reconcile_due(now=at(13, 3, 2), at="03:00"))
+
+    db.set_state("last_reconcile_at", stamp(at(9, 3, 10)))
+    check("three days asleep makes it due", poller.reconcile_due(now=at(13, 8, 0),
+                                                                 at="03:00"))
+
+    summary = poller.reconcile_all()
+    check("a healthy full sweep is recorded as complete",
+          summary["recorded_as_complete"] is True
+          and db.get_state("last_reconcile_at") is not None,
+          f"ok_shards={summary['ok_shards']}/{summary['shards']}")
+    real_now = datetime.now().astimezone()
+    check("so it runs once, not once per missed day",
+          not poller.reconcile_due(now=real_now, at="03:00"))
+
+    restarted = pmod.Poller(client=portal, houses=(HOUSE_LS,), verbose=False)
+    check("a restarted poller remembers it, because it lives in the database",
+          not restarted.reconcile_due(now=real_now, at="03:00"))
+
+    print("\n[8e] a sweep that did not really happen is not recorded as done")
+    db.set_state("last_reconcile_at", stamp(at(9, 3, 10)))
+    for shard in poller.registry():
+        portal.fail_shards.add(shard.shard_id)
+    failed = poller.reconcile_all()
+    portal.fail_shards.clear()
+    check("a sweep against an unreachable portal is not marked complete",
+          failed["recorded_as_complete"] is False,
+          f"ok_shards={failed['ok_shards']}/{failed['shards']}")
+    check("the last good sweep time is left untouched",
+          db.get_state("last_reconcile_at") == stamp(at(9, 3, 10)))
+    just_after = datetime.now().astimezone() + timedelta(minutes=5)
+    check("it is not retried every minute (retry gap)",
+          not poller.reconcile_due(now=just_after, at="03:00"))
+    check("but it is due again once the retry gap has passed",
+          poller.reconcile_due(now=just_after + pmod.RETRY_GAP, at="03:00"))
+
+    db.set_state("last_reconcile_at", stamp(at(9, 3, 10)))
+    partial = poller.reconcile_all(house=HOUSE_LS)
+    check("a single-house sweep does not count as the nightly sweep",
+          partial["recorded_as_complete"] is False)
+
+    print("\n[8f] the registry refresh is wall-clock, not a sleeping monotonic clock")
+    db.set_state("last_registry_at", stamp(datetime.now(IST)))
+    check("a fresh registry is not due",
+          not poller.registry_due(now=datetime.now(timezone.utc)))
+    db.set_state("last_registry_at",
+                 stamp(datetime.now(IST) - timedelta(hours=25)))
+    check("a registry last refreshed 25 hours ago is due, sleep or no sleep",
+          poller.registry_due(now=datetime.now(timezone.utc)))
+    poller.refresh_registry()
+    check("refreshing it records the time",
+          not poller.registry_due(now=datetime.now(timezone.utc)))
+
+
 def test_kill_switch(tiles) -> None:
     print("\n[10] the kill switch and the status file")
     check("ASTRA_POLLER_ENABLED is honoured at import",
@@ -473,6 +560,27 @@ def test_freshness_endpoint(tiles) -> None:
     check("a healthy sweep reports ok", ok["status"] == "ok", json.dumps(ok)[:140])
     check("it reports reconciled shards as a percentage",
           ok["reconciled_pct"] is not None, str(ok["reconciled_pct"]))
+    check("it reports when the safety net last ran",
+          ok["last_full_reconciliation"] is not None
+          and ok["reconciliation_overdue"] is False,
+          f"{ok['hours_since_reconciliation']}h ago")
+
+    # a count off by the tolerated single record is reported, not alarmed on
+    db.save_watermark("2:36:500", n_records=5, lifecycle=validate.STORED,
+                      n_stored=6, count_matched=False, fetched=True)
+    skew = client.get("/meta/freshness").json()
+    check("a tolerated one-record skew is counted but does not degrade status",
+          skew["status"] == "ok" and skew["count_mismatched"] >= 1,
+          f"status={skew['status']}, mismatched={skew['count_mismatched']}")
+
+    from datetime import datetime, timedelta, timezone
+    db.set_state("last_reconcile_at",
+                 (datetime.now(timezone.utc) - timedelta(hours=30)).isoformat())
+    overdue = client.get("/meta/freshness").json()
+    check("a safety net that has not run in 30 hours degrades the status",
+          overdue["status"] == "degraded" and overdue["reconciliation_overdue"],
+          f"status={overdue['status']}, {overdue['hours_since_reconciliation']}h")
+    poller.reconcile_all()
 
     shard = next(s for s in poller.registry() if s.shard_id == "2:33:419")
     portal.fail_shards.add("2:33:419")
@@ -526,12 +634,13 @@ def main() -> int:
                    test_gates_in_the_loop, test_transient_recovery,
                    test_genuinely_empty, test_failure_and_escalation,
                    test_restart_resumes, test_reconcile, test_after_sweep,
-                   test_kill_switch,
+                   test_schedule, test_kill_switch,
                    test_freshness_endpoint):
             db.init_db(force=True)
             with db.connect() as con:
                 for table in ("works", "shards", "shard_watermarks",
-                              "work_versions", "provenance"):
+                              "work_versions", "provenance",
+                              "poller_state"):
                     con.execute(f"DELETE FROM {table}")
             fn(tiles)
         if "--live" in sys.argv:

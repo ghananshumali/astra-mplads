@@ -9,6 +9,8 @@ Tables:
   shards           — the pollable slices of the eSAKSHI portal (live path)
   shard_watermarks — what the portal last told us about each slice (live path)
   work_versions    — append-only log of every observed change to a work
+  poller_state     — the poller's schedule: when each periodic job last
+                     succeeded, so a restart or a sleep catches up
 
 Two distinct write paths
 ------------------------
@@ -81,6 +83,9 @@ CREATE TABLE IF NOT EXISTS shard_watermarks (
 CREATE TABLE IF NOT EXISTS work_versions (
     work_id TEXT, observed_at TEXT, field TEXT, old_value TEXT, new_value TEXT,
     shard_id TEXT, PRIMARY KEY (work_id, observed_at, field)
+);
+CREATE TABLE IF NOT EXISTS poller_state (
+    key TEXT PRIMARY KEY, value TEXT, updated_at TEXT
 );
 CREATE INDEX IF NOT EXISTS ix_flags_state ON flags(state);
 CREATE INDEX IF NOT EXISTS ix_flags_status ON flags(review_status);
@@ -404,6 +409,27 @@ def mark_shard_failure(shard_id: str, error: str, *,
         row = con.execute("SELECT consecutive_failures FROM shard_watermarks "
                           "WHERE shard_id = ?", (shard_id,)).fetchone()
     return int(row["consecutive_failures"]) if row else 1
+
+
+def get_state(key: str) -> str | None:
+    """A value from the poller's persistent schedule, or None if never set."""
+    init_db()
+    with connect() as con:
+        row = con.execute("SELECT value FROM poller_state WHERE key = ?",
+                          (key,)).fetchone()
+    return row["value"] if row else None
+
+
+def set_state(key: str, value: str) -> None:
+    """Record a schedule value. Kept in the database, not in process memory,
+    so a restart, a crash or a sleeping laptop does not forget it."""
+    init_db()
+    with connect() as con:
+        con.execute(
+            "INSERT INTO poller_state (key, value, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value, "
+            "updated_at=excluded.updated_at",
+            (key, value, datetime.now(timezone.utc).isoformat()))
 
 
 def stale_shards(min_failures: int = 3) -> list[dict]:
