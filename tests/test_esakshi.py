@@ -155,6 +155,12 @@ def test_mapping(tiles: dict[str, list[dict]]) -> list:
     es_keyed = [w for w in works if w.work_id.startswith("ES-")]
     check("sanctioned works keep their WS code", bool(coded),
           f"{len(coded)} coded, {len(es_keyed)} pre-sanction keyed ES-")
+    check("pre-sanction ids carry the house (ES-LS-<id>)",
+          all(w.work_id.startswith("ES-LS-") for w in es_keyed),
+          ", ".join(w.work_id for w in es_keyed[:3]))
+    check("payments attach through the expenditure tile's WORK_ID",
+          sum(1 for w in works if w.total_paid) > 0,
+          f"{sum(1 for w in works if w.total_paid)} works with payments")
     check("category is populated (anomaly peer-group key)",
           all(w.category for w in works))
     check("house is set", {w.house for w in works} == {"LS"})
@@ -167,6 +173,142 @@ def test_mapping(tiles: dict[str, list[dict]]) -> list:
     check("expenditure never exceeds nothing",
           all(w.expenditure is None or w.expenditure >= 0 for w in works))
     return works
+
+
+def test_shared_portal_ids(tiles: dict[str, list[dict]]) -> None:
+    """The portal's record id is not unique: two different works can share it."""
+    print("\n[3b] two different works sharing one portal id are both kept")
+    import copy
+
+    base = emap.to_works(tiles)
+    paid = next(w for w in base if w.total_paid and w.work_id.startswith("WS/"))
+    dtl = int(paid.work_id.rsplit("/", 1)[1])
+    donor = next(r for r in tiles["recommended"]
+                 if r.get("WORK_RECOMMENDATION_DTL_ID") not in (None, dtl))
+
+    # Rajya Sabha UP, 13 Sep 2026: a sanctioned work and an unrelated work
+    # awaiting sanction, same id, same report.
+    pending = copy.deepcopy(donor)
+    pending.update({"WORK_RECOMMENDATION_DTL_ID": dtl,
+                    "ACTIVITY_NAME": "NA-Construction of rooms and halls in school and colleges",
+                    "MP_NAME": "Another Member", "WORK_STAGE": "NA",
+                    "SANCTION_DATE": None, "SANCTION_AMOUNT": None,
+                    "WORK_DESCRIPTION": "An unrelated school work", "Sno": 99999})
+    shared = {**tiles, "recommended": tiles["recommended"] + [pending]}
+    works = {w.work_id: w for w in emap.to_works(shared)}
+    check("both works survive", len(works) == len(base) + 1,
+          f"{len(base)} -> {len(works)}")
+    other = works.get(f"ES-LS-{dtl}")
+    check("the pending work is keyed by house and id", other is not None)
+    check("it does not inherit the sanctioned work's stage, sanction or payments",
+          other is not None and other.status == "NA" and other.sanction_date is None
+          and not other.total_paid and other.vendor_name is None,
+          other and f"status={other.status}, paid={other.total_paid}")
+    kept = works.get(paid.work_id)
+    check("the sanctioned work keeps its own payments",
+          kept is not None and kept.total_paid == paid.total_paid
+          and kept.vendor_name == paid.vendor_name,
+          kept and f"paid={kept.total_paid} vendor={kept.vendor_name}")
+    check("a shared id across a sanctioned and a pending work is not a duplicate listing",
+          emap.map_shard(shared).duplicates == [])
+
+    # Rajampet (LS) and a Madhya Pradesh Rajya Sabha member, 13 Sep 2026.
+    rs = copy.deepcopy(pending)
+    rs["HOUSE_OF_PARLIAMENT"] = 1
+    ls_id = emap.to_works({"recommended": [pending]})[0].work_id
+    rs_id = emap.to_works({"recommended": [rs]})[0].work_id
+    check("the same pending id in two houses gives two work ids",
+          ls_id != rs_id and rs_id == f"ES-RS-{dtl}", f"{ls_id} / {rs_id}")
+
+    twin = copy.deepcopy(pending)
+    twin["WORK_DESCRIPTION"] = "A second, different pending work"
+    both = emap.map_shard({**tiles, "recommended": tiles["recommended"] + [pending, twin]})
+    ids = {w.work_id for w in both.works}
+    check("two different works listed under one key are both kept, as the portal shows both",
+          {f"ES-LS-{dtl}", f"ES-LS-{dtl}#2"} <= ids, str(sorted(i for i in ids if "ES-" in i)))
+    check("and the double listing is reported",
+          any(d["work_id"] == f"ES-LS-{dtl}" and d["distinct_records"] == 2
+              for d in both.duplicates), str(both.duplicates)[:120])
+    echo = copy.deepcopy(pending)
+    echo["Sno"], echo["ATTACH_ID"] = 100000, 42
+    listed_twice = emap.map_shard({**tiles, "recommended": tiles["recommended"] + [pending, echo]})
+    check("the same record listed twice (row number or attachment differ) is one work",
+          sum(1 for w in listed_twice.works if w.work_id.startswith(f"ES-LS-{dtl}")) == 1)
+    check("counted twice, as the portal's own count counts it",
+          listed_twice.listing[f"ES-LS-{dtl}"]["in_recommended"] == 2)
+
+    # A work sanctioned between two report reads: pending in one report, coded
+    # in the next. Matching stays exact, so nothing is attached on a guess; the
+    # sanctioned record stands as its own work until a consistent read retires
+    # the pending one.
+    uncoded = copy.deepcopy(next(r for r in tiles["recommended"]
+                                 if r.get("WORK_RECOMMENDATION_DTL_ID") == dtl))
+    uncoded["ACTIVITY_NAME"] = "NA-" + (emap.activity_type(uncoded["ACTIVITY_NAME"]) or "")
+    raced = {**tiles, "recommended": [r for r in tiles["recommended"]
+                                      if r.get("WORK_RECOMMENDATION_DTL_ID") != dtl]
+             + [uncoded]}
+    split = {w.work_id: w for w in emap.map_shard(raced).works}
+    check("a sanction read a moment later never attaches to a pending work by id alone",
+          split.get(f"ES-LS-{dtl}") is not None and not split[f"ES-LS-{dtl}"].total_paid
+          and split.get(paid.work_id) is not None
+          and split[paid.work_id].total_paid == paid.total_paid,
+          f"pending paid={split.get(f'ES-LS-{dtl}') and split[f'ES-LS-{dtl}'].total_paid}")
+
+
+def test_portal_figures(tiles: dict[str, list[dict]]) -> None:
+    """ASTRA must reproduce the portal's four tiles from what it maps."""
+    print("\n[3c] every portal tile figure is reproduced, and nothing listed is dropped")
+    import copy
+
+    mapping = emap.map_shard(tiles)
+    figures = emap.portal_figures(mapping.listing,
+                                  {w.work_id: w.model_dump() for w in mapping.works})
+    real = {t: [r for r in tiles[t] if r.get("WORK_RECOMMENDATION_DTL_ID") is not None]
+            for t in RECORD_TILES}
+    check("Works Recommended count and rupees equal the report's",
+          figures["recommended"] == (len(real["recommended"]), round(sum(
+              r["RECOMMENDED_AMOUNT"] or 0 for r in real["recommended"]), 2)),
+          str(figures["recommended"]))
+    check("Works Sanctioned count and rupees equal the report's",
+          figures["sanctioned"] == (len(real["sanctioned"]), round(sum(
+              r["SANCTION_AMOUNT"] or 0 for r in real["sanctioned"]), 2)),
+          str(figures["sanctioned"]))
+    sanction_of = {emap._key(r): r["SANCTION_AMOUNT"] or 0 for r in real["sanctioned"]}
+    check("Works Completed is the sanctioned amount of completed works (portal definition)",
+          figures["completed"] == (len(real["completed"]), round(sum(
+              sanction_of.get(emap._key(r), 0) for r in real["completed"]), 2)),
+          str(figures["completed"]))
+    check("expenditure is every payment tranche",
+          abs(figures["expenditure"][1] - sum(r["FUND_DISBURSED_AMT"] or 0
+                                               for r in real["expenditure"])) < 0.01,
+          str(figures["expenditure"]))
+
+    # a sanctioned, paid work that no recommended report lists (608 on 13 Sep 2026)
+    held_back = next(r for r in real["sanctioned"]
+                     if any(e["WORK_RECOMMENDATION_DTL_ID"] == r["WORK_RECOMMENDATION_DTL_ID"]
+                            for e in real["expenditure"]))
+    missing = {**tiles, "recommended": [r for r in tiles["recommended"]
+                                        if emap._key(r) != emap._key(held_back)]}
+    m = emap.map_shard(missing)
+    work = next((w for w in m.works if w.work_id == emap.row_code(held_back)), None)
+    check("a work listed only from the sanctioned report onward is still a work",
+          work is not None and work.sanctioned_amount and work.total_paid,
+          work and f"sanctioned={work.sanctioned_amount} paid={work.total_paid}")
+    check("it is not counted as recommended, exactly as the portal does not",
+          m.listing[work.work_id]["in_recommended"] == 0
+          and m.listing[work.work_id]["in_sanctioned"] == 1 if work else False)
+    after = emap.portal_figures(m.listing, {w.work_id: w.model_dump() for w in m.works})
+    check("so sanctioned, completed and expenditure figures are unchanged by its absence",
+          after["sanctioned"] == figures["sanctioned"]
+          and after["completed"] == figures["completed"]
+          and abs(after["expenditure"][1] - figures["expenditure"][1]) < 0.01)
+
+    token = copy.deepcopy(real["recommended"][0])
+    token.update({"WORK_RECOMMENDATION_DTL_ID": 999001, "ACTIVITY_NAME": "NA-Test",
+                  "RECOMMENDED_AMOUNT": 1.0, "WORK_DESCRIPTION": "test"})
+    kept = emap.map_shard({**tiles, "recommended": tiles["recommended"] + [token]})
+    check("a one-rupee placeholder the portal lists is kept, not filtered as fake",
+          any(w.work_id == "ES-LS-999001" and w.estimated_cost == 1.0 for w in kept.works))
 
 
 def test_corpus_equivalence(works: list) -> None:
@@ -351,6 +493,8 @@ def main() -> int:
         skip("corpus equivalence", "no fixtures and no network")
     else:
         works = test_mapping(tiles)
+        test_shared_portal_ids(tiles)
+        test_portal_figures(tiles)
         test_corpus_equivalence(works)
     test_rajya_sabha_shape()
     test_breaker()

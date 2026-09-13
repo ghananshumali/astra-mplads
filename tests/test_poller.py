@@ -77,6 +77,15 @@ class FakePortal:
         self.truncate_shards: set[str] = set()
         self.truncate_once: set[str] = set()
         self.zero_shards: set[str] = set()
+        #: exact reports for one slice, served verbatim, with the watermark
+        #: computed from them the way the portal computes its tiles
+        self.shard_tiles: dict[str, dict[str, list[dict]]] = {}
+        #: counts the portal claims regardless of its reports (an inconsistent read)
+        self.claimed_counts: dict[str, dict[str, int]] = {}
+        #: portal ids the shared reports no longer list
+        self.dropped: set = set()
+        #: how many shared recommended rows a slice's report is cut from
+        self.slice_n: dict[str, int] = {}
         self.breaker = _NullBreaker()
 
     # -- the interface Poller uses
@@ -99,15 +108,71 @@ class FakePortal:
         state, const, _mp, house = combo.split(",")[:4]
         return f"{house}:{state}:{const}"
 
+    def _report(self, shard_id: str) -> dict[str, list[dict]]:
+        """The four reports a slice lists, before any simulated fault.
+
+        The later reports list only works the slice's recommended report
+        holds, as on the portal; otherwise every unlisted payment in the shared
+        fixture would become a work of its own.
+        """
+        if shard_id in self.shard_tiles:
+            return self.shard_tiles[shard_id]
+        want = self.slice_n.get(shard_id, self.n.get(shard_id, 0))
+        rec = [r for r in self.tiles["recommended"][:want]
+               if r.get("WORK_RECOMMENDATION_DTL_ID") not in self.dropped]
+        held = {r.get("WORK_RECOMMENDATION_DTL_ID") for r in rec}
+        out = {"recommended": rec}
+        for tile in ("sanctioned", "completed", "expenditure"):
+            out[tile] = [r for r in self.tiles.get(tile) or []
+                         if r.get("WORK_RECOMMENDATION_DTL_ID") in held]
+        return out
+
+    @staticmethod
+    def figures(tiles: dict[str, list[dict]]) -> dict[str, tuple]:
+        """The portal's four tiles, computed straight from raw rows.
+
+        Deliberately independent of `esakshi_map.portal_figures`, so a parity
+        check against it tests the mapping and the storage, not itself.
+        """
+        from astra.ingestion import esakshi_map as emap
+        real = {t: [r for r in tiles.get(t) or []
+                    if r.get("WORK_RECOMMENDATION_DTL_ID") is not None]
+                for t in RECORD_TILES}
+        sanctioned = {(r["WORK_RECOMMENDATION_DTL_ID"], emap.row_code(r)):
+                      r.get("SANCTION_AMOUNT") or 0.0 for r in real["sanctioned"]}
+        return {
+            "recommended": (len(real["recommended"]),
+                            sum(r.get("RECOMMENDED_AMOUNT") or 0.0 for r in real["recommended"])),
+            "sanctioned": (len(real["sanctioned"]),
+                           sum(r.get("SANCTION_AMOUNT") or 0.0 for r in real["sanctioned"])),
+            "completed": (len(real["completed"]),
+                          sum(sanctioned.get((r["WORK_RECOMMENDATION_DTL_ID"], emap.row_code(r)), 0.0)
+                              for r in real["completed"])),
+            "expenditure": (None, sum(r.get("FUND_DISBURSED_AMT") or 0.0
+                                      for r in real["expenditure"])),
+        }
+
     def watermark(self, combo: str) -> Watermark:
+        from astra.ingestion.esakshi_api import TILE_KEYS
         shard_id = self._shard_id(combo)
         self.calls.append(("watermark", shard_id))
         if shard_id in self.fail_shards:
             raise SourceError("HTTP 500", path="/getTilesData", status=500)
-        count = 0 if shard_id in self.zero_shards else self.n.get(shard_id, 0)
         wm = Watermark(combo=combo, fetched_at="now")
-        wm.counts = {"Works Recommended": count}
-        wm.totals = {"Works Recommended": float(count) * 1000}
+        if shard_id in self.shard_tiles:
+            figures = self.figures(self.shard_tiles[shard_id])
+            wm.counts = {TILE_KEYS[t]: n for t, (n, _) in figures.items() if n is not None}
+            wm.totals = {TILE_KEYS[t]: total for t, (_, total) in figures.items()}
+        else:
+            count = 0 if shard_id in self.zero_shards else self.n.get(shard_id, 0)
+            wm.counts = {"Works Recommended": count}
+            # The portal's total is the sum of the amounts it lists. A fake that
+            # invented one would fail the parity check for the wrong reason.
+            listed = [r for r in self._report(shard_id)["recommended"]
+                      if r.get("WORK_RECOMMENDATION_DTL_ID") is not None][:count]
+            wm.totals = {"Works Recommended": float(sum(
+                r.get("RECOMMENDED_AMOUNT") or 0 for r in listed))}
+        wm.counts.update(self.claimed_counts.get(shard_id, {}))
         wm.suspicious_zero = shard_id in self.zero_shards
         return wm
 
@@ -116,17 +181,23 @@ class FakePortal:
         self.calls.append(("report", shard_id))
         if shard_id in self.fail_shards:
             raise SourceError("HTTP 500", path="/getTilesReportData", status=500)
-        rows = self.tiles[tile]
-        if tile == "recommended":
-            want = self.n.get(shard_id, 0)
-            if shard_id in self.truncate_shards:
-                want = max(1, want // 4)
-            elif shard_id in self.truncate_once:
-                # short on the first read only, correct from then on — exactly
-                # what the first national sweep saw on 7 of 543 constituencies
-                self.truncate_once.discard(shard_id)
-                want = max(1, want // 4)
-            rows = rows[:want]
+        report = self._report(shard_id)
+        rows = report[tile]
+        if shard_id in self.shard_tiles:
+            return list(rows)
+        short = shard_id in self.truncate_shards
+        if tile == "recommended" and not short and shard_id in self.truncate_once:
+            # short on the first read only, correct from then on — exactly
+            # what the first national sweep saw on 7 of 543 constituencies
+            self.truncate_once.discard(shard_id)
+            short = True
+        if short:
+            kept = report["recommended"][:max(1, len(report["recommended"]) // 4)]
+            if tile == "recommended":
+                rows = kept
+            elif shard_id in self.truncate_shards:
+                held = {r.get("WORK_RECOMMENDATION_DTL_ID") for r in kept}
+                rows = [r for r in rows if r.get("WORK_RECOMMENDATION_DTL_ID") in held]
         return list(rows)
 
     def close(self):
@@ -596,6 +667,437 @@ def test_freshness_endpoint(tiles) -> None:
           "works" not in degraded and len(json.dumps(degraded)) < 6000)
 
 
+def test_single_writer(tiles) -> None:
+    print("\n[11b] only one writer may run against a database")
+    from fastapi.testclient import TestClient
+    from astra.api.main import app
+    from astra.ingestion import instance_lock, router
+
+    client = TestClient(app)
+    check("with no poller, the site reports it as not running",
+          client.get("/meta/freshness").json()["poller_running"] is False)
+
+    rival = instance_lock.WriterLock()
+    check("the lock sits beside the scratch database, not the real one",
+          rival.path.parent == Path(os.environ["ASTRA_DB_PATH"]).parent,
+          str(rival.path))
+    check("a first holder takes the lock", rival.acquire(role="poller"))
+    try:
+        check("the site now reports the poller as running",
+              client.get("/meta/freshness").json()["poller_running"] is True)
+        code = pmod.main(["--once", "--quiet"])
+        check("a second poller refuses to start, with its own exit code",
+              code == instance_lock.ALREADY_RUNNING, f"exit {code}")
+        try:
+            router.ingest("offline", verbose=False)
+            refused = False
+        except RuntimeError as exc:
+            refused = "poller is running" in str(exc)
+        check("a bulk re-ingest refuses to run under a live poller", refused)
+        note = instance_lock.holder()
+        check("the holder is named for the refusal message",
+              note and note.get("pid") == os.getpid(), str(note))
+    finally:
+        rival.release()
+    check("releasing frees it for the next poller", not instance_lock.is_held())
+
+
+def test_live_status(tiles) -> None:
+    print("\n[11c] the website can tell a live, a sweeping and a stopped poller apart")
+    from fastapi.testclient import TestClient
+    from astra.api.main import app
+    from astra.ingestion import instance_lock
+
+    portal = FakePortal(tiles)
+    poller = fresh_poller(portal)
+    client = TestClient(app)
+    before = client.get("/meta/freshness").json()
+    check("no check is claimed before the first heartbeat",
+          before["last_check_at"] is None and before["last_update"] is None)
+
+    poller.heartbeat()
+    after = client.get("/meta/freshness").json()
+    check("a heartbeat records when the portal was last checked",
+          after["last_check_at"] is not None, str(after["last_check_at"]))
+    check("the latest stored update is named by place",
+          (after["last_update"] or {}).get("area", "").startswith(("ALIGARH", "BARABANKI",
+                                                                    "SOUTH GOA", "KOLLAM")),
+          json.dumps(after["last_update"])[:120])
+
+    lock = instance_lock.WriterLock()
+    lock.acquire()
+    try:
+        seen = {}
+        original = pmod.Poller._reconcile_all
+
+        def spy(self, house):
+            seen["during"] = client.get("/meta/freshness").json()
+            return original(self, house)
+
+        pmod.Poller._reconcile_all = spy
+        try:
+            poller.reconcile_all()
+        finally:
+            pmod.Poller._reconcile_all = original
+        during = seen.get("during") or {}
+        check("a running sweep is reported as in progress",
+              during.get("sweep_in_progress") is True, str(during.get("sweep_started_at")))
+        check("and cleared when it ends",
+              client.get("/meta/freshness").json()["sweep_in_progress"] is False)
+    finally:
+        lock.release()
+
+    db.set_state("sweep_started_at", "2026-01-01T00:00:00+00:00")
+    check("a marker left by a killed sweep is ignored once nothing holds the lock",
+          client.get("/meta/freshness").json()["sweep_in_progress"] is False)
+
+
+def test_recent_updates(tiles) -> None:
+    print("\n[11d] the change log shows what the portal really changed")
+    import copy
+    from fastapi.testclient import TestClient
+    from astra.api.main import app
+
+    moved = copy.deepcopy(tiles)
+    portal = FakePortal(moved)
+    poller = fresh_poller(portal)
+    shard = next(s for s in poller.registry() if s.shard_id == "2:33:418")
+    other = next(s for s in poller.registry() if s.shard_id == "2:12:105")
+    poller.fetch_shard(shard)
+    poller.fetch_shard(other)
+    check("each store is appended to the ledger, not written over it",
+          len(db.load_provenance()) == 2, f"{len(db.load_provenance())} rows")
+
+    row = moved["recommended"][0]
+    old_text = row["WORK_DESCRIPTION"]
+    row["WORK_DESCRIPTION"] = old_text + " (revised)"
+    outcome = poller.fetch_shard(shard, force=True)
+    check("an edited work is stored as a change", outcome["changed"] >= 1, str(outcome))
+
+    client = TestClient(app)
+    body = client.get("/meta/recent-updates?limit=5").json()
+    stores = body["stores"]
+    check("the newest store comes first, with what it held",
+          stores and stores[0]["area"].startswith("ALIGARH")
+          and "updated" in stores[0]["detail"], json.dumps(stores[:1])[:160])
+    change = next((c for c in body["changes"]
+                   if any(f["field"] == "description" for f in c["fields"])), None)
+    check("the field-level edit is listed with its old and new value",
+          change is not None
+          and any(f["old_value"] == old_text and f["new_value"].endswith("(revised)")
+                  for f in change["fields"]),
+          json.dumps(change, default=str)[:160] if change else "no change listed")
+    check("the change names its place and member",
+          change is not None and change["place"] == "ALIGARH" and change["mp_name"],
+          f"{change and change['place']} / {change and change['mp_name']}")
+
+    db.append_provenance([{"source": f"eSAKSHI API X{i}", "mode": "api",
+                           "table": "works", "rows": i, "status": "ok"}
+                          for i in range(8)], keep=5)
+    check("the running log is trimmed to its cap", len(db.load_provenance()) == 5,
+          f"{len(db.load_provenance())} rows")
+
+
+def test_data_source_live(tiles) -> None:
+    print("\n[11e] the data-source ledger describes the live corpus, from the database")
+    from fastapi.testclient import TestClient
+    from astra.api.main import app
+    from astra.config import PROCESSED_DIR
+
+    portal = FakePortal(tiles)
+    poller = fresh_poller(portal)
+    poller.reconcile_all()
+    meta = PROCESSED_DIR / "ingest_meta.json"
+    meta.parent.mkdir(parents=True, exist_ok=True)
+    meta.write_text(json.dumps({"mode_resolved": "api", "mode_requested": "api",
+                                "works": 1, "eras": {"stale": 1}}), encoding="utf-8")
+    try:
+        body = TestClient(app).get("/meta/data-source").json()
+        with db.connect() as con:
+            stored = con.execute("SELECT COUNT(*) FROM works").fetchone()[0]
+        check("work counts are read from the database, not the ingestion note",
+              body["works"] == stored and "stale" not in body["work_eras"],
+              f"api={body['works']} db={stored} eras={body['work_eras']}")
+        ledger = {r["source"]: r for r in body["provenance"]}
+        ls = ledger.get("eSAKSHI portal — Lok Sabha")
+        check("the ledger has one row per real source, not per slice stored",
+              ls is not None and not any(s.startswith("eSAKSHI API") for s in ledger),
+              ", ".join(ledger)[:160])
+        check("the Lok Sabha row carries its slice health",
+              ls is not None and "4 constituencies" in ls["detail"]
+              and ls["rows"] == body["houses"].get("LS"),
+              ls and ls["detail"])
+        check("it is flagged live", body["live"] is True)
+
+        client = TestClient(app)
+        fresh = client.get("/meta/freshness").json()
+        parity = fresh["parity"]
+        ls = parity["national"].get("LS", {})
+        check("every slice is reported in exact parity with the portal",
+              parity["exact_slices"] == parity["registered_slices"] == 4
+              and fresh["status"] == "ok",
+              f"{parity['exact_slices']} of {parity['registered_slices']}, {fresh['status']}")
+        check("national figures carry portal and stored side by side, per tile",
+              set(ls) == {"recommended", "sanctioned", "completed", "expenditure"}
+              and all(slot["exact"] for slot in ls.values()), json.dumps(ls)[:160])
+        with db.connect() as con:
+            con.execute("UPDATE shard_parity SET exact = 0, differences_json = ? "
+                        "WHERE shard_id = '2:36:500'",
+                        (json.dumps([{"tile": "sanctioned", "measure": "count",
+                                      "portal": 5, "stored": 4}]),))
+        off = client.get("/meta/freshness").json()
+        check("a slice that differs from the portal degrades the status and is named",
+              off["status"] == "degraded" and off["parity"]["exceptions"]
+              and off["parity"]["exceptions"][0]["place"] == "KOLLAM",
+              json.dumps(off["parity"]["exceptions"])[:160])
+    finally:
+        meta.unlink(missing_ok=True)
+
+
+def _parity(shard_id: str) -> dict:
+    with db.connect() as con:
+        row = con.execute("SELECT * FROM shard_parity WHERE shard_id = ?",
+                          (shard_id,)).fetchone()
+    return dict(row) if row else {}
+
+
+def _slice(tiles, rows: list[dict], state="Uttar Pradesh",
+           constituency="ALIGARH") -> dict[str, list[dict]]:
+    """Reports for one slice holding exactly `rows`, with their later reports."""
+    import copy
+    rec = []
+    for row in rows:
+        row = copy.deepcopy(row)
+        row.update({"STATE_NAME": state, "CONSTITUENCY": constituency})
+        rec.append(row)
+    held = {r["WORK_RECOMMENDATION_DTL_ID"] for r in rec}
+    out = {"recommended": rec}
+    for tile in ("sanctioned", "completed", "expenditure"):
+        out[tile] = []
+        for row in tiles.get(tile) or []:
+            if row.get("WORK_RECOMMENDATION_DTL_ID") in held:
+                row = copy.deepcopy(row)
+                row.update({"STATE_NAME": state, "CONSTITUENCY": constituency})
+                out[tile].append(row)
+    return out
+
+
+def _work_id(row: dict) -> str:
+    from astra.ingestion import esakshi_map as emap
+    return emap.work_id_for(str(row["WORK_RECOMMENDATION_DTL_ID"]), emap.row_code(row), "LS")
+
+
+def _alone(portal, tiles, keep: str) -> None:
+    """Give every other slice an empty report, so no two slices list one work."""
+    for shard_id in ("2:33:418", "2:33:419", "2:12:105", "2:36:500"):
+        if shard_id != keep:
+            portal.shard_tiles.setdefault(shard_id, _slice(tiles, []))
+
+
+def test_duplicate_listings(tiles) -> None:
+    print("\n[11f] works the portal lists more than once are mirrored, not refused")
+    import copy
+    donor = [r for r in tiles["recommended"] if r.get("WORK_RECOMMENDATION_DTL_ID")][:8]
+    first, second = copy.deepcopy(donor[0]), copy.deepcopy(donor[0])
+    for row, text in ((first, "first pending work"), (second, "second pending work")):
+        row.update({"WORK_RECOMMENDATION_DTL_ID": 1740, "ACTIVITY_NAME": "NA-Installing hand pumps",
+                    "WORK_DESCRIPTION": text})
+    echo = copy.deepcopy(donor[1])
+    echo["Sno"] = 9999
+    portal = FakePortal(tiles)
+    portal.shard_tiles["2:33:418"] = _slice(tiles, [first, second] + donor[1:] + [echo])
+    poller = fresh_poller(portal)
+    shard = next(s for s in poller.registry() if s.shard_id == "2:33:418")
+    outcome = poller.fetch_shard(shard)
+    stored = db.works_in_shard("2:33:418")
+    check("two different works sharing one id are both stored",
+          outcome["status"] == validate.STORED
+          and {"ES-LS-1740", "ES-LS-1740#2"} <= stored, str(sorted(stored))[:120])
+    with db.connect() as con:
+        listed = con.execute("SELECT in_recommended FROM work_listing WHERE work_id = ?",
+                             (_work_id(donor[1]),)).fetchone()
+    check("the same record listed twice is one work counted twice, as the portal counts it",
+          listed is not None and listed[0] == 2, str(listed and listed[0]))
+    parity = _parity("2:33:418")
+    check("the slice is in exact parity with the portal's own tiles",
+          parity.get("exact") == 1, parity.get("differences_json"))
+    check("the duplicate listings are recorded for inspection",
+          len(json.loads(parity.get("duplicates_json") or "[]")) == 2,
+          parity.get("duplicates_json", "")[:140])
+
+    print("      and a work id already held by another state is still refused")
+    portal = FakePortal(copy.deepcopy(tiles))
+    poller = fresh_poller(portal)
+    aligarh = next(s for s in poller.registry() if s.shard_id == "2:33:418")
+    goa = next(s for s in poller.registry() if s.shard_id == "2:12:105")
+    poller.fetch_shard(aligarh)
+    for row in portal.tiles["recommended"]:
+        row["STATE_NAME"] = "Goa"
+    moved = poller.fetch_shard(goa)
+    check("a slice whose works are still listed elsewhere is quarantined, not merged",
+          moved["status"] == validate.QUARANTINED
+          and "would overwrite a different work" in moved["reason"],
+          moved["reason"][:120])
+
+
+def test_removal_lifecycle(tiles) -> None:
+    print("\n[11g] a work the portal stops listing is retired only once confirmed")
+    from datetime import datetime, timedelta, timezone
+    rows = [r for r in tiles["recommended"] if r.get("WORK_RECOMMENDATION_DTL_ID")][:10]
+    portal = FakePortal(tiles)
+    portal.shard_tiles["2:33:418"] = _slice(tiles, rows)
+    _alone(portal, tiles, "2:33:418")
+    poller = fresh_poller(portal)
+    shard = next(s for s in poller.registry() if s.shard_id == "2:33:418")
+    poller.fetch_shard(shard)
+    gone = rows[3]
+    gone_id = _work_id(gone)
+    check("the work to be dropped is stored first", gone_id in db.works_in_shard("2:33:418"),
+          gone_id)
+    without = _slice(tiles, [r for r in rows if r is not gone])
+
+    # a short read the portal itself disagrees with: it still claims ten
+    portal.shard_tiles["2:33:418"] = without
+    portal.claimed_counts["2:33:418"] = {"Works Recommended": 10}
+    short = poller.fetch_shard(shard, force=True)
+    with db.connect() as con:
+        marked = con.execute("SELECT COUNT(*) FROM missing_works").fetchone()[0]
+    check("an inconsistent read (count ten, nine records) marks nothing as gone",
+          short["status"] == validate.STORED and marked == 0,
+          f"status={short['status']}, missing={marked}")
+
+    # the portal really drops it: its count and its records agree on nine
+    portal.claimed_counts.clear()
+    first = poller.fetch_shard(shard, force=True)
+    check("a consistent read without it records it as awaiting removal",
+          first.get("awaiting_removal") == 1 and gone_id in db.works_in_shard("2:33:418"),
+          str(first))
+    parity = _parity("2:33:418")
+    check("the slice already reads as exact against the portal",
+          parity.get("exact") == 1, parity.get("differences_json"))
+    check("and a confirming re-read is scheduled", parity.get("recheck_after") is not None)
+
+    again = poller.fetch_shard(shard, force=True)
+    check("a second read inside the confirmation window does not retire it",
+          again.get("retired") == 0 and gone_id in db.works_in_shard("2:33:418"), str(again))
+
+    earlier = (datetime.now(timezone.utc) - pmod.RETIRE_CONFIRM - timedelta(minutes=1)).isoformat()
+    with db.connect() as con:
+        con.execute("UPDATE missing_works SET first_missing_at = ?", (earlier,))
+        con.execute("UPDATE shard_parity SET recheck_after = ? WHERE shard_id = '2:33:418'",
+                    (earlier,))
+    portal.calls.clear()
+    poller.heartbeat()
+    check("the heartbeat re-reads a slice whose confirmation is due",
+          "2:33:418" in portal.report_calls(), str(sorted(set(portal.report_calls()))))
+    with db.connect() as con:
+        stored = con.execute("SELECT COUNT(*) FROM works WHERE work_id = ?", (gone_id,)).fetchone()[0]
+        kept = con.execute("SELECT row_json FROM retired_works WHERE work_id = ?", (gone_id,)).fetchone()
+        logged = con.execute("SELECT new_value FROM work_versions WHERE work_id = ? "
+                             "AND field = 'listing'", (gone_id,)).fetchall()
+    check("once confirmed it leaves the corpus", stored == 0)
+    check("it is kept whole among retired works", kept is not None and gone_id in kept[0])
+    check("and its history records the removal",
+          [r[0] for r in logged] == ["no longer listed on the portal"], str(logged))
+    check("the corpus now matches the portal's nine",
+          len(db.works_in_shard("2:33:418")) == 9 and _parity("2:33:418").get("exact") == 1,
+          f"{len(db.works_in_shard('2:33:418'))} stored")
+
+    portal.shard_tiles["2:33:418"] = _slice(tiles, rows)
+    back = poller.fetch_shard(shard, force=True)
+    with db.connect() as con:
+        still_retired = con.execute("SELECT COUNT(*) FROM retired_works").fetchone()[0]
+        logged = [r[0] for r in con.execute(
+            "SELECT new_value FROM work_versions WHERE work_id = ? AND field = 'listing' "
+            "ORDER BY observed_at", (gone_id,))]
+    check("a work the portal lists again comes back",
+          back.get("restored") == 1 and gone_id in db.works_in_shard("2:33:418")
+          and still_retired == 0, str(back))
+    check("and its history says so", logged[-1:] == ["listed again"], str(logged))
+
+
+def test_move_between_slices(tiles) -> None:
+    print("\n[11h] a work the portal moves to another slice is followed, not refused")
+    import copy
+    from datetime import datetime, timedelta, timezone
+    rows = [r for r in tiles["recommended"] if r.get("WORK_RECOMMENDATION_DTL_ID")][:10]
+    portal = FakePortal(tiles)
+    portal.shard_tiles["2:33:418"] = _slice(tiles, rows)
+    portal.shard_tiles["2:12:105"] = _slice(tiles, [], state="Goa", constituency="SOUTH GOA")
+    _alone(portal, tiles, "2:33:418")
+    poller = fresh_poller(portal)
+    aligarh = next(s for s in poller.registry() if s.shard_id == "2:33:418")
+    goa = next(s for s in poller.registry() if s.shard_id == "2:12:105")
+    poller.fetch_shard(aligarh)
+    poller.fetch_shard(goa)
+    moving = rows[0]
+    moved_id = _work_id(moving)
+
+    portal.shard_tiles["2:33:418"] = _slice(tiles, rows[1:])
+    poller.fetch_shard(aligarh, force=True)
+    portal.shard_tiles["2:12:105"] = _slice(tiles, [moving], state="Goa", constituency="SOUTH GOA")
+    arrived = poller.fetch_shard(goa, force=True)
+    with db.connect() as con:
+        row = con.execute("SELECT state, constituency FROM works WHERE work_id = ?",
+                          (moved_id,)).fetchone()
+        pending = con.execute("SELECT COUNT(*) FROM missing_works").fetchone()[0]
+        history = {r[0] for r in con.execute(
+            "SELECT field FROM work_versions WHERE work_id = ?", (moved_id,))}
+    check("the destination slice stores it instead of refusing",
+          arrived["status"] == validate.STORED and row is not None
+          and row["state"] == "GOA", f"{arrived['status']} {row and dict(row)}")
+    check("it is no longer awaiting removal", pending == 0, f"{pending} pending")
+    check("the move is in its history", {"state", "constituency"} <= history, str(history))
+
+    earlier = (datetime.now(timezone.utc) - pmod.RETIRE_CONFIRM - timedelta(minutes=1)).isoformat()
+    with db.connect() as con:
+        con.execute("UPDATE shard_parity SET recheck_after = ?", (earlier,))
+    poller.fetch_shard(aligarh, force=True)
+    with db.connect() as con:
+        retired = con.execute("SELECT COUNT(*) FROM retired_works").fetchone()[0]
+    check("and a later read of its old slice does not retire it", retired == 0)
+    check("both slices are in exact parity",
+          _parity("2:33:418").get("exact") == 1 and _parity("2:12:105").get("exact") == 1)
+
+
+def test_later_report_only(tiles) -> None:
+    print("\n[11i] a work listed only in a later report is stored and counted")
+    import copy
+    rows = [r for r in tiles["recommended"] if r.get("WORK_RECOMMENDATION_DTL_ID")][:10]
+    portal = FakePortal(tiles)
+    reports = _slice(tiles, rows)
+    sanctioned_only = next((r for r in reports["sanctioned"]), None)
+    check("the fixture has a sanctioned work to hold back", sanctioned_only is not None)
+    if sanctioned_only is None:
+        return
+    dtl = sanctioned_only["WORK_RECOMMENDATION_DTL_ID"]
+    # as on the portal on 13 Sep 2026: sanctioned, paid, yet in no recommended report
+    reports["recommended"] = [r for r in reports["recommended"]
+                              if r["WORK_RECOMMENDATION_DTL_ID"] != dtl]
+    portal.shard_tiles["2:33:418"] = reports
+    _alone(portal, tiles, "2:33:418")
+    poller = fresh_poller(portal)
+    shard = next(s for s in poller.registry() if s.shard_id == "2:33:418")
+    outcome = poller.fetch_shard(shard)
+    code = _work_id(sanctioned_only)
+    with db.connect() as con:
+        work = con.execute("SELECT sanction_date, sanctioned_amount, total_paid FROM works "
+                           "WHERE work_id = ?", (code,)).fetchone()
+        listing = con.execute("SELECT in_recommended, in_sanctioned FROM work_listing "
+                              "WHERE work_id = ?", (code,)).fetchone()
+    check("the work is stored with its sanction", outcome["status"] == validate.STORED
+          and work is not None and work["sanctioned_amount"], f"{outcome['status']} {work and dict(work)}")
+    check("it is listed as sanctioned but not recommended",
+          listing is not None and tuple(listing) == (0, 1), str(listing and tuple(listing)))
+    parity = _parity("2:33:418")
+    portal_side = json.loads(parity.get("portal_json") or "{}")
+    check("every tile, count and rupees, equals the portal's",
+          parity.get("exact") == 1, parity.get("differences_json"))
+    check("including sanctioned, completed and expenditure, not just the headline",
+          all(portal_side.get(t, [None, None])[1] is not None
+              for t in ("sanctioned", "completed", "expenditure")), str(portal_side)[:160])
+
+
 def test_live() -> None:
     print("\n[12] live portal — the loop's assumptions still hold")
     client = EsakshiClient()
@@ -635,12 +1137,17 @@ def main() -> int:
                    test_genuinely_empty, test_failure_and_escalation,
                    test_restart_resumes, test_reconcile, test_after_sweep,
                    test_schedule, test_kill_switch,
-                   test_freshness_endpoint):
+                   test_freshness_endpoint, test_single_writer,
+                   test_live_status, test_recent_updates,
+                   test_data_source_live, test_duplicate_listings,
+                   test_removal_lifecycle, test_move_between_slices,
+                   test_later_report_only):
             db.init_db(force=True)
             with db.connect() as con:
                 for table in ("works", "shards", "shard_watermarks",
-                              "work_versions", "provenance",
-                              "poller_state"):
+                              "work_versions", "provenance", "poller_state",
+                              "work_listing", "missing_works", "retired_works",
+                              "shard_parity"):
                     con.execute(f"DELETE FROM {table}")
             fn(tiles)
         if "--live" in sys.argv:

@@ -11,8 +11,10 @@ import type {
   DetectionRow,
   DistrictRow,
   Facets,
+  Freshness,
   LlmStatus,
   PipelineMeta,
+  RecentUpdates,
   StateRow,
   Stats,
   Synthesis,
@@ -137,6 +139,11 @@ export const api = {
     request<Partial<WorkRecord>[]>(`/agencies/works${qs({ name, limit })}`),
 
   dataSource: () => request<DataSource>("/meta/data-source"),
+
+  freshness: () => request<Freshness>("/meta/freshness"),
+
+  recentUpdates: (limit = 10) =>
+    request<RecentUpdates>(`/meta/recent-updates${qs({ limit })}`),
 
   pipeline: () => request<PipelineMeta>("/meta/pipeline"),
 

@@ -34,6 +34,23 @@ from astra.schemas import Work                              # noqa: E402
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "esakshi"
 SHARD = "2:33:418"
+REAL_DB = ROOT / "data" / "astra.db"
+
+
+def _real_files() -> dict[str, tuple[int, int] | None]:
+    """Size and mtime of the real corpus and its sidecars, or None if absent."""
+    out = {}
+    for suffix in ("", "-wal", "-shm"):
+        path = Path(str(REAL_DB) + suffix)
+        out[path.name] = ((path.stat().st_size, path.stat().st_mtime_ns)
+                          if path.exists() else None)
+    return out
+
+
+#: Taken before any test runs. The real corpus is live now, so its WAL sidecars
+#: can legitimately exist (a running poller, or one stopped with Ctrl+C); what
+#: this run must not do is touch them.
+_REAL_BEFORE = _real_files()
 
 PASS, FAIL, SKIP = "PASS", "FAIL", "SKIP"
 results: list[tuple[str, str, str]] = []
@@ -153,6 +170,45 @@ def test_upsert(tiles: dict[str, list[dict]]) -> list[Work]:
     return works
 
 
+def test_collision_guard(works: list[Work]) -> None:
+    print("\n[2b] a different work can never silently replace a stored one")
+    target = next(w for w in works if w.work_id.startswith("ES-"))
+    # id 1740: a Rajampet work and a Madhya Pradesh Rajya Sabha work
+    impostor = target.model_copy(update={"house": "RS", "state": "MADHYA PRADESH",
+                                         "constituency": None,
+                                         "description": "an unrelated work"})
+    try:
+        db.upsert_works([impostor], shard_id="1:20:0")
+        raised = None
+    except db.WorkIdCollision as exc:
+        raised = exc
+    check("a work from another house or state is refused", raised is not None,
+          str(raised)[:120])
+    with db.connect() as con:
+        row = con.execute("SELECT house, state, description FROM works WHERE work_id=?",
+                          (target.work_id,)).fetchone()
+        logged = con.execute("SELECT COUNT(*) FROM work_versions WHERE work_id=?",
+                             (target.work_id,)).fetchone()[0]
+    check("the stored work is untouched",
+          row["state"] == target.state and row["description"] == target.description)
+    check("and no false history is logged", logged == 0, f"{logged} version rows")
+
+    try:
+        db.upsert_works([target, impostor], shard_id=SHARD)
+        twice = False
+    except db.WorkIdCollision:
+        twice = True
+    check("a batch carrying one id twice is refused", twice)
+
+    edited = target.model_copy(update={"estimated_cost": (target.estimated_cost or 0) + 1})
+    result = db.upsert_works([edited], shard_id=SHARD)
+    check("an ordinary edit in the same place still goes through",
+          result["changed"] == 1, str(result))
+    db.upsert_works([target], shard_id=SHARD)
+    with db.connect() as con:
+        con.execute("DELETE FROM work_versions WHERE work_id=?", (target.work_id,))
+
+
 def test_shard_queries(works: list[Work]) -> None:
     print("\n[3] shard registry and reverse lookup")
     shards = db.load_shards(house=2)
@@ -167,6 +223,25 @@ def test_shard_queries(works: list[Work]) -> None:
 
 
 # ----------------------------------------------------------------- the gates
+def test_figure_differences() -> None:
+    print("\n[3b] parity comparison — every portal figure, count and rupees")
+    portal = {"recommended": [10, 1000.0], "sanctioned": [7, 700.0],
+              "completed": [3, 300.0], "expenditure": [None, 250.0]}
+    same = {"recommended": (10, 1000.4), "sanctioned": (7, 700.0),
+            "completed": (3, 300.0), "expenditure": (41, 250.0)}
+    check("identical figures, and paise of float rounding, are exact",
+          validate.figure_differences(portal, same) == [])
+    off = {**same, "sanctioned": (6, 700.0), "expenditure": (41, 262.0)}
+    found = {(d["tile"], d["measure"]) for d in validate.figure_differences(portal, off)}
+    check("a count or a rupee total that differs is named by tile",
+          found == {("sanctioned", "count"), ("expenditure", "rupees")}, str(found))
+    check("counts_only ignores rupee differences",
+          {(d["tile"], d["measure"]) for d in
+           validate.figure_differences(portal, off, counts_only=True)} == {("sanctioned", "count")})
+    check("a figure the portal does not report is never compared",
+          validate.figure_differences({"completed": [None, None]}, {"completed": (9, 9.0)}) == [])
+
+
 def test_gates(tiles: dict[str, list[dict]]) -> None:
     print("\n[4] gate 1 — assert_contract")
     for tile in RECORD_TILES:
@@ -301,13 +376,16 @@ def test_isolation() -> None:
     print("\n[10] isolation — the real corpus was never opened")
     check("DB_PATH points at the scratch database", str(_TMP) in str(DB_PATH),
           str(DB_PATH))
-    real = ROOT / "data" / "astra.db"
-    if real.exists():
-        check("data/astra.db has no stray WAL/SHM sidecars",
-              not (real.parent / "astra.db-wal").exists()
-              and not (real.parent / "astra.db-shm").exists())
+    from astra.ingestion import instance_lock
+    if not REAL_DB.exists():
+        skip("data/astra.db untouched", "no real corpus on this machine")
+    elif instance_lock.is_held(instance_lock.lock_path(REAL_DB)):
+        skip("data/astra.db untouched", "a poller is writing to the real corpus")
     else:
-        skip("data/astra.db sidecar check", "no real corpus on this machine")
+        after = _real_files()
+        check("data/astra.db and its sidecars were not touched by this run",
+              after == _REAL_BEFORE,
+              "" if after == _REAL_BEFORE else f"{_REAL_BEFORE} -> {after}")
 
 
 # ----------------------------------------------------------------------- main
@@ -323,7 +401,9 @@ def main() -> int:
     try:
         test_schema()
         works = test_upsert(tiles)
+        test_collision_guard(works)
         test_shard_queries(works)
+        test_figure_differences()
         test_gates(tiles)
         test_escalation()
         test_fingerprints(tiles)

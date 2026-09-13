@@ -11,6 +11,11 @@ Tables:
   work_versions    — append-only log of every observed change to a work
   poller_state     — the poller's schedule: when each periodic job last
                      succeeded, so a restart or a sleep catches up
+  work_listing     — which of a slice's four portal reports list each work,
+                     and how many times: what reproduces the portal's tiles
+  missing_works    — works a slice stopped listing, awaiting confirmation
+  retired_works    — works the portal no longer lists, kept whole
+  shard_parity     — each slice's four tile figures, portal against stored
 
 Two distinct write paths
 ------------------------
@@ -24,11 +29,12 @@ both the current row and its history.
 """
 from __future__ import annotations
 
+import collections
 import json
 import os
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 
@@ -87,6 +93,23 @@ CREATE TABLE IF NOT EXISTS work_versions (
 CREATE TABLE IF NOT EXISTS poller_state (
     key TEXT PRIMARY KEY, value TEXT, updated_at TEXT
 );
+CREATE TABLE IF NOT EXISTS work_listing (
+    work_id TEXT PRIMARY KEY, shard_id TEXT, in_recommended INTEGER,
+    in_sanctioned INTEGER, in_completed INTEGER, payments INTEGER, listed_at TEXT
+);
+CREATE TABLE IF NOT EXISTS missing_works (
+    work_id TEXT PRIMARY KEY, shard_id TEXT, first_missing_at TEXT,
+    last_checked_at TEXT, checks INTEGER
+);
+CREATE TABLE IF NOT EXISTS retired_works (
+    work_id TEXT PRIMARY KEY, shard_id TEXT, retired_at TEXT,
+    first_missing_at TEXT, row_json TEXT
+);
+CREATE TABLE IF NOT EXISTS shard_parity (
+    shard_id TEXT PRIMARY KEY, checked_at TEXT, exact INTEGER, portal_json TEXT,
+    stored_json TEXT, differences_json TEXT, duplicates_json TEXT,
+    recheck_after TEXT, rechecks INTEGER DEFAULT 0
+);
 CREATE INDEX IF NOT EXISTS ix_flags_state ON flags(state);
 CREATE INDEX IF NOT EXISTS ix_flags_status ON flags(review_status);
 CREATE INDEX IF NOT EXISTS ix_flags_district ON flags(district);
@@ -96,6 +119,9 @@ CREATE INDEX IF NOT EXISTS ix_works_state ON works(state);
 CREATE INDEX IF NOT EXISTS ix_works_constituency ON works(constituency);
 CREATE INDEX IF NOT EXISTS ix_wm_lifecycle ON shard_watermarks(lifecycle);
 CREATE INDEX IF NOT EXISTS ix_work_versions_work ON work_versions(work_id);
+CREATE INDEX IF NOT EXISTS ix_work_versions_observed ON work_versions(observed_at);
+CREATE INDEX IF NOT EXISTS ix_listing_shard ON work_listing(shard_id);
+CREATE INDEX IF NOT EXISTS ix_missing_shard ON missing_works(shard_id);
 """
 
 #: Tables `init_db()` may rebuild when their columns drift from SCHEMA. The
@@ -204,8 +230,25 @@ def _as_text(value) -> str | None:
     return str(value)
 
 
+class WorkIdCollision(ValueError):
+    """Two different works resolved to one `work_id`; nothing was written."""
+
+    def __init__(self, clashes: list[dict]):
+        self.clashes = clashes
+        shown = "; ".join(f"{c['work_id']}: {c['stored']} vs {c['incoming']}"
+                          for c in clashes[:3])
+        super().__init__(f"{len(clashes)} work id(s) would overwrite a different "
+                         f"work: {shown}")
+
+
+def _identity(house, state, constituency) -> tuple[str, str, str]:
+    """Where a work belongs. An edit never moves a work to another house,
+    state or constituency; a different place means a different work."""
+    return tuple((v or "").strip().upper() for v in (house, state, constituency))
+
+
 def upsert_works(works: list[Work], *, shard_id: str | None = None,
-                 record_history: bool = True) -> dict:
+                 record_history: bool = True, movable: set[str] | None = None) -> dict:
     """Insert or update `works` by `work_id`, in ONE transaction.
 
     Idempotent: re-running with identical input writes no new rows and logs no
@@ -215,9 +258,24 @@ def upsert_works(works: list[Work], *, shard_id: str | None = None,
     This is the live path. It never deletes, so a short or truncated response
     cannot remove records — only `validate.guard_zero` plus two agreeing full
     sweeps may conclude a work is really gone.
+
+    Raises `WorkIdCollision`, writing nothing, if an incoming work would replace
+    a stored work from another house, state or constituency, or if the batch
+    itself holds one id twice. The portal's own record id turned out not to be
+    unique; this is the backstop that makes any future clash loud instead of
+    one work silently replacing another.
+
+    `movable` names works their old slice has stopped listing (`missing_works`).
+    Those may change place: that is the portal moving a work, and the move is
+    logged in the history like any other edit.
     """
     if not works:
         return {"written": 0, "inserted": 0, "changed": 0, "versions": 0}
+    counts = collections.Counter(w.work_id for w in works)
+    repeated = [wid for wid, n in counts.items() if n > 1]
+    if repeated:
+        raise WorkIdCollision([{"work_id": wid, "stored": "this batch",
+                                "incoming": "this batch"} for wid in repeated])
     init_db()
     now = datetime.now(timezone.utc).isoformat()
     cols = ", ".join(WORK_COLUMNS)
@@ -236,6 +294,20 @@ def upsert_works(works: list[Work], *, shard_id: str | None = None,
             for row in con.execute(
                     f"SELECT {cols} FROM works WHERE work_id IN ({marks})", chunk):
                 existing[row["work_id"]] = row
+
+        clashes = []
+        for work in works:
+            before = existing.get(work.work_id)
+            if before is None or work.work_id in (movable or ()):
+                continue
+            was = _identity(before["house"], before["state"], before["constituency"])
+            now_at = _identity(work.house, work.state, work.constituency)
+            if was != now_at:
+                clashes.append({"work_id": work.work_id,
+                                "stored": " / ".join(p for p in was if p),
+                                "incoming": " / ".join(p for p in now_at if p)})
+        if clashes:
+            raise WorkIdCollision(clashes)
 
         versions: list[tuple] = []
         changed = 0
@@ -272,6 +344,220 @@ def work_versions(work_id: str) -> list[dict]:
         return [dict(r) for r in con.execute(
             "SELECT observed_at, field, old_value, new_value, shard_id "
             "FROM work_versions WHERE work_id = ? ORDER BY observed_at", (work_id,))]
+
+
+# ------------------------------------------------------------ portal parity
+def _place_ids(con, shard_id: str) -> set[str]:
+    """Works stored for a slice, found by place. Used only before a slice has
+    a listing of its own (a database built before listings existed)."""
+    shard = con.execute("SELECT * FROM shards WHERE shard_id = ?", (shard_id,)).fetchone()
+    if shard is None:
+        return set()
+    if shard["house"] == 1:
+        rows = con.execute("SELECT work_id FROM works WHERE upper(state) = upper(?) "
+                           "AND house = 'RS'", (shard["state_name"],))
+    else:
+        rows = con.execute("SELECT work_id FROM works WHERE upper(state) = upper(?) "
+                           "AND upper(constituency) = upper(?)",
+                           (shard["state_name"], shard["constituency_name"]))
+    return {r["work_id"] for r in rows}
+
+
+def missing_ids(ids: list[str]) -> set[str]:
+    """Which of `ids` a slice has stopped listing and not yet retired."""
+    init_db()
+    out: set[str] = set()
+    with connect() as con:
+        for start in range(0, len(ids), 500):
+            chunk = ids[start:start + 500]
+            marks = ", ".join("?" * len(chunk))
+            out |= {r["work_id"] for r in con.execute(
+                f"SELECT work_id FROM missing_works WHERE work_id IN ({marks})", chunk)}
+    return out
+
+
+def apply_listing(shard_id: str, listing: dict[str, dict[str, int]], *,
+                  consistent: bool, confirm_after: timedelta,
+                  now: datetime | None = None) -> dict:
+    """Record what a fetch listed, and retire what the portal no longer lists.
+
+    A work a slice stops listing is first recorded in `missing_works`. It is
+    retired — moved whole into `retired_works`, removed from `works`, and the
+    removal written to its history — only when a later fetch, at least
+    `confirm_after` afterwards, still does not list it. Both fetches must be
+    `consistent` (every tile count equal to the portal's own); a read the
+    portal itself disagrees with never marks anything missing. A work that is
+    listed again, anywhere, is taken off the missing list, and a retired one
+    comes back through the normal upsert and is noted as restored.
+    """
+    init_db()
+    now = now or datetime.now(timezone.utc)
+    stamp = now.isoformat()
+    listed = set(listing)
+    out = {"newly_missing": [], "still_missing": [], "retired": [], "restored": []}
+    with connect() as con:
+        previous = {r["work_id"] for r in con.execute(
+            "SELECT work_id FROM work_listing WHERE shard_id = ?", (shard_id,))}
+        pending = {r["work_id"]: r for r in con.execute(
+            "SELECT * FROM missing_works WHERE shard_id = ?", (shard_id,))}
+        if not previous and not pending:
+            previous = _place_ids(con, shard_id)
+        previous |= set(pending)
+
+        ids = sorted(listed)
+        for start in range(0, len(ids), 500):
+            chunk = ids[start:start + 500]
+            marks = ", ".join("?" * len(chunk))
+            for row in con.execute(f"SELECT work_id, shard_id FROM retired_works "
+                                   f"WHERE work_id IN ({marks})", chunk):
+                out["restored"].append(row["work_id"])
+                con.execute("INSERT OR IGNORE INTO work_versions (work_id, observed_at, "
+                            "field, old_value, new_value, shard_id) VALUES (?,?,?,?,?,?)",
+                            (row["work_id"], stamp, "listing",
+                             "no longer listed on the portal", "listed again", shard_id))
+            con.execute(f"DELETE FROM retired_works WHERE work_id IN ({marks})", chunk)
+            con.execute(f"DELETE FROM missing_works WHERE work_id IN ({marks})", chunk)
+
+        if consistent:
+            for work_id in sorted(previous - listed):
+                seen = pending.get(work_id)
+                if seen is None:
+                    con.execute("INSERT OR REPLACE INTO missing_works VALUES (?,?,?,?,1)",
+                                (work_id, shard_id, stamp, stamp))
+                    out["newly_missing"].append(work_id)
+                    continue
+                first = datetime.fromisoformat(seen["first_missing_at"])
+                if now - first < confirm_after:
+                    con.execute("UPDATE missing_works SET last_checked_at = ?, "
+                                "checks = checks + 1 WHERE work_id = ?", (stamp, work_id))
+                    out["still_missing"].append(work_id)
+                    continue
+                row = con.execute("SELECT * FROM works WHERE work_id = ?",
+                                  (work_id,)).fetchone()
+                if row is not None:
+                    con.execute("INSERT OR REPLACE INTO retired_works VALUES (?,?,?,?,?)",
+                                (work_id, shard_id, stamp, seen["first_missing_at"],
+                                 json.dumps(dict(row), default=str)))
+                    con.execute("DELETE FROM works WHERE work_id = ?", (work_id,))
+                    con.execute("INSERT OR IGNORE INTO work_versions (work_id, "
+                                "observed_at, field, old_value, new_value, shard_id) "
+                                "VALUES (?,?,?,?,?,?)",
+                                (work_id, stamp, "listing", "listed",
+                                 "no longer listed on the portal", shard_id))
+                    out["retired"].append(work_id)
+                con.execute("DELETE FROM missing_works WHERE work_id = ?", (work_id,))
+            con.execute("DELETE FROM work_listing WHERE shard_id = ?", (shard_id,))
+        con.executemany(
+            "INSERT OR REPLACE INTO work_listing (work_id, shard_id, in_recommended, "
+            "in_sanctioned, in_completed, payments, listed_at) VALUES (?,?,?,?,?,?,?)",
+            [(w, shard_id, v["in_recommended"], v["in_sanctioned"], v["in_completed"],
+              v["payments"], stamp) for w, v in listing.items()])
+    return out
+
+
+def stored_listing(shard_id: str) -> tuple[dict, dict]:
+    """A slice's listing and the stored amounts behind it, read back from disk."""
+    init_db()
+    listing, amounts = {}, {}
+    with connect() as con:
+        for r in con.execute(
+                "SELECT l.work_id, l.in_recommended, l.in_sanctioned, l.in_completed, "
+                "l.payments, w.estimated_cost, w.sanctioned_amount, w.total_paid "
+                "FROM work_listing l JOIN works w ON w.work_id = l.work_id "
+                "WHERE l.shard_id = ?", (shard_id,)):
+            listing[r["work_id"]] = {k: r[k] or 0 for k in
+                                     ("in_recommended", "in_sanctioned", "in_completed",
+                                      "payments")}
+            amounts[r["work_id"]] = {k: r[k] for k in
+                                     ("estimated_cost", "sanctioned_amount", "total_paid")}
+    return listing, amounts
+
+
+def save_parity(shard_id: str, *, exact: bool, portal: dict, stored: dict,
+                differences: list, duplicates: list, recheck_after: str | None) -> None:
+    init_db()
+    with connect() as con:
+        before = con.execute("SELECT rechecks FROM shard_parity WHERE shard_id = ?",
+                             (shard_id,)).fetchone()
+        rechecks = 0 if recheck_after is None else ((before["rechecks"] or 0) + 1
+                                                    if before else 1)
+        con.execute(
+            "INSERT OR REPLACE INTO shard_parity (shard_id, checked_at, exact, portal_json, "
+            "stored_json, differences_json, duplicates_json, recheck_after, rechecks) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (shard_id, datetime.now(timezone.utc).isoformat(), int(exact),
+             json.dumps(portal), json.dumps(stored), json.dumps(differences),
+             json.dumps(duplicates, default=str), recheck_after, rechecks))
+
+
+def due_rechecks(now: str, max_rechecks: int) -> list[str]:
+    """Slices owed another read: a parity difference, or an absence to confirm."""
+    init_db()
+    with connect() as con:
+        return [r["shard_id"] for r in con.execute(
+            "SELECT shard_id FROM shard_parity WHERE recheck_after IS NOT NULL "
+            "AND recheck_after <= ? AND rechecks <= ? ORDER BY recheck_after",
+            (now, max_rechecks))]
+
+
+def parity_summary() -> dict:
+    """Slice parity, national figures and removals, for the API and the site."""
+    init_db()
+    with connect() as con:
+        rows = [dict(r) for r in con.execute(
+            "SELECT p.*, s.house, s.state_name, s.constituency_name FROM shard_parity p "
+            "JOIN shards s ON s.shard_id = p.shard_id")]
+        registered = con.execute("SELECT COUNT(*) AS n FROM shards").fetchone()["n"]
+        missing = con.execute("SELECT COUNT(*) AS n, MIN(first_missing_at) AS oldest "
+                              "FROM missing_works").fetchone()
+        retired = con.execute("SELECT COUNT(*) AS n, MAX(retired_at) AS latest "
+                              "FROM retired_works").fetchone()
+    national: dict[str, dict[str, dict[str, list]]] = {}
+    exceptions = []
+    duplicates = 0
+    for r in rows:
+        house = "LS" if r["house"] == 2 else "RS"
+        portal, stored = json.loads(r["portal_json"]), json.loads(r["stored_json"])
+        for tile in portal:
+            slot = national.setdefault(house, {}).setdefault(
+                tile, {"portal": [0, 0.0], "stored": [0, 0.0]})
+            for side, figures in (("portal", portal), ("stored", stored)):
+                count, total = figures.get(tile) or (None, None)
+                # A figure the portal does not report for any one slice (there
+                # is no expenditure count) is not reported nationally either,
+                # rather than summed as zero.
+                for i, value in ((0, count), (1, total)):
+                    if slot[side][i] is None:
+                        continue
+                    if value is None and side == "portal":
+                        slot[side][i] = None
+                    else:
+                        slot[side][i] += value or 0
+        dups = json.loads(r["duplicates_json"] or "[]")
+        duplicates += len(dups)
+        if not r["exact"]:
+            exceptions.append({"shard_id": r["shard_id"], "house": house,
+                               "place": r["constituency_name"] or r["state_name"],
+                               "differences": json.loads(r["differences_json"] or "[]"),
+                               "checked_at": r["checked_at"],
+                               "recheck_after": r["recheck_after"]})
+    for tiles in national.values():
+        for tile, slot in tiles.items():
+            for side in ("portal", "stored"):
+                if slot[side][1] is not None:
+                    slot[side][1] = round(slot[side][1], 2)
+            if tile == "expenditure":
+                slot["portal"][0] = slot["stored"][0] = None
+            count_ok = slot["portal"][0] is None or slot["portal"][0] == slot["stored"][0]
+            total_ok = (slot["portal"][1] is None
+                        or abs(slot["portal"][1] - slot["stored"][1]) <= max(1.0, len(rows)))
+            slot["exact"] = count_ok and total_ok
+    return {"registered_slices": registered, "checked_slices": len(rows),
+            "exact_slices": sum(1 for r in rows if r["exact"]),
+            "exceptions": exceptions[:25], "exception_count": len(exceptions),
+            "duplicate_listings": duplicates, "national": national,
+            "awaiting_removal": missing["n"], "oldest_missing_since": missing["oldest"],
+            "removed_from_portal": retired["n"], "latest_removal": retired["latest"]}
 
 
 # ------------------------------------------------------------------- shards
@@ -551,10 +837,107 @@ def record_provenance(entries: list[dict]) -> None:
         )
 
 
+#: Rows of the poller's running log kept in `provenance`. At about one store
+#: per new or edited work, this is several days of ordinary activity.
+PROVENANCE_KEEP = 500
+
+
+def append_provenance(entries: list[dict], keep: int = PROVENANCE_KEEP) -> None:
+    """Add to the ledger instead of replacing it: the live path's running log.
+
+    `record_provenance()` describes one batch, so it replaces. The poller
+    stores one slice at a time; replacing there left the ledger naming only
+    the last slice stored. Trimmed to the newest `keep` rows.
+    """
+    init_db()
+    now = datetime.now(timezone.utc).isoformat()
+    with connect() as con:
+        con.executemany(
+            "INSERT INTO provenance (source, mode, table_name, rows, status, detail, fetched_at)"
+            " VALUES (?,?,?,?,?,?,?)",
+            [(e.get("source"), e.get("mode"), e.get("table"), int(e.get("rows") or 0),
+              e.get("status"), e.get("detail"), e.get("fetched_at") or now) for e in entries],
+        )
+        con.execute("DELETE FROM provenance WHERE id NOT IN "
+                    "(SELECT id FROM provenance ORDER BY id DESC LIMIT ?)", (keep,))
+
+
 def load_provenance() -> pd.DataFrame:
     init_db()
     with connect() as con:
         return pd.read_sql_query("SELECT * FROM provenance ORDER BY id", con)
+
+
+def recent_stores(limit: int = 10) -> list[dict]:
+    """The poller's latest slice stores, newest first."""
+    init_db()
+    with connect() as con:
+        return [dict(r) for r in con.execute(
+            "SELECT source, rows, status, detail, fetched_at FROM provenance "
+            "WHERE mode = 'api' ORDER BY id DESC LIMIT ?", (limit,))]
+
+
+def recent_changes(limit: int = 10) -> list[dict]:
+    """The latest observed edits to existing works, newest first.
+
+    One entry per work per observation, carrying every field that moved, the
+    place it belongs to and who recommended it. Read straight from the
+    append-only `work_versions` log, so it shows only what the portal really
+    changed — never an inference.
+    """
+    init_db()
+    with connect() as con:
+        heads = con.execute(
+            "SELECT work_id, observed_at, MAX(shard_id) AS shard_id "
+            "FROM work_versions GROUP BY work_id, observed_at "
+            "ORDER BY observed_at DESC LIMIT ?", (limit,)).fetchall()
+        out = []
+        for head in heads:
+            fields = [dict(r) for r in con.execute(
+                "SELECT field, old_value, new_value FROM work_versions "
+                "WHERE work_id = ? AND observed_at = ? ORDER BY field",
+                (head["work_id"], head["observed_at"]))]
+            work = con.execute(
+                "SELECT state, constituency, mp_name, house, description, status "
+                "FROM works WHERE work_id = ?", (head["work_id"],)).fetchone()
+            shard = con.execute(
+                "SELECT state_name, constituency_name, house FROM shards "
+                "WHERE shard_id = ?", (head["shard_id"],)).fetchone()
+            work = dict(work) if work else {}
+            place = ((shard["constituency_name"] or shard["state_name"])
+                     if shard else (work.get("constituency") or work.get("state")))
+            out.append({
+                "work_id": head["work_id"],
+                "observed_at": head["observed_at"],
+                "shard_id": head["shard_id"],
+                "place": place,
+                "state": work.get("state"),
+                "house": work.get("house"),
+                "mp_name": work.get("mp_name"),
+                "description": work.get("description"),
+                "status": work.get("status"),
+                "fields": fields,
+            })
+    return out
+
+
+def shard_summary_by_house() -> dict[int, dict]:
+    """Per-house slice health, for the source ledger. Registered slices only:
+    the national and state probe watermarks are not slices of data."""
+    init_db()
+    with connect() as con:
+        rows = con.execute(
+            "SELECT s.house, COUNT(*) AS shards, "
+            "  SUM(CASE WHEN w.count_matched = 1 THEN 1 ELSE 0 END) AS reconciled, "
+            "  SUM(CASE WHEN p.exact = 1 THEN 1 ELSE 0 END) AS exact, "
+            "  SUM(CASE WHEN w.lifecycle = 'QUARANTINED' THEN 1 ELSE 0 END) AS quarantined, "
+            "  SUM(CASE WHEN w.consecutive_failures >= 3 THEN 1 ELSE 0 END) AS stale, "
+            "  MAX(w.fetched_at) AS newest_fetch "
+            "FROM shards s LEFT JOIN shard_watermarks w ON w.shard_id = s.shard_id "
+            "LEFT JOIN shard_parity p ON p.shard_id = s.shard_id "
+            "GROUP BY s.house").fetchall()
+    return {r["house"]: {k: (r[k] or 0) if k != "newest_fetch" else r[k]
+                         for k in r.keys() if k != "house"} for r in rows}
 
 
 # --------------------------------------------------------------- UI queries

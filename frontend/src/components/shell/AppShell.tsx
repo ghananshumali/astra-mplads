@@ -17,8 +17,9 @@ import { useQuery } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
 
 import { api } from "../../api/client";
-import type { Tier } from "../../api/types";
+import type { Freshness, Tier } from "../../api/types";
 import { TIERS } from "../../lib/format";
+import { liveState, liveTooltip, useNow } from "../../lib/live";
 import { useAuthority } from "../../state/AuthorityContext";
 import { Spinner } from "../ui";
 import "./shell.css";
@@ -177,6 +178,15 @@ function DataBadge() {
     staleTime: 5 * 60_000,
   });
 
+  // Polled only for the live corpus; a CSV batch has nothing to watch.
+  const { data: freshness } = useQuery({
+    queryKey: ["freshness"],
+    queryFn: api.freshness,
+    enabled: Boolean(data?.live),
+    refetchInterval: 20_000,
+    retry: false,
+  });
+
   if (isLoading) return <Spinner size={14} />;
   const mode = (data?.mode_resolved ?? "—").toUpperCase();
   const fresh = data?.freshness_vs_live_portal;
@@ -196,19 +206,36 @@ function DataBadge() {
           {llm.configured ? "AI synthesis" : "Deterministic"}
         </span>
       )}
-      <span
-        className="head-badge"
-        title={
-          fresh
-            ? `Local corpus holds ${fresh.local_recommended_works.toLocaleString()} recommended works; the live MoSPI portal reported ${fresh.live_recommended_works.toLocaleString()}.`
-            : "Data mode"
-        }
-      >
-        <Database size={12} />
-        {mode}
-        {fresh && <b style={{ marginLeft: 4 }}>{fresh.coverage_pct}%</b>}
-      </span>
+      {data?.live && freshness ? (
+        <LiveBadge f={freshness} />
+      ) : (
+        <span
+          className="head-badge"
+          title={
+            fresh
+              ? `Local corpus holds ${fresh.local_recommended_works.toLocaleString()} recommended works; the live MoSPI portal reported ${fresh.live_recommended_works.toLocaleString()}.`
+              : "Data mode"
+          }
+        >
+          <Database size={12} />
+          {mode}
+          {fresh && <b style={{ marginLeft: 4 }}>{fresh.coverage_pct}%</b>}
+        </span>
+      )}
     </div>
+  );
+}
+
+/** "● Live · checked 20 s ago" — links to the Data source page for detail. */
+function LiveBadge({ f }: { f: Freshness }) {
+  const now = useNow(10_000);
+  const state = liveState(f, now);
+  return (
+    <NavLink to="/data" className={`head-badge live-badge ${state.tone}`} title={liveTooltip(f)}>
+      <span className={`live-dot ${state.tone}`} aria-hidden />
+      <b>{state.label}</b>
+      <span className="live-badge-detail">· {state.detail}</span>
+    </NavLink>
   );
 }
 

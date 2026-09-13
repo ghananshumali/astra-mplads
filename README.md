@@ -192,21 +192,31 @@ python scripts/fetch_data.py        # dual-mode ingestion (auto)
 python scripts/run_pipeline.py      # all agents + orchestrator
 ```
 
-**2 · Run both services**
+**2 · Run the poller, the API and the site**
 
 ```bash
 powershell -ExecutionPolicy Bypass -File run_dev.ps1   # Windows
 bash run_dev.sh                                        # macOS / Linux
 ```
 
-Or in two terminals:
+This starts all three; Ctrl+C stops all three. Add `-NoPoller` (Windows) or
+set `ASTRA_NO_POLLER=1` (macOS / Linux) to start only the site.
+
+Or in separate terminals:
 
 ```bash
+python -m astra.ingestion.poller                   # keeps data/astra.db current
 python -m uvicorn astra.api.main:app --port 8000   # API   → :8000/docs
 cd frontend && npm install && npm run dev          # React → :5173
 ```
 
-Open **http://localhost:5173**. Point the client at a different API with
+Run the poller in its own terminal to keep the data updating while the site is
+closed. Only one poller can run against a database: a second one prints who
+already holds it and exits, and `run_dev` then uses the one already running.
+
+Open **http://localhost:5173**. The header badge shows whether the data is live
+and when the portal was last checked; the Data source page shows the latest
+changes picked up from the portal. Point the client at a different API with
 `VITE_API_BASE` in `frontend/.env`.
 
 The original Streamlit dashboard remains at `dashboard/app.py`

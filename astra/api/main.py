@@ -15,11 +15,14 @@ orchestrator's synthesis, not from filtered SQL):
   GET /meta/llm                            — LLM provider status (never the key)
   POST /flags/{flag_id}/feedback           — human-in-the-loop review action
   GET /meta/router-trace                   — why each agent ran / was skipped
-  GET /meta/data-source                    — dual-mode ingestion provenance:
-                                             which source supplied this batch
-                                             (live vs offline official CSV) and
-                                             how current it is vs the live
-                                             eSAKSHI portal
+  GET /meta/data-source                    — where the corpus came from: the
+                                             live eSAKSHI portal, or an offline
+                                             official CSV batch, with counts
+                                             read from the database
+  GET /meta/freshness                      — live sync health: poller running,
+                                             last portal check, stale slices
+  GET /meta/recent-updates                 — what the portal changed most
+                                             recently, slice and field level
 
 Full RBAC/audit-logging is a stage-2 roadmap item; tier here is an explicit
 path segment so the demo can show all four synthesized framings side by side.
@@ -39,6 +42,7 @@ import pandas as pd
 from .. import db, rbac, synthesis
 from ..config import PROCESSED_DIR
 from ..explain import AGENT_LABEL
+from ..ingestion import instance_lock
 
 app = FastAPI(title=f"{PLATFORM_NAME} API", description=PLATFORM_TAGLINE, version=__version__)
 
@@ -252,11 +256,33 @@ def freshness_meta():
     # A count that differs from the portal by the tolerated single record is
     # reported, but does not degrade the status: the tolerance exists because
     # that skew is expected, and a permanent warning would be ignored.
+    # Parity is the claim that matters most: every slice's stored figures equal
+    # the portal's own tiles. A slice that differs degrades the status and is
+    # named, even while a re-read is pending.
+    parity = db.parity_summary()
     status = "no data" if not registered else (
-        "degraded" if stale or sweep_overdue else "ok")
-    alerts = PROCESSED_DIR / "ingest_alerts.json"
-    poller = PROCESSED_DIR / "poller_status.json"
+        "degraded" if stale or sweep_overdue or parity["exception_count"] else "ok")
+    alerts = _read_json(PROCESSED_DIR / "ingest_alerts.json") or {}
+    poller = _read_json(PROCESSED_DIR / "poller_status.json") or {}
+    # Whether the poller is running is answered by its lock, not by how recent
+    # the last check looks: a nightly sweep runs for twenty minutes with no
+    # heartbeat, and a crashed poller can leave a recent-looking timestamp.
+    running = instance_lock.is_held()
+    owner = instance_lock.holder() if running else None
+    sweep_started = db.get_state("sweep_started_at") or None
+    stores = db.recent_stores(1)
     return {
+        "parity": parity,
+        "poller_running": running,
+        "poller_since": (owner or {}).get("since"),
+        "last_check_at": db.get_state("last_heartbeat_at"),
+        "poll_interval_seconds": poller.get("poll_interval_seconds"),
+        "reconcile_at": poller.get("reconcile_at"),
+        "sweep_in_progress": bool(running and sweep_started),
+        "sweep_started_at": sweep_started if running else None,
+        "last_update": ({"at": stores[0]["fetched_at"],
+                         "area": _area_label(stores[0]["source"]),
+                         "detail": stores[0]["detail"]} if stores else None),
         "status": status,
         "registered_shards": registered,
         "reconciled_shards": reconciled,
@@ -280,11 +306,39 @@ def freshness_meta():
             "last_fetch": s.get("fetched_at"),
             "last_error": s.get("last_error"),
         } for s in stale],
-        "alerts_written_at": (
-            json.loads(alerts.read_text(encoding="utf-8")).get("generated_at")
-            if alerts.exists() else None),
-        "poller": (json.loads(poller.read_text(encoding="utf-8")).get("last_cycle")
-                   if poller.exists() else None),
+        "alerts_written_at": alerts.get("generated_at"),
+        "poller": poller.get("last_cycle"),
+    }
+
+
+def _read_json(path) -> dict | None:
+    """A status file the poller rewrites every minute. A read that lands
+    mid-write must cost one stale answer, never a 500."""
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def _area_label(source: str | None) -> str:
+    """ "eSAKSHI API BHARATPUR(SC) (LS)" -> "BHARATPUR(SC) (LS)" """
+    return (source or "").removeprefix("eSAKSHI API ").strip()
+
+
+@app.get("/meta/recent-updates")
+def recent_updates(limit: int = Query(10, ge=1, le=50)):
+    """What the portal changed most recently.
+
+    `stores` is the poller's log of slices it re-read because their contents
+    changed, which includes newly recommended works. `changes` is the
+    field-level history of existing works, old value and new, exactly as
+    observed. Neither is an inference.
+    """
+    return {
+        "stores": [{"area": _area_label(s["source"]), "records": s["rows"],
+                    "detail": s["detail"], "at": s["fetched_at"]}
+                   for s in db.recent_stores(limit)],
+        "changes": db.recent_changes(limit),
     }
 
 
@@ -455,26 +509,95 @@ def flag_feedback(flag_id: str, body: FeedbackIn):
 
 @app.get("/meta/data-source")
 def data_source():
-    """Provenance of the analysed batch under the dual-mode ingestion strategy."""
-    p = PROCESSED_DIR / "ingest_meta.json"
-    prov = db.load_provenance()
-    payload = {
-        "provenance": prov.to_dict(orient="records") if not prov.empty else [],
+    """Where the analysed corpus came from, and how current it is.
+
+    Counts come from the database rather than the ingestion note, because on
+    the live corpus the poller keeps changing them after ingestion ends. For
+    the live corpus the ledger is also built from the database: the stored
+    provenance there is the poller's running log (see /meta/recent-updates),
+    not a description of the corpus. A CSV batch keeps its own ledger.
+    """
+    meta = _read_json(PROCESSED_DIR / "ingest_meta.json") or {}
+    db.init_db()
+    with db.connect() as con:
+        work_rows = con.execute(
+            "SELECT era, house, COUNT(*) AS n FROM works GROUP BY era, house").fetchall()
+        flow_rows = con.execute(
+            "SELECT source, era, COUNT(*) AS n FROM fundflows "
+            "GROUP BY source, era").fetchall()
+
+    def tally(rows, key):
+        out: dict[str, int] = {}
+        for r in rows:
+            out[r[key] or "unknown"] = out.get(r[key] or "unknown", 0) + r["n"]
+        return out
+
+    houses = tally(work_rows, "house")
+    flow_sources = tally(flow_rows, "source")
+    live = meta.get("mode_resolved") == "api"
+    if live:
+        ledger = _live_ledger(houses, flow_sources, meta.get("ingested_at"))
+    else:
+        prov = db.load_provenance()
+        ledger = prov.to_dict(orient="records") if not prov.empty else []
+
+    return {
+        "mode_requested": meta.get("mode_requested"),
+        "mode_resolved": meta.get("mode_resolved"),
+        "live": live,
+        "works": sum(r["n"] for r in work_rows),
+        "houses": houses,
+        "fundflows": sum(r["n"] for r in flow_rows),
+        "work_eras": tally(work_rows, "era"),
+        "fundflow_eras": tally(flow_rows, "era"),
+        "freshness_vs_live_portal": meta.get("freshness"),
+        "live_portal_totals": meta.get("live_tiles"),
+        "ingested_at": meta.get("ingested_at"),
+        "provenance": ledger,
     }
-    if p.exists():
-        meta = json.loads(p.read_text(encoding="utf-8"))
-        payload.update({
-            "mode_requested": meta.get("mode_requested"),
-            "mode_resolved": meta.get("mode_resolved"),
-            "works": meta.get("works"),
-            "fundflows": meta.get("fundflows"),
-            "work_eras": meta.get("eras"),
-            "fundflow_eras": meta.get("flow_eras"),
-            "freshness_vs_live_portal": meta.get("freshness"),
-            "live_portal_totals": meta.get("live_tiles"),
-            "ingested_at": meta.get("ingested_at"),
+
+
+def _live_ledger(houses: dict, flow_sources: dict, built_at: str | None) -> list[dict]:
+    """One row per real source of the live corpus, with its current health."""
+    health = db.shard_summary_by_house()
+    rows = []
+    for code, key, label, unit in ((2, "LS", "Lok Sabha", "constituencies"),
+                                   (1, "RS", "Rajya Sabha", "states")):
+        h = health.get(code)
+        if not h:
+            continue
+        trouble = h["quarantined"] + h["stale"]
+        rows.append({
+            "source": f"eSAKSHI portal — {label}",
+            "mode": "api", "table_name": "works",
+            "rows": houses.get(key, 0),
+            "status": "attention" if trouble else "ok",
+            "detail": (f"{h['shards']} {unit} read record by record from "
+                       f"mplads.mospi.gov.in; {h['exact']} match the portal on every "
+                       f"figure (works recommended, sanctioned and completed, and "
+                       f"expenditure, in count and rupees)"
+                       + (f"; {trouble} need attention" if trouble else "")),
+            "fetched_at": h["newest_fetch"],
         })
-    return payload
+    for source, n in sorted(flow_sources.items()):
+        if source == "esakshi_api":
+            rows.append({
+                "source": "Fund positions from eSAKSHI work records",
+                "mode": "derived", "table_name": "fundflows", "rows": n,
+                "status": "ok",
+                "detail": ("Aggregated per MP and financial year from the live work "
+                           "records when the corpus was built"),
+                "fetched_at": built_at,
+            })
+        else:
+            rows.append({
+                "source": f"data.opencity.in — {source}",
+                "mode": "open data", "table_name": "fundflows", "rows": n,
+                "status": "ok",
+                "detail": "Pre-2023 fund positions from the OpenCity CKAN datastore",
+                "fetched_at": None,
+            })
+    return rows
 
 
 @app.get("/meta/router-trace")

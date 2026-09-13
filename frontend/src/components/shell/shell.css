@@ -67,6 +67,30 @@
   color: #fff;
 }
 
+/* live sync badge: links to the Data source page */
+.live-badge {
+  text-decoration: none;
+  transition: background var(--dur) var(--ease), border-color var(--dur) var(--ease);
+}
+.live-badge:hover {
+  background: rgba(255, 255, 255, 0.16);
+  border-color: rgba(255, 255, 255, 0.26);
+}
+.live-badge.warn {
+  border-color: rgba(245, 182, 66, 0.55);
+}
+.live-badge.stopped b {
+  color: #dce6f5;
+}
+.live-badge-detail {
+  color: #b9c7dc;
+}
+@media (max-width: 760px) {
+  .live-badge-detail {
+    display: none;
+  }
+}
+
 /* -------------------------------------------------------- authority menu */
 .auth-switch {
   position: relative;

@@ -1,8 +1,13 @@
-"""Switch data/astra.db from the six CSV exports to the live eSAKSHI corpus.
+"""Build the live eSAKSHI corpus fresh and swap it in as data/astra.db.
 
     python scripts/switch_to_live.py              # build, validate, swap in
     python scripts/switch_to_live.py --dry-run    # build and validate, do not swap
     python scripts/switch_to_live.py --swap-only  # swap a staging build already made
+
+First used on 13 Sep 2026 to move from the six CSV exports to the live corpus,
+and again the same day to rebuild it after the portal's record id turned out
+not to be unique (see `astra/ingestion/esakshi_map.py`). A rebuild is the only
+safe way to change how works are keyed, for the same reason as below.
 
 Why a new database rather than an in-place update
 -------------------------------------------------
@@ -21,10 +26,14 @@ What it does
 3. Builds fund flows from the new works, plus the cached pre-2023 CKAN rows.
 4. Carries the human review decisions in `feedback` across.
 5. Runs the analysis pipeline, so flags come from the live corpus.
-6. Validates the result against the portal's own counts. If anything is off,
-   it stops and leaves the staging build for inspection; nothing is swapped.
-7. Moves the CSV database to data/astra.db.bak-prelive-<timestamp> and puts
-   the live one in its place.
+6. Validates the result against the portal's own counts, slice by slice and
+   exactly. If anything is off, it stops and leaves the staging build for
+   inspection; nothing is swapped.
+7. At swap time, carries the observed change history (`work_versions`) and the
+   poller's update log across from the old database, which the poller may have
+   kept writing during the build. History cannot be re-fetched from anywhere.
+8. Moves the old database to data/astra.db.bak-<timestamp> and puts the new
+   one in its place. Refuses while a poller is running on it.
 
 Afterwards start the poller to keep it current:
 
@@ -55,10 +64,13 @@ os.environ["ASTRA_DB_PATH"] = str(STAGING_DB)
 os.environ["ASTRA_PROCESSED_DIR"] = str(STAGING_PROCESSED)
 sys.path.insert(0, str(ROOT))
 
-#: Live corpus may trail the portal by works entered during the ~20 min sweep,
-#: plus the one id-less summary row per report. Anything beyond this means
-#: shards are missing, not that time passed.
+#: The national figure is read after a ~20 minute sweep, so it may lead the
+#: stored corpus by works entered meanwhile. Each slice, by contrast, is
+#: compared with the count read alongside its own records, and must be exact.
 COUNT_TOLERANCE = 0.005
+#: Fields that say where a work belongs. A logged "change" to one of these was
+#: a different work overwriting the id, never an edit, and is not carried over.
+IDENTITY_FIELDS = ("house", "state", "constituency")
 #: Share of registered shards allowed to end quarantined.
 MAX_QUARANTINED = 0.01
 
@@ -121,6 +133,27 @@ def build() -> dict:
     sweep = poller.reconcile_all()
     report["sweep"] = {k: v for k, v in sweep.items() if k != "missing_locally"}
     log(f"sweep finished in {time.monotonic() - started:.0f}s")
+
+    # The fetch gate tolerates a one-record disagreement, because the count and
+    # the records are separate reads. A rebuild should end exact, so re-read
+    # any slice left one record out. What still disagrees after that fails
+    # validation: that is how the non-unique ids were found.
+    reread = []
+    for _round in (1, 2):
+        with db.connect() as con:
+            inexact = {r[0] for r in con.execute(
+                "SELECT shard_id FROM shard_parity WHERE exact = 0")}
+        off = [sh for sh in poller.registry()
+               if sh.shard_id in inexact
+               or (db.get_watermark(sh.shard_id) or {}).get("count_matched") == 0]
+        if not off:
+            break
+        log(f"re-reading {len(off)} slice(s) not yet in exact parity: "
+            + ", ".join(sh.label for sh in off[:6]))
+        for sh in off:
+            poller.fetch_shard(sh, force=True)
+            reread.append(sh.shard_id)
+    report["reread_for_exact_count"] = reread
 
     works = db.read_df("works")
     log(f"works stored: {len(works):,} "
@@ -210,14 +243,52 @@ def validate(db, client, works, flows, pipe, sweep) -> list[tuple[bool, str]]:
         checks.append((bool(ok), message))
         log(("  PASS " if ok else "  FAIL ") + message)
 
-    log("validating against the portal's own counts")
+    log("validating against the portal's own figures")
+    parity = db.parity_summary()
     for house, label in ((2, "LS"), (1, "RS")):
         portal = client.watermark(f"0,0,0,{house}").counts.get("Works Recommended") or 0
-        stored = int((works["house"] == label).sum())
+        stored = (parity["national"].get(label, {}).get("recommended", {})
+                  .get("stored", [0, 0])[0])
         gap = abs(portal - stored) / max(portal, 1)
         check(gap <= COUNT_TOLERANCE,
-              f"{label}: stored {stored:,} vs portal {portal:,} "
-              f"({gap:.2%} apart, tolerance {COUNT_TOLERANCE:.1%})")
+              f"{label}: {stored:,} works recommended vs portal now {portal:,} "
+              f"({gap:.2%} apart, tolerance {COUNT_TOLERANCE:.1%} for works entered "
+              f"during the build)")
+    check(parity["exact_slices"] == parity["registered_slices"] > 0,
+          f"every slice equals the portal on all four figures, counts and rupees "
+          f"({parity['exact_slices']} of {parity['registered_slices']})"
+          + (f" — off: {[(e['place'], e['differences']) for e in parity['exceptions'][:4]]}"
+             if parity["exceptions"] else ""))
+    for label, tiles in sorted(parity["national"].items()):
+        for tile, fig in sorted(tiles.items()):
+            check(fig["exact"],
+                  f"{label} {tile}: stored {fig['stored'][0] if fig['stored'][0] is not None else '-'}"
+                  f" / Rs {fig['stored'][1]:,.2f} = portal "
+                  f"{fig['portal'][0] if fig['portal'][0] is not None else '-'}"
+                  f" / Rs {fig['portal'][1]:,.2f}")
+
+    with db.connect() as con:
+        off = [dict(r) for r in con.execute(
+            "SELECT s.shard_id, s.state_name, s.constituency_name, w.n_records, "
+            "w.n_stored FROM shards s JOIN shard_watermarks w "
+            "ON w.shard_id = s.shard_id WHERE COALESCE(w.count_matched, 0) = 0")]
+        per_house = {r["house"]: (r["slices"], r["stored"]) for r in con.execute(
+            "SELECT s.house, COUNT(*) AS slices, SUM(w.n_stored) AS stored "
+            "FROM shards s JOIN shard_watermarks w ON w.shard_id = s.shard_id "
+            "GROUP BY s.house")}
+    check(not off, "every slice's recommended report equals the portal's count for it"
+          + (f" — off: {[(o['state_name'], o['constituency_name'], o['n_records'], o['n_stored']) for o in off[:5]]}"
+             if off else ""))
+    for house, label in ((2, "LS"), (1, "RS")):
+        stored = int((works["house"] == label).sum())
+        slices_total = (per_house.get(house) or (0, 0))[1] or 0
+        check(stored == slices_total,
+              f"{label}: {stored:,} distinct works = {slices_total:,} records across "
+              f"its slices (no two slices share a work id)")
+    es_ids = works["work_id"].astype(str)
+    unscoped = int((es_ids.str.startswith("ES-")
+                    & ~es_ids.str.match(r"^ES-(LS|RS)-\d+$")).sum())
+    check(unscoped == 0, f"every pre-sanction id carries its house ({unscoped} without)")
 
     quarantined = len(sweep.get("quarantined", []))
     check(quarantined <= MAX_QUARANTINED * max(sweep.get("shards", 1), 1),
@@ -238,6 +309,65 @@ def validate(db, client, works, flows, pipe, sweep) -> list[tuple[bool, str]]:
     return checks
 
 
+# ------------------------------------------------------------- carry history
+def _scoped_id(work_id: str, shard_id: str | None, house_of: dict) -> str:
+    """`ES-1740` from the old keying -> `ES-LS-1740` / `ES-RS-1740`."""
+    if not (work_id.startswith("ES-") and work_id[3:].isdigit()):
+        return work_id
+    house = ("LS" if (shard_id or "").startswith("2:") else
+             "RS" if (shard_id or "").startswith("1:") else house_of.get(work_id))
+    return f"ES-{house}-{work_id[3:]}" if house else work_id
+
+
+def carry_history(old: sqlite3.Connection, new: sqlite3.Connection) -> dict:
+    """Bring observed changes and the poller's update log into the new build.
+
+    Change history is the one thing a rebuild cannot re-fetch. Ids are moved to
+    the house-scoped keying; entries where a work "changed" house, state or
+    constituency are dropped, because those were one work overwriting another.
+    """
+    house_of = dict(old.execute(
+        "SELECT work_id, house FROM works WHERE work_id LIKE 'ES-%'").fetchall())
+    rows = old.execute("SELECT work_id, observed_at, field, old_value, new_value, "
+                       "shard_id FROM work_versions").fetchall()
+    flips = {(w, t) for w, t, f, *_ in rows if f in IDENTITY_FIELDS}
+    existing = {r[0] for r in new.execute("SELECT work_id FROM works")}
+    keep, orphaned = [], 0
+    for work_id, observed_at, field, old_value, new_value, shard_id in rows:
+        if (work_id, observed_at) in flips:
+            continue
+        scoped = _scoped_id(work_id, shard_id, house_of)
+        if scoped not in existing:
+            orphaned += 1
+            continue
+        keep.append((scoped, observed_at, field, old_value, new_value, shard_id))
+    new.executemany("INSERT OR IGNORE INTO work_versions (work_id, observed_at, "
+                    "field, old_value, new_value, shard_id) VALUES (?,?,?,?,?,?)", keep)
+
+    # Removals already confirmed stay removed and keep their record.
+    tables = {r[0] for r in old.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    retired = []
+    if "retired_works" in tables:
+        retired = [r for r in old.execute("SELECT work_id, shard_id, retired_at, "
+                                          "first_missing_at, row_json FROM retired_works")
+                   if r[0] not in existing]
+        new.executemany("INSERT OR IGNORE INTO retired_works VALUES (?,?,?,?,?)", retired)
+
+    # The build's own slice stores are the initial load, not portal updates.
+    new.execute("DELETE FROM provenance WHERE mode = 'api'")
+    log_rows = old.execute("SELECT source, mode, table_name, rows, status, detail, "
+                           "fetched_at FROM provenance WHERE mode = 'api' "
+                           "ORDER BY id").fetchall()
+    new.executemany("INSERT INTO provenance (source, mode, table_name, rows, status, "
+                    "detail, fetched_at) VALUES (?,?,?,?,?,?,?)", log_rows)
+    new.commit()
+    return {"versions_carried": len(keep),
+            "version_groups_dropped_as_id_clashes": len(flips),
+            "versions_without_a_work": orphaned,
+            "update_log_rows_carried": len(log_rows),
+            "retired_works_carried": len(retired)}
+
+
 # ------------------------------------------------------------------------ swap
 def swap() -> Path | None:
     if not STAGING_DB.exists():
@@ -246,15 +376,37 @@ def swap() -> Path | None:
         if Path(str(STAGING_DB) + sidecar).exists():
             raise SystemExit(f"staging database still has a {sidecar} file open; "
                              "close whatever is using it and retry --swap-only")
+    from astra.ingestion import instance_lock
+    if instance_lock.is_held(instance_lock.lock_path(REAL_DB)):
+        note = instance_lock.holder(instance_lock.lock_path(REAL_DB)) or {}
+        raise SystemExit(f"a poller is running on data/astra.db (pid {note.get('pid', '?')}). "
+                         "Stop it (Ctrl+C in its window), then run: "
+                         "python scripts/switch_to_live.py --swap-only")
     if not file_is_free(REAL_DB):
         raise SystemExit("data/astra.db is open in another process (the API or "
                          "dev server?). Stop it, then run: "
                          "python scripts/switch_to_live.py --swap-only")
 
+    carried = None
+    if REAL_DB.exists():
+        # Fold any WAL content into the file first, so the kept copy is whole
+        # and the history read below includes the poller's last writes.
+        old = sqlite3.connect(REAL_DB)
+        try:
+            old.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            new = sqlite3.connect(STAGING_DB)
+            try:
+                carried = carry_history(old, new)
+            finally:
+                new.close()
+        finally:
+            old.close()
+        log(f"carried across: {carried}")
+
     stamp = datetime.now().strftime("%Y%m%d-%H%M")
     kept = None
     if REAL_DB.exists():
-        kept = REAL_DB.with_name(f"astra.db.bak-prelive-{stamp}")
+        kept = REAL_DB.with_name(f"astra.db.bak-{stamp}")
         os.replace(REAL_DB, kept)
         for sidecar in ("-wal", "-shm"):
             side = Path(str(REAL_DB) + sidecar)
@@ -269,7 +421,10 @@ def swap() -> Path | None:
     # run would otherwise delete the only record of the build it swapped in.
     report = STAGING / "switch_report.json"
     if report.exists():
-        shutil.copy2(report, REAL_PROCESSED / report.name)
+        data = json.loads(report.read_text(encoding="utf-8"))
+        data["carried_at_swap"] = carried
+        (REAL_PROCESSED / report.name).write_text(
+            json.dumps(data, indent=2, default=str), encoding="utf-8")
     shutil.rmtree(STAGING, ignore_errors=True)
     return kept
 
@@ -286,7 +441,7 @@ def main() -> int:
 
     if args.swap_only:
         kept = swap()
-        log(f"swapped in. CSV database kept as {kept.name if kept else 'n/a'}")
+        log(f"swapped in. previous database kept as {kept.name if kept else 'n/a'}")
         return 0
 
     if not args.dry_run and not file_is_free(REAL_DB):
@@ -312,11 +467,9 @@ def main() -> int:
             f"{STAGING}. Swap it in with --swap-only.")
         return 0
 
-    report_copy = json.dumps(report, indent=2, default=str)
     kept = swap()
-    (REAL_PROCESSED / "switch_report.json").write_text(report_copy, encoding="utf-8")
     log(f"done in {report['seconds']:.0f}s. data/astra.db is now the live corpus; "
-        f"the CSV database is kept as data/{kept.name if kept else 'n/a'}")
+        f"the previous database is kept as data/{kept.name if kept else 'n/a'}")
     log("keep it current with:  python -m astra.ingestion.poller")
     return 0
 

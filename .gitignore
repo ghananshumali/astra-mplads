@@ -6,6 +6,7 @@ data/astra.db.bak*
 data/*.db-wal
 data/*.db-shm
 data/live-staging/
+data/*.poller.lock
 data/processed/poller_status.json
 data/processed/ingest_alerts.json
 data/processed/switch_report.json

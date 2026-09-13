@@ -61,9 +61,10 @@ from datetime import datetime, timedelta, timezone
 from .. import db
 from ..config import PROCESSED_DIR
 from . import esakshi_map as emap
-from . import shard_cache, validate
-from .esakshi_api import (HOUSE_LS, HOUSE_RS, RECORD_TILES, EsakshiClient,
-                          Shard, SourceError, run_parallel, shard_combo)
+from . import instance_lock, shard_cache, validate
+from .esakshi_api import (HOUSE_LS, HOUSE_RS, RECORD_TILES, TILE_KEYS,
+                          EsakshiClient, Shard, SourceError, run_parallel,
+                          shard_combo)
 
 #: Seconds between heartbeats. Works arrive at roughly 20-25 an hour during
 #: Indian working hours, i.e. one every few minutes, so a minute already
@@ -90,6 +91,17 @@ HOUSES = tuple(int(h) for h in
 ESCALATE_AFTER = int(os.environ.get("ASTRA_ESCALATE_AFTER", "3"))
 #: Kill switch: set to 0 to pin the demo to the cache and stop all polling.
 ENABLED = os.environ.get("ASTRA_POLLER_ENABLED", "1") != "0"
+#: A work a slice stops listing is retired only if a second consistent read at
+#: least this much later still does not list it. The portal has been seen to
+#: return a short but self-consistent report for a few minutes.
+RETIRE_CONFIRM = timedelta(minutes=int(os.environ.get("ASTRA_RETIRE_CONFIRM_MIN", "10")))
+#: Wait before re-reading a slice whose stored figures differ from the portal's.
+PARITY_RECHECK = timedelta(minutes=int(os.environ.get("ASTRA_PARITY_RECHECK_MIN", "5")))
+#: Re-reads of one slice before leaving a difference to the nightly sweep. The
+#: difference stays on the site, named, either way.
+MAX_RECHECKS = int(os.environ.get("ASTRA_MAX_RECHECKS", "3"))
+#: Slices re-read per heartbeat, so a burst of rechecks cannot stall the loop.
+RECHECKS_PER_CYCLE = 10
 
 ALERTS_PATH = PROCESSED_DIR / "ingest_alerts.json"
 STATUS_PATH = PROCESSED_DIR / "poller_status.json"
@@ -389,12 +401,56 @@ class Poller:
         if not gate:
             return refuse(gate.reason, validate.QUARANTINED)
 
-        works = emap.to_works(tiles)
-        count_gate = validate.reconcile_count(portal_count, len(works))
+        mapping = emap.map_shard(tiles)
+        works = mapping.works
+        # The portal's Works Recommended count is a count of report rows, so it
+        # is compared with rows listed, not with distinct works: a work listed
+        # twice is two rows there too.
+        listed_rows = sum(v["in_recommended"] for v in mapping.listing.values())
+        count_gate = validate.reconcile_count(portal_count, listed_rows)
         if not count_gate:
             return refuse(count_gate.reason, validate.QUARANTINED)
 
-        result = db.upsert_works(works, shard_id=shard.shard_id)
+        portal = {tile: [watermark.counts.get(TILE_KEYS[tile]),
+                         watermark.totals.get(TILE_KEYS[tile])] for tile in RECORD_TILES}
+        # A read is consistent when every tile's count agrees with the report
+        # rows. Only a consistent read may mark a work as gone from the portal.
+        consistent = not validate.figure_differences(
+            portal, emap.portal_figures(mapping.listing,
+                                        {w.work_id: w.model_dump() for w in works}),
+            counts_only=True)
+
+        try:
+            result = db.upsert_works(works, shard_id=shard.shard_id,
+                                     movable=db.missing_ids([w.work_id for w in works]))
+        except db.WorkIdCollision as exc:
+            return refuse(str(exc), validate.QUARANTINED)
+        removal = db.apply_listing(shard.shard_id, mapping.listing,
+                                   consistent=consistent, confirm_after=RETIRE_CONFIRM)
+
+        # Parity is checked on what was written, read back from the database —
+        # not on the mapping — so it proves the stored corpus, not the code.
+        stored = emap.portal_figures(*db.stored_listing(shard.shard_id))
+        differences = validate.figure_differences(portal, stored)
+        awaiting = removal["newly_missing"] or removal["still_missing"]
+        recheck = None
+        if differences:
+            recheck = datetime.now(timezone.utc) + PARITY_RECHECK
+        if awaiting:
+            confirm = datetime.now(timezone.utc) + RETIRE_CONFIRM
+            recheck = min(recheck, confirm) if recheck else confirm
+        db.save_parity(shard.shard_id, exact=not differences, portal=portal,
+                       stored=stored, differences=differences,
+                       duplicates=mapping.duplicates,
+                       recheck_after=recheck.isoformat() if recheck else None)
+        if removal["retired"]:
+            self.log(f"  {shard.label}: {len(removal['retired'])} work(s) no longer "
+                     f"listed on the portal, retired: {', '.join(removal['retired'][:3])}")
+        if differences:
+            self.log(f"  {shard.label}: stored figures differ from the portal "
+                     f"({'; '.join(d['tile'] + ' ' + d['measure'] for d in differences)}); "
+                     f"re-reading in {PARITY_RECHECK.seconds // 60} min")
+
         for tile, rows in tiles.items():
             shard_cache.write(shard.shard_id, tile, rows)
         db.save_watermark(
@@ -402,14 +458,29 @@ class Poller:
             n_records=portal_count, payload_sha256=digest,
             lifecycle=validate.STORED, n_stored=len(works),
             count_matched=bool(count_gate.detail.get("matched")), fetched=True)
-        db.record_provenance([{
+        # Appended, never replaced: this is the running log of what the portal
+        # sent, and replacing it on every store left only the last slice.
+        fields = result["versions"]
+        parts = []
+        if result["inserted"] or result["changed"]:
+            parts.append(f"{result['inserted']} new, {result['changed']} updated "
+                         f"({fields} field change{'' if fields == 1 else 's'})")
+        if removal["retired"]:
+            parts.append(f"{len(removal['retired'])} removed from the portal")
+        if removal["restored"]:
+            parts.append(f"{len(removal['restored'])} listed again")
+        if removal["newly_missing"]:
+            parts.append(f"{len(removal['newly_missing'])} no longer listed, confirming")
+        what = ", ".join(parts) or "re-read; no tracked field changed"
+        db.append_provenance([{
             "source": f"eSAKSHI API {shard.label}", "mode": "api",
             "table": "works", "rows": len(works), "status": "ok",
-            "detail": (f"shard {shard.shard_id}; portal count {portal_count}; "
-                       f"{result['changed']} changed, {result['versions']} versions"),
+            "detail": f"{what}; portal count {portal_count}; shard {shard.shard_id}",
             "fetched_at": _now()}])
         outcome.update(status=validate.STORED, stored=len(works),
-                       changed=result["changed"], versions=result["versions"])
+                       changed=result["changed"], versions=result["versions"],
+                       exact=not differences, retired=len(removal["retired"]),
+                       awaiting_removal=len(awaiting), restored=len(removal["restored"]))
         return outcome
 
     # ------------------------------------------------------------ escalation
@@ -472,6 +543,21 @@ class Poller:
             self.log(f"resuming {len(pending)} shard(s) left from earlier")
             self.drain(pending, report)
 
+        # Slices owed a second read: a parity difference, or a work that
+        # stopped being listed and must be confirmed gone before it is retired.
+        due = db.due_rechecks(_now(), MAX_RECHECKS)
+        if due:
+            by_id = {s.shard_id: s for s in self.registry()}
+            recheck = [by_id[sid] for sid in due if sid in by_id][:RECHECKS_PER_CYCLE]
+            self.log(f"re-reading {len(recheck)} slice(s) to confirm against the portal: "
+                     + ", ".join(s.label for s in recheck[:6]))
+            for shard in recheck:
+                outcome = self.fetch_shard(shard, force=True)
+                if outcome["status"] == validate.STORED:
+                    report.stored += outcome["stored"]
+                    report.changed += outcome["changed"]
+                    report.versions += outcome["versions"]
+
         for house in self.houses:
             nid = national_shard_id(house)
             try:
@@ -502,6 +588,9 @@ class Poller:
             self._record_probe(nid, signature, count, validate.IDLE)
 
         report.seconds = round(time.monotonic() - clock, 2)
+        # In the database rather than only the status file, so the website can
+        # say when the portal was last checked without racing a half-written file.
+        db.set_state("last_heartbeat_at", _now())
         self._write_status(report)
         return report
 
@@ -515,11 +604,22 @@ class Poller:
         counts-only sweep would be blind in exactly the same way as the
         heartbeat it is meant to back up.
         """
+        # A sweep takes about twenty minutes with no heartbeat in between. The
+        # marker lets the website say "full check running" instead of showing
+        # a last-check time that looks like the poller has stalled.
+        db.set_state("sweep_started_at", _now())
+        try:
+            return self._reconcile_all(house)
+        finally:
+            db.set_state("sweep_started_at", "")
+
+    def _reconcile_all(self, house: int | None) -> dict:
         started = time.monotonic()
         shards = self.registry(house)
         summary = {"started_at": _now(), "shards": len(shards), "stored": 0,
                    "unchanged": 0, "changed": 0, "versions": 0,
-                   "quarantined": [], "count_mismatch": [], "missing_locally": {}}
+                   "quarantined": [], "count_mismatch": [], "not_exact": [],
+                   "retired": 0, "awaiting_removal": 0}
         self.log(f"full reconciliation over {len(shards)} shards")
         full = house is None
         if full:
@@ -528,17 +628,15 @@ class Poller:
         summary["upper_levels_recorded"] = self._snapshot_upper_levels(
             (house,) if house else self.houses)
         for index, shard in enumerate(shards, 1):
-            before = db.works_in_shard(shard.shard_id)
             outcome = self.fetch_shard(shard, force=True)
             if outcome["status"] == validate.STORED:
                 summary["stored"] += outcome["stored"]
                 summary["changed"] += outcome["changed"]
                 summary["versions"] += outcome["versions"]
-                after = db.works_in_shard(shard.shard_id)
-                gone = before - after
-                if gone:
-                    # Never deleted here. Recorded so a second sweep can agree.
-                    summary["missing_locally"][shard.shard_id] = sorted(gone)[:20]
+                summary["retired"] += outcome.get("retired", 0)
+                summary["awaiting_removal"] += outcome.get("awaiting_removal", 0)
+                if not outcome.get("exact", True):
+                    summary["not_exact"].append(shard.shard_id)
                 row = db.get_watermark(shard.shard_id) or {}
                 if row.get("count_matched") == 0:
                     summary["count_mismatch"].append(shard.shard_id)
@@ -569,7 +667,9 @@ class Poller:
                  f"{summary['stored']:,} records, "
                  f"{summary['changed']} changed, "
                  f"{len(summary['quarantined'])} quarantined, "
-                 f"{len(summary['count_mismatch'])} count mismatches"
+                 f"{len(summary['count_mismatch'])} count mismatches, "
+                 f"{len(summary['not_exact'])} slices not in exact parity, "
+                 f"{summary['retired']} retired"
                  + ("" if healthy else " — NOT recorded as complete; still due"))
         return summary
 
@@ -724,25 +824,40 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(argv)
 
-    houses = (args.house,) if args.house else HOUSES
-    poller = Poller(houses=houses, verbose=not args.quiet)
+    # Every mode writes the corpus, so every mode takes the lock — a one-off
+    # --once beside a running poller would double-log the same change too.
+    lock = instance_lock.WriterLock()
+    if not lock.acquire(role="poller"):
+        note = instance_lock.holder(lock.path) or {}
+        print(f"[poller] another poller is already running on {db.DB_PATH.name} "
+              f"(pid {note.get('pid', '?')}, {note.get('role', 'poller')}, since "
+              f"{note.get('since', '?')}). It is keeping the data current; "
+              f"not starting a second one.", file=sys.stderr, flush=True)
+        return instance_lock.ALREADY_RUNNING
+    try:
+        # A sweep killed mid-run (closed window, power cut) cannot clear its own
+        # marker. Holding the lock proves no sweep is running now.
+        db.set_state("sweep_started_at", "")
+        houses = (args.house,) if args.house else HOUSES
+        poller = Poller(houses=houses, verbose=not args.quiet)
 
-    if args.registry:
-        poller.refresh_registry()
+        if args.registry:
+            poller.refresh_registry()
+            return 0
+        if not db.load_shards():
+            poller.refresh_registry()
+        if args.reconcile:
+            summary = poller.reconcile_all(args.house)
+            print(json.dumps(summary, indent=2, default=str))
+            return 0
+        if args.once:
+            report = poller.heartbeat()
+            print(json.dumps(report.as_dict(), indent=2, default=str))
+            return 0
+        poller.run_forever()
         return 0
-    if not db.load_shards():
-        poller.refresh_registry()
-    if args.reconcile:
-        summary = poller.reconcile_all(args.house)
-        print(json.dumps({k: v for k, v in summary.items()
-                          if k != "missing_locally"}, indent=2, default=str))
-        return 0
-    if args.once:
-        report = poller.heartbeat()
-        print(json.dumps(report.as_dict(), indent=2, default=str))
-        return 0
-    poller.run_forever()
-    return 0
+    finally:
+        lock.release()
 
 
 if __name__ == "__main__":

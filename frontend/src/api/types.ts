@@ -222,7 +222,11 @@ export interface WorkRecord {
 export interface DataSource {
   mode_requested?: string;
   mode_resolved?: string;
+  /** True when the corpus is the live eSAKSHI portal kept current by the poller. */
+  live?: boolean;
   works?: number;
+  /** Work records by house: "LS" / "RS". */
+  houses?: Record<string, number>;
   fundflows?: number;
   work_eras?: Record<string, number>;
   fundflow_eras?: Record<string, number>;
@@ -242,7 +246,90 @@ export interface DataSource {
     rows: number;
     status: string;
     detail: string;
-    fetched_at: string;
+    fetched_at: string | null;
+  }[];
+}
+
+/** One portal tile figure, portal and stored side by side: [count, rupees].
+ *  A null count means the portal does not report one (expenditure). */
+export interface ParityFigure {
+  portal: [number | null, number | null];
+  stored: [number | null, number | null];
+  exact: boolean;
+}
+
+export type ParityTile = "recommended" | "sanctioned" | "completed" | "expenditure";
+
+/** Slice-by-slice agreement between the stored corpus and the portal's tiles. */
+export interface Parity {
+  registered_slices: number;
+  checked_slices: number;
+  exact_slices: number;
+  exception_count: number;
+  exceptions: {
+    shard_id: string;
+    house: "LS" | "RS";
+    place: string | null;
+    differences: { tile: ParityTile; measure: "count" | "rupees"; portal: number; stored: number }[];
+    checked_at: string;
+    recheck_after: string | null;
+  }[];
+  duplicate_listings: number;
+  national: Partial<Record<"LS" | "RS", Partial<Record<ParityTile, ParityFigure>>>>;
+  awaiting_removal: number;
+  oldest_missing_since: string | null;
+  removed_from_portal: number;
+  latest_removal: string | null;
+}
+
+/** GET /meta/freshness — health of the live sync with the eSAKSHI portal. */
+export interface Freshness {
+  status: "ok" | "degraded" | "no data";
+  parity?: Parity;
+  poller_running: boolean;
+  poller_since: string | null;
+  last_check_at: string | null;
+  poll_interval_seconds: number | null;
+  /** Local time of the nightly full re-read, e.g. "03:00". */
+  reconcile_at: string | null;
+  sweep_in_progress: boolean;
+  sweep_started_at: string | null;
+  last_update: { at: string; area: string; detail: string } | null;
+  registered_shards: number;
+  reconciled_shards: number;
+  reconciled_pct: number | null;
+  quarantined: number;
+  count_mismatched: number;
+  never_fetched: number;
+  last_full_reconciliation: string | null;
+  hours_since_reconciliation: number | null;
+  reconciliation_overdue: boolean;
+  stale: {
+    shard_id: string;
+    place: string | null;
+    state: string | null;
+    house: "LS" | "RS";
+    consecutive_failures: number;
+    stale_since: string | null;
+    last_fetch: string | null;
+    last_error: string | null;
+  }[];
+}
+
+/** GET /meta/recent-updates — what the portal changed most recently. */
+export interface RecentUpdates {
+  stores: { area: string; records: number; detail: string; at: string }[];
+  changes: {
+    work_id: string;
+    observed_at: string;
+    shard_id: string | null;
+    place: string | null;
+    state: string | null;
+    house: string | null;
+    mp_name: string | null;
+    description: string | null;
+    status: string | null;
+    fields: { field: string; old_value: string | null; new_value: string | null }[];
   }[];
 }
 
