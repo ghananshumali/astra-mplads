@@ -185,7 +185,16 @@ def to_works(tiles: dict[str, list[dict]]) -> list[Work]:
             continue
         code = work_code(row.get("ACTIVITY_NAME"))
         rec_date = iso_date(row.get("RECOMMENDATION_DATE"))
-        constituency = clean_text(row.get("CONSTITUENCY"))
+        is_rs = row.get("HOUSE_OF_PARLIAMENT") != HOUSE_LS
+        # For Rajya Sabha the portal's CONSTITUENCY field holds a membership
+        # type — "Sitting Rajya Sabha" or "Nominated Rajya Sabha" — not a seat.
+        # Stored as a constituency it would merge every RS member in a state
+        # into one pseudo-constituency: the constituency-level rules key
+        # entities as `constituency|state`, so R-SPIKE-01 and R-PILE-01 would
+        # run on several MPs' combined fund series. Left empty, those rules
+        # fall back to the MP's name and each member is their own entity. The
+        # membership type is still in the raw shard cache.
+        constituency = None if is_rs else clean_text(row.get("CONSTITUENCY"))
         is_sc, is_st = reservation(constituency)
         state = clean_text(row.get("STATE_NAME"))
         work_kind = activity_type(row.get("ACTIVITY_NAME"))

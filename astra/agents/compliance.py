@@ -78,6 +78,17 @@ class ComplianceAgent(BaseAgent):
         the district ledgers, and nothing more.
         """
         df = works.copy()
+        # Reserved seats are Lok Sabha constituencies. Rajya Sabha members hold
+        # no seat, so their spend has no place in this share — included, it
+        # only inflates each state's total and pushes reserved-seat shares
+        # down. Measured on the live corpus: two false findings (Andhra
+        # Pradesh ST, Bihar SC) that exist only because RS spend was mixed in.
+        # The CSV corpus carries no `house`, so NULL is treated as Lok Sabha
+        # and that path is unchanged.
+        if "house" in df.columns:
+            df = df[df["house"].fillna("LS") != "RS"]
+        if df.empty:
+            return []
         spend = pd.to_numeric(df.get("expenditure"), errors="coerce")
         if spend is None or spend.isna().all():
             spend = pd.to_numeric(df.get("sanctioned_amount"), errors="coerce")

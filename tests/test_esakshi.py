@@ -206,6 +206,62 @@ def test_corpus_equivalence(works: list) -> None:
           f"{len(api_only)} API-only" if api_only else "none")
 
 
+def test_rajya_sabha_shape() -> None:
+    """Rajya Sabha records carry a membership type where a seat would be."""
+    print("\n[4b] Rajya Sabha records — no pseudo-constituency, no SC/ST distortion")
+    import pandas as pd
+    from astra.agents.compliance import ComplianceAgent
+    from astra.config import load_rules
+
+    rs_row = {
+        "WORK_RECOMMENDATION_DTL_ID": 900001, "HOUSE_OF_PARLIAMENT": 1,
+        "ACTIVITY_NAME": "NA-Construction of community centers and community halls",
+        "STATE_NAME": "Bihar", "CONSTITUENCY": "Sitting Rajya Sabha",
+        "MP_NAME": "Shri Example Member (2022-28)",
+        "IDA_NAME": "PATNA(DISTRICT MAGISTRATE PATNA_IDA)",
+        "RECOMMENDATION_DATE": "12-Mar-2025", "RECOMMENDED_AMOUNT": 1500000.0,
+        "WORK_STAGE": "Pending for Sanction", "SANCTION_DATE": "NA",
+    }
+    work = emap.to_works({"recommended": [rs_row]})[0]
+    check("a Rajya Sabha work is marked RS", work.house == "RS")
+    check("its membership type is not stored as a constituency",
+          work.constituency is None, repr(work.constituency))
+    check("it carries no reserved-seat flags", (work.is_sc_constituency,
+                                                work.is_st_constituency) == (0, 0))
+
+    key = ComplianceAgent._ckey({"constituency": work.constituency,
+                                 "mp_name": work.mp_name, "state": work.state})
+    other = ComplianceAgent._ckey({"constituency": None,
+                                   "mp_name": "Smt Another Member (2024-30)",
+                                   "state": work.state})
+    check("each RS member is a separate constituency-level entity",
+          key != other and key.startswith("Shri Example Member"), key)
+
+    # R-SCST-02: a state where reserved Lok Sabha seats clear the benchmark on
+    # their own, and a large block of Rajya Sabha spend that would drag the
+    # share below it if it were counted.
+    rule = load_rules()["rules"]["scst_reserved_proxy"]
+    ls = [{"work_id": f"LS-{i}", "state": "BIHAR", "house": "LS",
+           "constituency": "GOPALGANJ(SC)" if i < 3 else f"SEAT {i}",
+           "is_sc_constituency": 1 if i < 3 else 0, "is_st_constituency": 0,
+           "expenditure": 10_000_000.0} for i in range(10)]
+    rs = [{"work_id": f"RS-{i}", "state": "BIHAR", "house": "RS",
+           "constituency": None, "is_sc_constituency": 0, "is_st_constituency": 0,
+           "expenditure": 10_000_000.0} for i in range(20)]
+    agent = ComplianceAgent()
+    ls_only = agent._scst_reserved_proxy(pd.DataFrame(ls), rule)
+    mixed = agent._scst_reserved_proxy(pd.DataFrame(ls + rs), rule)
+    sc = [f for f in mixed if "SC-reserved" in f.summary]
+    check("reserved LS seats at 30% of state spend raise no SC finding",
+          not [f for f in ls_only if "SC-reserved" in f.summary])
+    check("adding Rajya Sabha spend does not manufacture one",
+          not sc, sc[0].summary[:90] if sc else "none")
+
+    legacy = [{**r, "house": None} for r in ls]
+    check("the CSV corpus, which has no house, is judged exactly as before",
+          len(agent._scst_reserved_proxy(pd.DataFrame(legacy), rule)) == len(ls_only))
+
+
 def test_breaker() -> None:
     print("\n[5] circuit breaker")
     cb = CircuitBreaker(window=8, threshold=0.5, base_seconds=30)
@@ -296,6 +352,7 @@ def main() -> int:
     else:
         works = test_mapping(tiles)
         test_corpus_equivalence(works)
+    test_rajya_sabha_shape()
     test_breaker()
 
     if client is not None:
