@@ -108,23 +108,45 @@ def assert_contract(tile: str, rows: list[dict]) -> GateResult:
 
 # ------------------------------------------------------------------ gate 2
 def guard_zero(rows: list[dict], *, suspicious_zero: bool = False,
-               previous_stored: int | None = None) -> GateResult:
+               previous_stored: int | None = None,
+               registered: bool = False) -> GateResult:
     """Decide whether an empty or shrunken answer may be believed.
 
-    Three cases are refused:
-      * the watermark itself came back all-zero (an unknown shard id),
-      * no records at all where we previously held some,
-      * a collapse to under a tenth of what we held.
+    An all-zero response is ambiguous on its own: it is what the portal returns
+    both for a shard id that does not exist and for a slice that genuinely
+    holds nothing. The discrimination is not in the response, it is in where
+    the id came from — an id the portal itself enumerated through
+    `getStateData` / `getConstituencyData` is valid by construction.
 
-    A shard that has never held anything and returns nothing is simply empty —
-    plenty of small constituencies genuinely have no works of a given kind.
+    So `registered` decides. Four union territories (Lakshadweep, Andaman and
+    Nicobar, Ladakh, Dadra and Nagar Haveli and Daman and Diu) have no Rajya
+    Sabha members at all, and a first national sweep found a Lok Sabha
+    constituency with no works either; all of those answer all-zero and all of
+    them are telling the truth.
+
+    Refused:
+      * an all-zero watermark for an id we did not enumerate — a bad id,
+      * an all-zero watermark where we previously held records — a regression,
+      * no records where we previously held some,
+      * a collapse to under a tenth of what we held.
     """
     n = len(rows)
     if suspicious_zero:
-        return GateResult(False, QUARANTINED,
-                          "watermark was all-zero: unknown shard id or a portal "
-                          "fault, never an empty constituency",
-                          {"rows": n, "previous_stored": previous_stored})
+        if not registered:
+            return GateResult(False, QUARANTINED,
+                              "all-zero watermark for a shard id that is not in "
+                              "the registry: an unknown id, never an empty slice",
+                              {"rows": n, "previous_stored": previous_stored})
+        if previous_stored:
+            return GateResult(False, QUARANTINED,
+                              f"all-zero watermark for a registered shard that "
+                              f"previously held {previous_stored} records",
+                              {"rows": n, "previous_stored": previous_stored})
+        return GateResult(True, VALIDATED,
+                          "registered shard is genuinely empty (no members or "
+                          "no works)",
+                          {"rows": n, "previous_stored": previous_stored,
+                           "empty": True})
     if n == 0:
         if previous_stored:
             return GateResult(False, QUARANTINED,
@@ -170,7 +192,8 @@ def reconcile_count(portal_count: int | None, mapped: int, *,
 # -------------------------------------------------------------- orchestration
 def validate_shard(tiles: dict[str, list[dict]], *, suspicious_zero: bool = False,
                    portal_count: int | None = None, mapped: int | None = None,
-                   previous_stored: int | None = None) -> GateResult:
+                   previous_stored: int | None = None,
+                   registered: bool = False) -> GateResult:
     """Run the pre-write gates in order and return the first failure.
 
     `mapped` is the number of `Work` records built from `tiles`; pass it to
@@ -184,7 +207,8 @@ def validate_shard(tiles: dict[str, list[dict]], *, suspicious_zero: bool = Fals
 
     zero = guard_zero(tiles.get("recommended") or [],
                       suspicious_zero=suspicious_zero,
-                      previous_stored=previous_stored)
+                      previous_stored=previous_stored,
+                      registered=registered)
     if not zero:
         return zero
 

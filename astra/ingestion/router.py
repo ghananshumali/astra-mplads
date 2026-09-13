@@ -56,9 +56,55 @@ from ..schemas import FundFlow, Work
 from . import live as live_mod
 from . import offline as offline_mod
 
-MODES = ("auto", "live", "offline")
+MODES = ("auto", "live", "offline", "api")
 #: a live work corpus smaller than this is treated as insufficient in auto mode
 MIN_LIVE_WORKS = int(os.environ.get("ASTRA_MIN_LIVE_WORKS", "200"))
+
+
+def _ingest_api(verbose: bool = True) -> dict:
+    """MODE 4: one full record-level sweep of the eSAKSHI REST interface.
+
+    The same sweep the poller runs nightly, as a one-shot command:
+
+        python scripts/fetch_data.py --mode api
+
+    Upserts `works` shard by shard rather than replacing the table, so it is
+    safe to re-run and never leaves the corpus empty if it is interrupted.
+    Takes about seven minutes for the whole country.
+
+    `fundflows` is untouched by this mode — it is built from the Allocated
+    Limit tile and the pre-2023 CKAN records, which the offline/auto path
+    already handles. Run `--mode offline` (or `auto`) once for fund positions.
+    """
+    from .poller import Poller                      # deferred: avoids a cycle
+
+    poller = Poller(verbose=verbose)
+    registered = poller.refresh_registry()
+    summary = poller.reconcile_all()
+    works_df = db.read_df("works")
+    flows_df = db.read_df("fundflows")
+    works_now, flows_now = len(works_df), len(flows_df)
+
+    meta = {
+        "mode_requested": "api",
+        "mode_resolved": "api",
+        "works": works_now,
+        "fundflows": flows_now,
+        "eras": works_df["era"].value_counts().to_dict() if works_now else {},
+        "flow_eras": flows_df["era"].value_counts().to_dict() if flows_now else {},
+        "shards": registered,
+        "sweep": {k: v for k, v in summary.items() if k != "missing_locally"},
+        "watermarks": db.watermark_summary(),
+        "ingested_at": datetime.now(timezone.utc).isoformat(),
+        "provenance": [],
+    }
+    PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+    with open(PROCESSED_DIR / "ingest_meta.json", "w", encoding="utf-8") as fh:
+        json.dump(meta, fh, indent=2, default=str)
+    if verbose:
+        print(f"[router] API sweep complete: works={works_now:,} "
+              f"shards={registered} in {summary['seconds']}s")
+    return meta
 
 
 def _conform(df: pd.DataFrame, model) -> pd.DataFrame:
@@ -78,6 +124,9 @@ def ingest(mode: str = "auto", verbose: bool = True,
     """Resolve a data source per the mode and load the canonical tables."""
     if mode not in MODES:
         raise ValueError(f"mode must be one of {MODES}")
+
+    if mode == "api":
+        return _ingest_api(verbose=verbose)
 
     provenance: list[dict] = []
     works = pd.DataFrame()

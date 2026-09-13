@@ -1,0 +1,645 @@
+"""The control loop: sharded polling with hierarchical change detection.
+
+    python -m astra.ingestion.poller                 # run until stopped
+    python -m astra.ingestion.poller --once          # one heartbeat cycle
+    python -m astra.ingestion.poller --reconcile     # one full record-level sweep
+    python -m astra.ingestion.poller --registry      # re-enumerate shards only
+
+Why it is shaped this way
+-------------------------
+The portal has no way to tell us when something changes: no webhook, no feed,
+no `updated_since` filter. So we ask. Asking for the whole country never
+returns (measured: no response after 45 s), which is why the country is split
+into 579 slices — 543 Lok Sabha constituencies plus 36 Rajya Sabha states.
+
+Asking every slice every minute would be 579 requests a minute against a
+government service, which is out of the question. What makes it cheap instead
+is that the portal's counts are exactly additive: the national total equals the
+sum of the states, and each state equals the sum of its constituencies, to the
+paisa. So one cheap national question per minute tells us whether anything
+moved anywhere, and the same question asked of 36 states and then of one
+state's constituencies walks the difference down to the exact slice. At rest
+that is **one request a minute**; a typical detection costs about forty.
+
+There is deliberately no learned priority over shards. An earlier design
+weighted slices by observed change rate to shave a few seconds off the
+descent; it bought roughly six seconds in exchange for a parameter that is
+wrong during warm-up and wrong again whenever a quiet state suddenly becomes
+active. Sweeping all 36 states costs 7.5 s, so every slice is treated equally.
+
+The counts are a hint, never an authority
+-----------------------------------------
+Two independent reasons the fast path cannot be the only path:
+
+* The counts and the records do not agree exactly. Each report carries one
+  id-less summary row, and the two figures are separate reads — measured
+  national Rajya Sabha "Works Completed" at 10,080 against a state sum of
+  10,081 across a 13-second sweep. So additivity is asserted with a tolerance
+  and used as a consistency check, never as a loop's exit condition.
+* If the counts endpoint were ever stale, cached or simply wrong, the heartbeat
+  would sleep through a real change and see nothing. Nothing in the fast path
+  could detect that.
+
+`reconcile_all()` is the answer to both: once a night it re-reads every slice's
+**records** regardless of what the counts say, diffs the id sets against what
+we hold, and records whether each slice's count agreed with its records. It
+must never be "optimised" into a counts-only sweep — that would inherit exactly
+the blindness it exists to cover.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import random
+import signal
+import sys
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+
+from .. import db
+from ..config import PROCESSED_DIR
+from . import esakshi_map as emap
+from . import shard_cache, validate
+from .esakshi_api import (HOUSE_LS, HOUSE_RS, RECORD_TILES, EsakshiClient,
+                          Shard, SourceError, run_parallel, shard_combo)
+
+#: Seconds between heartbeats. Works arrive at roughly 20-25 an hour during
+#: Indian working hours, i.e. one every few minutes, so a minute already
+#: over-samples; going faster multiplies load on the portal for latency that
+#: the portal's own data-entry lag dwarfs.
+POLL_INTERVAL = float(os.environ.get("ASTRA_POLL_INTERVAL", "60"))
+#: Local clock time for the nightly record-level reconciliation, HH:MM.
+RECONCILE_AT = os.environ.get("ASTRA_RECONCILE_AT", "03:00")
+#: Houses to watch: 2 = Lok Sabha, 1 = Rajya Sabha.
+HOUSES = tuple(int(h) for h in
+               os.environ.get("ASTRA_HOUSES", "2,1").replace(" ", "").split(",") if h)
+#: Consecutive failures on one slice before it is escalated by name.
+ESCALATE_AFTER = int(os.environ.get("ASTRA_ESCALATE_AFTER", "3"))
+#: Kill switch: set to 0 to pin the demo to the cache and stop all polling.
+ENABLED = os.environ.get("ASTRA_POLLER_ENABLED", "1") != "0"
+
+ALERTS_PATH = PROCESSED_DIR / "ingest_alerts.json"
+STATUS_PATH = PROCESSED_DIR / "poller_status.json"
+
+#: Lifecycles that mean "this slice still owes us a fetch" — read back on
+#: startup so a restart resumes rather than restarts.
+PENDING = (validate.DIRTY, validate.FETCHED, validate.RETRY, validate.QUARANTINED)
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def national_shard_id(house: int) -> str:
+    return f"{house}:0:0"
+
+
+def state_shard_id(house: int, state_id: int) -> str:
+    return f"{house}:{state_id}:0"
+
+
+@dataclass
+class CycleReport:
+    """What one heartbeat cycle did — logged and written to poller_status.json."""
+
+    started_at: str
+    requests: int = 0
+    houses_moved: tuple = ()
+    states_probed: int = 0
+    constituencies_probed: int = 0
+    dirty: tuple = ()
+    stored: int = 0
+    changed: int = 0
+    versions: int = 0
+    quarantined: tuple = ()
+    seconds: float = 0.0
+    note: str = ""
+
+    def as_dict(self) -> dict:
+        return {k: (list(v) if isinstance(v, tuple) else v)
+                for k, v in self.__dict__.items()}
+
+
+class Poller:
+    """Owns the loop, the registry and the queue. The only writer."""
+
+    def __init__(self, client: EsakshiClient | None = None, *,
+                 houses: tuple[int, ...] = HOUSES, verbose: bool = True):
+        self.client = client or EsakshiClient()
+        self.houses = houses
+        self.verbose = verbose
+        self._stop = False
+
+    # ------------------------------------------------------------- plumbing
+    def log(self, message: str) -> None:
+        if self.verbose:
+            print(f"[poller {datetime.now().strftime('%H:%M:%S')}] {message}",
+                  flush=True)
+
+    def stop(self, *_args) -> None:
+        self._stop = True
+        self.log("stop requested; finishing the current cycle")
+
+    # ------------------------------------------------------------- registry
+    def refresh_registry(self) -> int:
+        """Re-enumerate every slice from the portal. Never hard-code ids."""
+        shards = self.client.shards(houses=self.houses)
+        rows = [{"shard_id": s.shard_id, "house": s.house, "state_id": s.state_id,
+                 "constituency_id": s.constituency_id, "state_name": s.state_name,
+                 "constituency_name": s.constituency_name} for s in shards]
+        db.save_shards(rows)
+        self.log(f"registry: {len(rows)} shards "
+                 + ", ".join(f"house {h}={sum(1 for s in shards if s.house == h)}"
+                             for h in self.houses))
+        return len(rows)
+
+    def registry(self, house: int | None = None) -> list[Shard]:
+        rows = db.load_shards(house)
+        return [Shard(house=r["house"], state_id=r["state_id"],
+                      constituency_id=r["constituency_id"],
+                      state_name=r["state_name"] or "",
+                      constituency_name=r["constituency_name"] or "")
+                for r in rows]
+
+    # ------------------------------------------------- watermark comparison
+    def _probe(self, shard_id: str, combo: str) -> tuple[bool, object, int | None]:
+        """Read a watermark and say whether it moved since we last looked.
+
+        Returns (moved, signature, recommended_count). A slice we have never
+        seen counts as moved — that is how a cold start finds everything.
+        """
+        watermark = self.client.watermark(combo)
+        signature = watermark.signature()
+        stored = db.get_watermark(shard_id)
+        previous = None
+        if stored and stored.get("signature_json"):
+            try:
+                previous = json.loads(stored["signature_json"])
+            except ValueError:
+                previous = None
+        moved = previous is None or previous != json.loads(
+            json.dumps(signature, default=str))
+        return moved, signature, watermark.counts.get("Works Recommended")
+
+    def _record_probe(self, shard_id: str, signature, count: int | None,
+                      lifecycle: str) -> None:
+        db.save_watermark(shard_id, signature=signature, n_records=count,
+                          lifecycle=lifecycle)
+
+    # ------------------------------------------------------------- the hunt
+    def descend(self, house: int, report: CycleReport) -> list[Shard]:
+        """Walk the difference down: states, then the constituencies that moved.
+
+        Every state is probed, not a prioritised subset. The accounting is
+        checked afterwards as a consistency assertion, with a tolerance, and a
+        mismatch widens the search rather than narrowing it.
+        """
+        dirty: list[Shard] = []
+        states = {}
+        for shard in self.registry(house):
+            states.setdefault(shard.state_id, []).append(shard)
+
+        # Every state at once, four at a time. All 36 are probed rather than a
+        # prioritised subset: measured at 7.5 s, which is not worth a learned
+        # parameter that can be wrong.
+        state_ids = sorted(states)
+        probes = run_parallel(
+            state_ids,
+            lambda sid_: self._probe(state_shard_id(house, sid_),
+                                     shard_combo(sid_, 0, house=house)))
+        moved_states = []
+        for state_id, probe in zip(state_ids, probes):
+            sid = state_shard_id(house, state_id)
+            if isinstance(probe, BaseException):
+                db.mark_shard_failure(sid, str(probe), lifecycle=validate.RETRY)
+                self.log(f"  state {state_id}: {probe}")
+                continue
+            moved, signature, count = probe
+            report.requests += 1
+            report.states_probed += 1
+            if moved:
+                moved_states.append(state_id)
+            self._record_probe(sid, signature, count, validate.IDLE)
+
+        if not moved_states:
+            return dirty
+
+        for state_id in moved_states:
+            members = states[state_id]
+            # Rajya Sabha slices ARE states: no constituency level to descend to.
+            if house == HOUSE_RS:
+                dirty.extend(members)
+                continue
+            probed = run_parallel(
+                members, lambda s: self._probe(s.shard_id, s.combo))
+            for shard, probe in zip(members, probed):
+                if isinstance(probe, BaseException):
+                    db.mark_shard_failure(shard.shard_id, str(probe),
+                                          lifecycle=validate.RETRY)
+                    continue
+                moved, signature, count = probe
+                report.requests += 1
+                report.constituencies_probed += 1
+                if moved:
+                    dirty.append(shard)
+                    db.save_watermark(shard.shard_id, signature=signature,
+                                      n_records=count, lifecycle=validate.DIRTY)
+                else:
+                    self._record_probe(shard.shard_id, signature, count,
+                                       validate.IDLE)
+        return dirty
+
+    # ------------------------------------------------------------ the fetch
+    def fetch_shard(self, shard: Shard, *, force: bool = False,
+                    attempts: int = 2) -> dict:
+        """Pull, gate, map and store one slice. Returns a small outcome dict.
+
+        Never deletes. A slice that cannot be read or does not pass the gates
+        keeps whatever records it already had and is marked stale instead.
+
+        A gate failure is retried once before the shard is quarantined. The
+        first national sweep showed why: 7 of 543 constituencies came back with
+        a report that disagreed with the portal's own count, in both directions
+        and by as much as 175 records — and every one of them was perfectly
+        consistent again minutes later (24 consecutive re-fetches of two of
+        them matched exactly). The portal is occasionally inconsistent under a
+        long sustained sweep, so the right response to a mismatch is to ask
+        again, and to quarantine only if it persists.
+        """
+        outcome = {"shard": shard.shard_id, "label": shard.label,
+                   "stored": 0, "changed": 0, "versions": 0, "status": "",
+                   "reason": ""}
+        for attempt in range(1, max(1, attempts) + 1):
+            outcome = self._attempt_fetch(shard, force=force,
+                                          final=attempt >= attempts)
+            if outcome["status"] != "RECHECK":
+                return outcome
+            self.log(f"  {shard.label}: {outcome['reason'][:90]} — re-reading")
+            time.sleep(1.5)
+        return outcome
+
+    def _attempt_fetch(self, shard: Shard, *, force: bool,
+                       final: bool) -> dict:
+        """One pull-gate-store attempt. Returns status 'RECHECK' if worth a retry."""
+        outcome = {"shard": shard.shard_id, "label": shard.label,
+                   "stored": 0, "changed": 0, "versions": 0, "status": "",
+                   "reason": ""}
+
+        def refuse(reason: str, lifecycle: str) -> dict:
+            """Quarantine now, or ask for one more read first."""
+            if not final:
+                return {**outcome, "status": "RECHECK", "reason": reason}
+            failures = db.mark_shard_failure(shard.shard_id, reason,
+                                             lifecycle=lifecycle)
+            self._maybe_escalate(shard, failures, reason)
+            return {**outcome, "status": lifecycle, "reason": reason}
+
+        try:
+            watermark = self.client.watermark(shard.combo)
+            # The four tiles in parallel: exactly the measured concurrency
+            # ceiling, so one shard costs about one request's worth of time
+            # rather than four.
+            fetched = run_parallel(
+                list(RECORD_TILES),
+                lambda tile: self.client.tile_report(shard.combo, tile))
+            for result in fetched:
+                if isinstance(result, BaseException):
+                    raise result
+            tiles = dict(zip(RECORD_TILES, fetched))
+        except SourceError as exc:
+            return refuse(str(exc), validate.RETRY)
+
+        digest = validate.payload_hash(tiles)
+        stored_row = db.get_watermark(shard.shard_id) or {}
+        previous_stored = stored_row.get("n_stored")
+        portal_count = watermark.counts.get("Works Recommended")
+
+        if not force and digest and stored_row.get("payload_sha256") == digest:
+            # Nothing in the slice actually changed; do not rewrite it.
+            db.save_watermark(shard.shard_id, signature=watermark.signature(),
+                              n_records=portal_count, payload_sha256=digest,
+                              lifecycle=validate.IDLE, fetched=True)
+            outcome.update(status="unchanged")
+            return outcome
+
+        # `registered=True`: the poller only ever fetches shards the portal
+        # itself enumerated, so an all-zero answer here means a genuinely empty
+        # slice rather than a bad id.
+        gate = validate.validate_shard(
+            tiles, suspicious_zero=watermark.suspicious_zero,
+            previous_stored=previous_stored, registered=True)
+        if not gate:
+            return refuse(gate.reason, validate.QUARANTINED)
+
+        works = emap.to_works(tiles)
+        count_gate = validate.reconcile_count(portal_count, len(works))
+        if not count_gate:
+            return refuse(count_gate.reason, validate.QUARANTINED)
+
+        result = db.upsert_works(works, shard_id=shard.shard_id)
+        for tile, rows in tiles.items():
+            shard_cache.write(shard.shard_id, tile, rows)
+        db.save_watermark(
+            shard.shard_id, signature=watermark.signature(),
+            n_records=portal_count, payload_sha256=digest,
+            lifecycle=validate.STORED, n_stored=len(works),
+            count_matched=bool(count_gate.detail.get("matched")), fetched=True)
+        db.record_provenance([{
+            "source": f"eSAKSHI API {shard.label}", "mode": "api",
+            "table": "works", "rows": len(works), "status": "ok",
+            "detail": (f"shard {shard.shard_id}; portal count {portal_count}; "
+                       f"{result['changed']} changed, {result['versions']} versions"),
+            "fetched_at": _now()}])
+        outcome.update(status=validate.STORED, stored=len(works),
+                       changed=result["changed"], versions=result["versions"])
+        return outcome
+
+    # ------------------------------------------------------------ escalation
+    def _maybe_escalate(self, shard: Shard, failures: int, reason: str) -> None:
+        """A slice missing for days must degrade freshness, not hide inside it."""
+        if failures < ESCALATE_AFTER:
+            return
+        stale = db.stale_shards(min_failures=ESCALATE_AFTER)
+        payload = {"generated_at": _now(), "escalate_after": ESCALATE_AFTER,
+                   "stale": stale}
+        PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+        ALERTS_PATH.write_text(json.dumps(payload, indent=2, default=str),
+                               encoding="utf-8")
+        self.log(f"  ESCALATED {shard.label} after {failures} consecutive "
+                 f"failures: {reason[:100]}")
+
+    # ----------------------------------------------------------- the queue
+    def pending_shards(self) -> list[Shard]:
+        """Slices still owing a fetch, read back from the database.
+
+        The queue is durable by construction: it is a lifecycle column, so a
+        crash or restart resumes from exactly where it stopped.
+        """
+        by_id = {s.shard_id: s for s in self.registry()}
+        out = []
+        with db.connect() as con:
+            marks = ", ".join("?" * len(PENDING))
+            rows = con.execute(
+                f"SELECT shard_id FROM shard_watermarks "
+                f"WHERE lifecycle IN ({marks})", PENDING)
+            for row in rows:
+                shard = by_id.get(row["shard_id"])
+                if shard is not None:
+                    out.append(shard)
+        return out
+
+    def drain(self, shards: list[Shard], report: CycleReport) -> None:
+        for shard in shards:
+            outcome = self.fetch_shard(shard)
+            if outcome["status"] == validate.STORED:
+                report.stored += outcome["stored"]
+                report.changed += outcome["changed"]
+                report.versions += outcome["versions"]
+                self.log(f"  stored {shard.label}: {outcome['stored']} records, "
+                         f"{outcome['changed']} changed, "
+                         f"{outcome['versions']} versions")
+            elif outcome["status"] in (validate.QUARANTINED, validate.RETRY):
+                report.quarantined = report.quarantined + (shard.shard_id,)
+                self.log(f"  {outcome['status']} {shard.label}: "
+                         f"{outcome['reason'][:120]}")
+
+    # ------------------------------------------------------------ one cycle
+    def heartbeat(self) -> CycleReport:
+        """One minute's work: ask nationally, descend only if something moved."""
+        report = CycleReport(started_at=_now())
+        clock = time.monotonic()
+
+        pending = self.pending_shards()
+        if pending:
+            self.log(f"resuming {len(pending)} shard(s) left from earlier")
+            self.drain(pending, report)
+
+        for house in self.houses:
+            nid = national_shard_id(house)
+            try:
+                moved, signature, count = self._probe(
+                    nid, shard_combo(house=house))
+            except SourceError as exc:
+                db.mark_shard_failure(nid, str(exc), lifecycle=validate.RETRY)
+                report.note = f"national probe failed: {exc}"
+                self.log(f"national (house {house}): {exc}")
+                continue
+            report.requests += 1
+            if not moved:
+                self._record_probe(nid, signature, count, validate.IDLE)
+                continue
+            self.log(f"national (house {house}) moved -> descending "
+                     f"(recommended={count:,})" if count else
+                     f"national (house {house}) moved -> descending")
+            report.houses_moved = report.houses_moved + (house,)
+            dirty = self.descend(house, report)
+            report.dirty = report.dirty + tuple(s.shard_id for s in dirty)
+            if dirty:
+                self.log(f"  {len(dirty)} shard(s) changed: "
+                         + ", ".join(s.label for s in dirty[:6])
+                         + (" ..." if len(dirty) > 6 else ""))
+                self.drain(dirty, report)
+            # Record the national watermark only after the descent, so a crash
+            # midway leaves it "moved" and the next cycle tries again.
+            self._record_probe(nid, signature, count, validate.IDLE)
+
+        report.seconds = round(time.monotonic() - clock, 2)
+        self._write_status(report)
+        return report
+
+    # ------------------------------------------------------- full sweep
+    def reconcile_all(self, house: int | None = None) -> dict:
+        """Re-read every slice's RECORDS, whatever the counts say.
+
+        This is the safety net under the fast path, for two reasons: it catches
+        edits that move no count, and it is the only thing that would notice a
+        counts endpoint gone stale or wrong. It must stay record-level — a
+        counts-only sweep would be blind in exactly the same way as the
+        heartbeat it is meant to back up.
+        """
+        started = time.monotonic()
+        shards = self.registry(house)
+        summary = {"started_at": _now(), "shards": len(shards), "stored": 0,
+                   "unchanged": 0, "changed": 0, "versions": 0,
+                   "quarantined": [], "count_mismatch": [], "missing_locally": {}}
+        self.log(f"full reconciliation over {len(shards)} shards")
+        summary["upper_levels_recorded"] = self._snapshot_upper_levels(
+            (house,) if house else self.houses)
+        for index, shard in enumerate(shards, 1):
+            before = db.works_in_shard(shard.shard_id)
+            outcome = self.fetch_shard(shard, force=True)
+            if outcome["status"] == validate.STORED:
+                summary["stored"] += outcome["stored"]
+                summary["changed"] += outcome["changed"]
+                summary["versions"] += outcome["versions"]
+                after = db.works_in_shard(shard.shard_id)
+                gone = before - after
+                if gone:
+                    # Never deleted here. Recorded so a second sweep can agree.
+                    summary["missing_locally"][shard.shard_id] = sorted(gone)[:20]
+                row = db.get_watermark(shard.shard_id) or {}
+                if row.get("count_matched") == 0:
+                    summary["count_mismatch"].append(shard.shard_id)
+            elif outcome["status"] == "unchanged":
+                summary["unchanged"] += 1
+            else:
+                summary["quarantined"].append(shard.shard_id)
+            if self.verbose and index % 50 == 0:
+                self.log(f"  {index}/{len(shards)} "
+                         f"({time.monotonic() - started:.0f}s)")
+            if self._stop:
+                summary["stopped_early_at"] = index
+                break
+        summary["seconds"] = round(time.monotonic() - started, 1)
+        summary["finished_at"] = _now()
+        self.log(f"reconciliation done in {summary['seconds']}s: "
+                 f"{summary['stored']:,} records, "
+                 f"{summary['changed']} changed, "
+                 f"{len(summary['quarantined'])} quarantined, "
+                 f"{len(summary['count_mismatch'])} count mismatches")
+        return summary
+
+    def _snapshot_upper_levels(self, houses: tuple[int, ...]) -> int:
+        """Record the national and state watermarks a sweep does not fetch.
+
+        A sweep stores a watermark for every shard it reads, but the heartbeat
+        compares at two levels above that too — the national figure and, for
+        the Lok Sabha, each state. Leaving those unrecorded made the first
+        heartbeat after the first national sweep treat them as never seen and
+        descend into all 543 constituencies: 617 requests where one was due,
+        and it would have happened again after every nightly sweep.
+
+        Taken at the START of the sweep, deliberately. If they were recorded at
+        the end, a change landing on a shard the sweep had already read would
+        be absorbed into the national figure, the heartbeat would see nothing
+        moved, and the change would go unnoticed until the next night. Taken at
+        the start, the same change leaves the national figure different from
+        what we stored, so the next heartbeat descends and finds it. The worst
+        case is one unnecessary descent right after a busy sweep.
+        """
+        recorded = 0
+        for house in houses:
+            try:
+                _moved, signature, count = self._probe(
+                    national_shard_id(house), shard_combo(house=house))
+                self._record_probe(national_shard_id(house), signature, count,
+                                   validate.IDLE)
+                recorded += 1
+            except SourceError as exc:
+                self.log(f"  national snapshot (house {house}) failed: {exc}")
+            if house == HOUSE_RS:
+                continue           # Rajya Sabha shards ARE the states: the sweep
+                                   # stores those watermarks itself
+            state_ids = sorted({s.state_id for s in self.registry(house)})
+            probes = run_parallel(
+                state_ids,
+                lambda sid_, h=house: self._probe(state_shard_id(h, sid_),
+                                                  shard_combo(sid_, 0, house=h)))
+            for state_id, probe in zip(state_ids, probes):
+                if isinstance(probe, BaseException):
+                    continue
+                _moved, signature, count = probe
+                self._record_probe(state_shard_id(house, state_id), signature,
+                                   count, validate.IDLE)
+                recorded += 1
+        return recorded
+
+    # ------------------------------------------------------------ the loop
+    def _write_status(self, report: CycleReport) -> None:
+        PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+        STATUS_PATH.write_text(json.dumps(
+            {"last_cycle": report.as_dict(),
+             "poll_interval_seconds": POLL_INTERVAL,
+             "reconcile_at": RECONCILE_AT,
+             "houses": list(self.houses),
+             "watermarks": db.watermark_summary(),
+             "cache": shard_cache.usage()}, indent=2, default=str),
+            encoding="utf-8")
+
+    def run_forever(self) -> None:
+        if not ENABLED:
+            self.log("ASTRA_POLLER_ENABLED=0 — not polling; serving the cache")
+            return
+        signal.signal(signal.SIGINT, self.stop)
+        signal.signal(signal.SIGTERM, self.stop)
+        if not db.load_shards():
+            self.refresh_registry()
+        last_registry = time.monotonic()
+        last_reconcile_day = None
+        self.log(f"watching every {POLL_INTERVAL:.0f}s; nightly sweep at "
+                 f"{RECONCILE_AT}; houses {self.houses}")
+        while not self._stop:
+            cycle_start = time.monotonic()
+            try:
+                report = self.heartbeat()
+                if report.houses_moved or report.dirty:
+                    self.log(f"cycle: {report.requests} requests, "
+                             f"{len(report.dirty)} shards fetched, "
+                             f"{report.stored} records, {report.seconds}s")
+            except Exception as exc:                 # a cycle must never kill it
+                self.log(f"cycle error: {type(exc).__name__}: {exc}")
+
+            if time.monotonic() - last_registry > 86_400:
+                try:
+                    self.refresh_registry()
+                    last_registry = time.monotonic()
+                except SourceError as exc:
+                    self.log(f"registry refresh failed: {exc}")
+
+            today = datetime.now().strftime("%Y-%m-%d")
+            if (datetime.now().strftime("%H:%M") == RECONCILE_AT
+                    and last_reconcile_day != today):
+                last_reconcile_day = today
+                try:
+                    self.reconcile_all()
+                except Exception as exc:
+                    self.log(f"reconciliation error: {type(exc).__name__}: {exc}")
+
+            # jittered, so restarts do not synchronise onto the same second
+            elapsed = time.monotonic() - cycle_start
+            nap = max(1.0, POLL_INTERVAL - elapsed) * (0.9 + random.random() / 5)
+            deadline = time.monotonic() + nap
+            while time.monotonic() < deadline and not self._stop:
+                time.sleep(0.5)
+        self.client.close()
+        self.log("stopped")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="ASTRA eSAKSHI poller")
+    parser.add_argument("--once", action="store_true",
+                        help="run a single heartbeat cycle and exit")
+    parser.add_argument("--reconcile", action="store_true",
+                        help="run one full record-level sweep and exit")
+    parser.add_argument("--registry", action="store_true",
+                        help="re-enumerate shards from the portal and exit")
+    parser.add_argument("--house", type=int, choices=(HOUSE_LS, HOUSE_RS),
+                        help="restrict to one house")
+    parser.add_argument("--quiet", action="store_true")
+    args = parser.parse_args(argv)
+
+    houses = (args.house,) if args.house else HOUSES
+    poller = Poller(houses=houses, verbose=not args.quiet)
+
+    if args.registry:
+        poller.refresh_registry()
+        return 0
+    if not db.load_shards():
+        poller.refresh_registry()
+    if args.reconcile:
+        summary = poller.reconcile_all(args.house)
+        print(json.dumps({k: v for k, v in summary.items()
+                          if k != "missing_locally"}, indent=2, default=str))
+        return 0
+    if args.once:
+        report = poller.heartbeat()
+        print(json.dumps(report.as_dict(), indent=2, default=str))
+        return 0
+    poller.run_forever()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
