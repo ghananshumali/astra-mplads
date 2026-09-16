@@ -371,6 +371,109 @@ def test_fingerprints(tiles: dict[str, list[dict]]) -> None:
           str(_TMP) in use["path"], use["path"])
 
 
+# ------------------------------------------------------------ fields added later
+def test_new_fields(tiles: dict[str, list[dict]]) -> None:
+    print("\n[9b] fields added later — columns appended, then filled from the cache")
+    from datetime import timedelta
+    from astra.ingestion import backfill
+    db.init_db(force=True)
+    with db.connect() as con:
+        for table in ("works", "work_versions", "work_listing", "shards", "poller_state"):
+            con.execute(f"DELETE FROM {table}")
+    seed_registry()
+    mapping = emap.map_shard(tiles)
+    db.upsert_works(mapping.works, shard_id=SHARD)
+    db.apply_listing(SHARD, mapping.listing, consistent=True, confirm_after=timedelta(minutes=10))
+    # A database from before the fields existed: drop the columns, as it had none.
+    with db.connect() as con:
+        for field in backfill.FIELDS:
+            con.execute(f"ALTER TABLE works DROP COLUMN {field}")
+    db.init_db(force=True)
+    with db.connect() as con:
+        cols = [r[1] for r in con.execute("PRAGMA table_info(works)")]
+        kept = con.execute("SELECT COUNT(*) FROM works").fetchone()[0]
+        empty = con.execute("SELECT COUNT(*) FROM works WHERE work_category IS NULL").fetchone()[0]
+    check("a works table lacking only new columns gains them and keeps every row",
+          set(backfill.FIELDS) <= set(cols) and kept == len(mapping.works) == empty,
+          f"{kept} rows, {empty} without a category")
+
+    for tile in RECORD_TILES:
+        shard_cache.write(SHARD, tile, tiles[tile])
+    with db.connect() as con:
+        con.execute("DELETE FROM poller_state")
+    summary = backfill.fill_from_cache(log=lambda _m: None)
+    with db.connect() as con:
+        filled = con.execute("SELECT COUNT(*) FROM works WHERE work_category IS NOT NULL "
+                             "AND letter_no IS NOT NULL AND term_end IS NOT NULL").fetchone()[0]
+        paid = con.execute("SELECT COUNT(*) FROM works WHERE payment_count > 0 "
+                           "AND implementing_agency IS NOT NULL AND vendor_id IS NOT NULL").fetchone()[0]
+        n_paid = con.execute("SELECT COUNT(*) FROM works WHERE payment_count > 0").fetchone()[0]
+        versions = con.execute("SELECT COUNT(*) FROM work_versions").fetchone()[0]
+    check("the cache fills them on every stored work, with no portal request",
+          filled == len(mapping.works) and paid == n_paid > 0
+          and summary["works_filled"] == len(mapping.works), json.dumps(summary))
+    check("filling logs nothing as an edit, and marks the analysis as behind",
+          versions == 0 and bool(db.get_state("data_changed_at")))
+    check("it runs once", backfill.fill_from_cache(log=lambda _m: None) == {"skipped": True})
+
+    with db.connect() as con:
+        work_id = con.execute("SELECT work_id FROM works LIMIT 1").fetchone()[0]
+        con.execute("UPDATE works SET letter_no = 'LN/NEWER' WHERE work_id = ?", (work_id,))
+    again = backfill.fill_from_cache(log=lambda _m: None, force=True)
+    with db.connect() as con:
+        letter = con.execute("SELECT letter_no FROM works WHERE work_id = ?", (work_id,)).fetchone()[0]
+    check("a value already stored is never replaced from the cache",
+          letter == "LN/NEWER" and again["works_filled"] == 0, f"{letter}, {again['works_filled']}")
+    result = db.upsert_works(emap.map_shard(tiles).works, shard_id=SHARD)
+    check("the next read of the slice logs only real differences",
+          result["versions"] == 1 and result["changed"] == 1, json.dumps(result))
+
+
+def test_payments(tiles: dict[str, list[dict]]) -> None:
+    print("\n[9c] payments — every record kept, replaced per work, filled from the cache")
+    from datetime import timedelta
+    from astra.ingestion import backfill
+    with db.connect() as con:
+        for table in ("works", "work_listing", "payments", "poller_state"):
+            con.execute(f"DELETE FROM {table}")
+    mapping = emap.map_shard(tiles)
+    db.upsert_works(mapping.works, shard_id=SHARD)
+    db.apply_listing(SHARD, mapping.listing, consistent=True, confirm_after=timedelta(minutes=10))
+    for tile in RECORD_TILES:
+        shard_cache.write(SHARD, tile, tiles[tile])
+    summary = backfill.fill_payments_from_cache(log=lambda _m: None)
+    with db.connect() as con:
+        stored = con.execute("SELECT COUNT(*), SUM(amount) FROM payments").fetchone()
+        works = con.execute("SELECT COUNT(*), SUM(total_paid), SUM(payment_count) FROM works "
+                            "WHERE payment_count > 0").fetchone()
+    check("the cache fills every payment of every paid work, matching the works",
+          stored[0] == works[2] == len(mapping.payments) and abs(stored[1] - works[1]) < 0.01
+          and summary["works_not_matching"] == 0 and bool(db.get_state("data_changed_at")),
+          json.dumps(summary))
+    check("it runs once", backfill.fill_payments_from_cache(log=lambda _m: None) == {"skipped": True})
+
+    paid = sorted({p["work_id"] for p in mapping.payments})
+    work_id = paid[0]
+    kept = [p for p in mapping.payments if p["work_id"] == work_id][1:]
+    other = paid[1]
+    db.replace_payments(SHARD, [work_id], kept)
+    check("a read replaces a work's payments, so one no longer listed goes",
+          len(db.work_payments(work_id)) == len(kept)
+          and len(db.work_payments(other)) == sum(1 for p in mapping.payments if p["work_id"] == other))
+    db.replace_payments(SHARD, [work_id], [])
+    check("a work listed with no payments keeps none; a work not in the read keeps its own",
+          db.work_payments(work_id) == [] and db.work_payments(other))
+
+    with db.connect() as con:
+        con.execute("DELETE FROM payments")
+        con.execute("DELETE FROM poller_state")
+        con.execute("UPDATE works SET total_paid = total_paid + 1 WHERE work_id = ?", (other,))
+    summary = backfill.fill_payments_from_cache(log=lambda _m: None)
+    check("a work whose stored total disagrees with the cache is left for its next read",
+          summary["works_not_matching"] == 1 and db.work_payments(other) == [],
+          json.dumps(summary))
+
+
 # ------------------------------------------------------------------ isolation
 def test_isolation() -> None:
     print("\n[10] isolation — the real corpus was never opened")
@@ -407,6 +510,8 @@ def main() -> int:
         test_gates(tiles)
         test_escalation()
         test_fingerprints(tiles)
+        test_new_fields(tiles)
+        test_payments(tiles)
         test_isolation()
     finally:
         shutil.rmtree(_TMP, ignore_errors=True)

@@ -18,6 +18,7 @@ import random
 import sqlite3
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -25,7 +26,7 @@ sys.path.insert(0, str(ROOT))
 
 from astra.ingestion import esakshi_map as emap             # noqa: E402
 from astra.ingestion.esakshi_api import (                   # noqa: E402
-    HOUSE_LS, RECORD_TILES, CircuitBreaker, EsakshiClient, SourceError,
+    HOUSE_LS, RECORD_TILES, CircuitBreaker, CircuitOpen, EsakshiClient, SourceError,
     parse_tile, shard_combo,
 )
 
@@ -173,6 +174,73 @@ def test_mapping(tiles: dict[str, list[dict]]) -> list:
     check("expenditure never exceeds nothing",
           all(w.expenditure is None or w.expenditure >= 0 for w in works))
     return works
+
+
+def test_portal_fields(tiles: dict[str, list[dict]], works: list) -> None:
+    """Fields the portal sends that the CSV exports never had."""
+    print("\n[3a] portal-only fields — category, letter, term, agency, vendor id")
+    categories = {"Normal/Others", "Repair and Renovation", "Trust and Society",
+                  "Bar and Associations"}
+    check("every work carries the portal's own category",
+          all(w.work_category in categories for w in works),
+          str(sorted({str(w.work_category) for w in works})))
+    check("and its recommendation letter",
+          all(w.letter_no and w.letter_no.startswith("LN/") for w in works))
+    check("and the recommending member's term, as ISO dates",
+          all(w.term_start and w.term_end and w.term_start < w.term_end
+              and len(w.term_end) == 10 for w in works),
+          str({(w.term_start, w.term_end) for w in works}))
+    paid = [w for w in works if w.payment_count]
+    check("every paid work names its implementing agency and vendor id",
+          paid and all(w.implementing_agency and w.vendor_id for w in paid),
+          f"{len(paid)} paid works; e.g. {paid[0].implementing_agency!r}" if paid else "none")
+    check("an unpaid work has neither",
+          all(w.implementing_agency is None and w.vendor_id is None
+              for w in works if not w.payment_count))
+    check("the implementing agency is not the district authority",
+          all(w.implementing_agency != w.ia_name for w in paid))
+
+    # One work paid to two different vendors who share a name: the larger one
+    # is the primary vendor, and the two are not added together.
+    base = next(r for r in tiles["expenditure"] if r.get("WORK_RECOMMENDATION_DTL_ID"))
+    code = base["WORK_ID"]
+    rows = [{**base, "VENDOR_NAME": "Ajay Kumar", "VENDOR_ID": 11, "FUND_DISBURSED_AMT": 60.0},
+            {**base, "VENDOR_NAME": "Ajay Kumar", "VENDOR_ID": 22, "FUND_DISBURSED_AMT": 50.0},
+            {**base, "VENDOR_NAME": "Ajay Kumar", "VENDOR_ID": 22, "FUND_DISBURSED_AMT": 30.0},
+            {**base, "VENDOR_NAME": "Other Firm", "VENDOR_ID": 33, "FUND_DISBURSED_AMT": 70.0}]
+    work = next(w for w in emap.to_works({"expenditure": rows}) if w.work_id == code)
+    check("payments add up per vendor id, not per name",
+          (work.vendor_id, work.vendor_name) == ("22", "Ajay Kumar"),
+          f"{work.vendor_id} {work.vendor_name}")
+    rec = next(r for r in tiles["recommended"] if emap.row_code(r) == code)
+    bare = {k: v for k, v in rec.items()
+            if k not in ("WORK_CATEGORY", "LETTER_NO", "TENURE_START_DATE", "TENURE_END_DATE")}
+    filled = next(w for w in emap.to_works({"recommended": [bare], "expenditure": rows})
+                  if w.work_id == code)
+    mapping = emap.map_shard(tiles)
+    listed = [r for r in tiles["expenditure"] if r.get("WORK_RECOMMENDATION_DTL_ID") is not None]
+    check("every payment record the report lists becomes one payment row",
+          len(mapping.payments) == len(listed) == sum(v["payments"] for v in mapping.listing.values()),
+          f"{len(mapping.payments)} rows / {len(listed)} listed")
+    by_work = {}
+    for p in mapping.payments:
+        by_work.setdefault(p["work_id"], []).append(p)
+    works_by_id = {w.work_id: w for w in mapping.works}
+    check("a work's payment rows add up to its total paid and payment count",
+          all(abs(sum(p["amount"] for p in rows) - works_by_id[w].total_paid) < 0.01
+              and len(rows) == works_by_id[w].payment_count for w, rows in by_work.items()))
+    check("rows are numbered 1..n per work, oldest first",
+          all([p["seq"] for p in rows] == list(range(1, len(rows) + 1))
+              and [p["paid_on"] for p in rows] == sorted(p["paid_on"] for p in rows)
+              for rows in by_work.values()))
+    twice = emap.payment_rows("W", [rows[0], rows[0], rows[1]] if len(rows := [
+        r for r in tiles["expenditure"] if r.get("WORK_RECOMMENDATION_DTL_ID")]) > 1 else [])
+    reordered = emap.payment_rows("W", [rows[1], rows[0], rows[0]])
+    check("two identical records are both kept, and the order the report lists them in "
+          "does not change their numbers", len(twice) == 3 and twice == reordered)
+    check("a field one report lacks is taken from a later report that has it",
+          filled.letter_no == emap.squash(base["LETTER_NO"]) and filled.term_end is not None
+          and filled.work_category is None, f"{filled.letter_no} {filled.term_end}")
 
 
 def test_shared_portal_ids(tiles: dict[str, list[dict]]) -> None:
@@ -414,6 +482,53 @@ def test_breaker() -> None:
     cb.record(True)
     check("a success closes it", not cb.is_open)
 
+    print("      while open: the real error, and a trial every few minutes")
+    cb = CircuitBreaker(window=8, threshold=0.5, base_seconds=600, trial_seconds=0.3)
+    for _ in range(8):
+        cb.record(False, "ReadTimeout: portal did not answer in 45 s")
+    status = cb.status()
+    check("the last real error is kept, not replaced by 'circuit open'",
+          status["open"] and status["last_error"] == "ReadTimeout: portal did not answer in 45 s"
+          and status["failing_since"] and status["last_error_at"], json.dumps(status)[:160])
+    blocked = False
+    try:
+        cb.check()
+    except CircuitOpen:
+        blocked = True
+    check("calls are held back while it is open", blocked)
+    check("the next attempt is due at the trial, not at the end of the backoff",
+          status["next_attempt_at"] is not None
+          and (datetime.fromisoformat(status["next_attempt_at"])
+               - datetime.fromisoformat(status["checked_at"])).total_seconds() <= 1.0,
+          f"{status['checked_at']} -> {status['next_attempt_at']}")
+    check("no trial is granted before its interval", cb.allow_trial() is False)
+    time.sleep(0.35)
+    check("once the interval has passed a trial is granted", cb.allow_trial() is True)
+    passed = True
+    try:
+        cb.check()
+    except CircuitOpen:
+        passed = False
+    check("and a call may go through", passed)
+    wait_before = cb.opens_in()
+    cb.record(False, "HTTP 503 from /getTilesData")
+    still_blocked = False
+    try:
+        cb.check()
+    except CircuitOpen:
+        still_blocked = True
+    check("a failed trial leaves it open without lengthening the backoff",
+          cb.is_open and cb.opens_in() <= wait_before and still_blocked,
+          f"{wait_before:.1f}s -> {cb.opens_in():.1f}s")
+    check("and updates the error shown", cb.status()["last_error"] == "HTTP 503 from /getTilesData")
+    time.sleep(0.35)
+    cb.allow_trial()
+    cb.record(True)
+    closed = cb.status()
+    check("a successful trial closes it and clears the failing-since time",
+          not cb.is_open and not closed["open"] and closed["failing_since"] is None
+          and closed["next_attempt_at"] is None, json.dumps(closed)[:160])
+
 
 # --------------------------------------------------------------------- live
 def test_live(client: EsakshiClient) -> bool:
@@ -493,6 +608,7 @@ def main() -> int:
         skip("corpus equivalence", "no fixtures and no network")
     else:
         works = test_mapping(tiles)
+        test_portal_fields(tiles, works)
         test_shared_portal_ids(tiles)
         test_portal_figures(tiles)
         test_corpus_equivalence(works)

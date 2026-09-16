@@ -4,6 +4,7 @@
     python -m astra.ingestion.poller --once          # one heartbeat cycle
     python -m astra.ingestion.poller --reconcile     # one full record-level sweep
     python -m astra.ingestion.poller --registry      # re-enumerate shards only
+    python -m astra.ingestion.poller --analyse       # re-run the analysis now
 
 Why it is shaped this way
 -------------------------
@@ -45,6 +46,25 @@ Two independent reasons the fast path cannot be the only path:
 we hold, and records whether each slice's count agreed with its records. It
 must never be "optimised" into a counts-only sweep — that would inherit exactly
 the blindness it exists to cover.
+
+Between the minute and the night
+--------------------------------
+An edit that moves no figure — a corrected description, a new stage, an
+agency's name — is invisible to the heartbeat and would otherwise wait for the
+nightly sweep, up to a day. `rolling_reread()` closes most of that gap: during
+working hours, in a minute with nothing else to do, it re-reads the one area
+whose records were read longest ago. That is five requests a minute, each
+about a single area. It stands down in any minute already busy with a change,
+a recheck or a failing portal, while the circuit breaker is open, and for
+areas read recently by any path. With every minute of a twelve-hour day free,
+each area is re-read within about ten hours; minutes lost to changes stretch
+that on a busy day, but an area that changed has just been read anyway.
+
+The poller keeps the data current; the risk flags come from the analysis,
+which reads the whole corpus. `refresh_analysis()` re-runs it when stored data
+has actually changed, at most every `ANALYSIS_EVERY` and after a completed
+nightly sweep, so the flags follow the portal within hours rather than waiting
+for someone to re-run the pipeline by hand.
 """
 from __future__ import annotations
 
@@ -60,11 +80,11 @@ from datetime import datetime, timedelta, timezone
 
 from .. import db
 from ..config import PROCESSED_DIR
+from . import backfill, instance_lock, shard_cache, validate
 from . import esakshi_map as emap
-from . import instance_lock, shard_cache, validate
 from .esakshi_api import (HOUSE_LS, HOUSE_RS, RECORD_TILES, TILE_KEYS,
-                          EsakshiClient, Shard, SourceError, run_parallel,
-                          shard_combo)
+                          CircuitOpen, EsakshiClient, Shard, SourceError,
+                          run_parallel, shard_combo)
 
 #: Seconds between heartbeats. Works arrive at roughly 20-25 an hour during
 #: Indian working hours, i.e. one every few minutes, so a minute already
@@ -102,6 +122,20 @@ PARITY_RECHECK = timedelta(minutes=int(os.environ.get("ASTRA_PARITY_RECHECK_MIN"
 MAX_RECHECKS = int(os.environ.get("ASTRA_MAX_RECHECKS", "3"))
 #: Slices re-read per heartbeat, so a burst of rechecks cannot stall the loop.
 RECHECKS_PER_CYCLE = 10
+#: Areas the rotation re-reads per heartbeat, oldest-read first; 0 turns it
+#: off. One area costs one watermark and four reports, all about that area.
+ROLLING_AREAS = int(os.environ.get("ASTRA_ROLLING_AREAS", "1"))
+#: Local hours the rotation runs: "HH:MM-HH:MM" (may wrap past midnight),
+#: "always", or "off". Offices edit in the day; the nightly sweep covers the night.
+ROLLING_HOURS = os.environ.get("ASTRA_ROLLING_HOURS", "08:00-20:00")
+#: An area whose records were read more recently than this, by any path, is
+#: not due for the rotation.
+ROLLING_MIN_AGE = timedelta(hours=float(os.environ.get("ASTRA_ROLLING_MIN_AGE_H", "3")))
+#: Re-run the analysis when stored data changed, at most this often, and after
+#: every completed nightly sweep that changed something; 0 turns it off. A run
+#: over the full corpus takes about two minutes, and the heartbeat waits for
+#: it exactly as it waits for the nightly sweep.
+ANALYSIS_EVERY = timedelta(minutes=float(os.environ.get("ASTRA_ANALYSIS_EVERY_MIN", "180")))
 
 ALERTS_PATH = PROCESSED_DIR / "ingest_alerts.json"
 STATUS_PATH = PROCESSED_DIR / "poller_status.json"
@@ -159,6 +193,47 @@ def most_recent_slot(now: datetime, at: str | None = RECONCILE_AT) -> datetime |
     return slot
 
 
+def parse_hours(text: str | None) -> tuple[int, int] | None:
+    """`"08:00-20:00"` -> (480, 1200), minutes past local midnight.
+
+    `"always"` is the whole day. `"off"`, blanks, invalid times and an empty
+    range disable it.
+    """
+    value = (text or "").strip().lower()
+    if value in ("always", "all day"):
+        return 0, 24 * 60
+    start_text, dash, end_text = value.partition("-")
+    start, end = parse_reconcile_at(start_text), parse_reconcile_at(end_text)
+    if not dash or start is None or end is None:
+        return None
+    start_min, end_min = start[0] * 60 + start[1], end[0] * 60 + end[1]
+    return None if start_min == end_min else (start_min, end_min)
+
+
+def in_hours(now: datetime, hours: tuple[int, int] | None) -> bool:
+    """Is `now` inside the window? A naive time is taken as local."""
+    if hours is None:
+        return False
+    if now.tzinfo is None:
+        now = now.astimezone()
+    minute = now.hour * 60 + now.minute
+    start, end = hours
+    if start < end:
+        return start <= minute < end
+    return minute >= start or minute < end          # wraps past midnight
+
+
+def _same_signature(stored_json: str | None, signature) -> bool:
+    """Does a stored watermark signature equal one just read?"""
+    if not stored_json:
+        return False
+    try:
+        previous = json.loads(stored_json)
+    except ValueError:
+        return False
+    return previous == json.loads(json.dumps(signature, default=str))
+
+
 def national_shard_id(house: int) -> str:
     return f"{house}:0:0"
 
@@ -181,6 +256,7 @@ class CycleReport:
     changed: int = 0
     versions: int = 0
     quarantined: tuple = ()
+    rolled: tuple = ()
     seconds: float = 0.0
     note: str = ""
 
@@ -240,21 +316,25 @@ class Poller:
         """
         watermark = self.client.watermark(combo)
         signature = watermark.signature()
-        stored = db.get_watermark(shard_id)
-        previous = None
-        if stored and stored.get("signature_json"):
-            try:
-                previous = json.loads(stored["signature_json"])
-            except ValueError:
-                previous = None
-        moved = previous is None or previous != json.loads(
-            json.dumps(signature, default=str))
+        stored = db.get_watermark(shard_id) or {}
+        moved = not _same_signature(stored.get("signature_json"), signature)
         return moved, signature, watermark.counts.get("Works Recommended")
 
+    @staticmethod
+    def _failed(shard_id: str, exc: BaseException, lifecycle: str) -> int | None:
+        """Count a real failure against a slice. A call the circuit breaker held
+        back asked the portal nothing, so it is not one: counting it made one
+        outage look like every slice failing, minute after minute."""
+        if isinstance(exc, CircuitOpen):
+            return None
+        return db.mark_shard_failure(shard_id, str(exc), lifecycle=lifecycle)
+
     def _record_probe(self, shard_id: str, signature, count: int | None,
-                      lifecycle: str) -> None:
+                      lifecycle: str, *, keep_payload: bool = False) -> None:
+        # A probe that found nothing moved leaves the records' fingerprint in
+        # place, so a later read of the same records can still skip the write.
         db.save_watermark(shard_id, signature=signature, n_records=count,
-                          lifecycle=lifecycle)
+                          lifecycle=lifecycle, keep_payload=keep_payload)
 
     # ------------------------------------------------------------- the hunt
     def descend(self, house: int, report: CycleReport) -> list[Shard]:
@@ -281,7 +361,7 @@ class Poller:
         for state_id, probe in zip(state_ids, probes):
             sid = state_shard_id(house, state_id)
             if isinstance(probe, BaseException):
-                db.mark_shard_failure(sid, str(probe), lifecycle=validate.RETRY)
+                self._failed(sid, probe, validate.RETRY)
                 self.log(f"  state {state_id}: {probe}")
                 continue
             moved, signature, count = probe
@@ -289,7 +369,8 @@ class Poller:
             report.states_probed += 1
             if moved:
                 moved_states.append(state_id)
-            self._record_probe(sid, signature, count, validate.IDLE)
+            self._record_probe(sid, signature, count, validate.IDLE,
+                               keep_payload=not moved)
 
         if not moved_states:
             return dirty
@@ -304,8 +385,7 @@ class Poller:
                 members, lambda s: self._probe(s.shard_id, s.combo))
             for shard, probe in zip(members, probed):
                 if isinstance(probe, BaseException):
-                    db.mark_shard_failure(shard.shard_id, str(probe),
-                                          lifecycle=validate.RETRY)
+                    self._failed(shard.shard_id, probe, validate.RETRY)
                     continue
                 moved, signature, count = probe
                 report.requests += 1
@@ -316,7 +396,7 @@ class Poller:
                                       n_records=count, lifecycle=validate.DIRTY)
                 else:
                     self._record_probe(shard.shard_id, signature, count,
-                                       validate.IDLE)
+                                       validate.IDLE, keep_payload=True)
         return dirty
 
     # ------------------------------------------------------------ the fetch
@@ -376,6 +456,10 @@ class Poller:
                 if isinstance(result, BaseException):
                     raise result
             tiles = dict(zip(RECORD_TILES, fetched))
+        except CircuitOpen as exc:
+            # held back, not failed: the slice keeps its place in the queue and
+            # its failure count, and is read once the portal answers again
+            return {**outcome, "status": validate.RETRY, "reason": str(exc)}
         except SourceError as exc:
             return refuse(str(exc), validate.RETRY)
 
@@ -384,8 +468,14 @@ class Poller:
         previous_stored = stored_row.get("n_stored")
         portal_count = watermark.counts.get("Works Recommended")
 
-        if not force and digest and stored_row.get("payload_sha256") == digest:
-            # Nothing in the slice actually changed; do not rewrite it.
+        if (not force and digest and stored_row.get("payload_sha256") == digest
+                and _same_signature(stored_row.get("signature_json"),
+                                    watermark.signature())):
+            # Nothing in the slice actually changed; do not rewrite it. Both
+            # the records and the figures must match: identical records under
+            # figures that moved are a report lagging its own count, or a
+            # figure no report carries, and only the full path's gates can
+            # tell those apart.
             db.save_watermark(shard.shard_id, signature=watermark.signature(),
                               n_records=portal_count, payload_sha256=digest,
                               lifecycle=validate.IDLE, fetched=True)
@@ -425,6 +515,7 @@ class Poller:
                                      movable=db.missing_ids([w.work_id for w in works]))
         except db.WorkIdCollision as exc:
             return refuse(str(exc), validate.QUARANTINED)
+        db.replace_payments(shard.shard_id, [w.work_id for w in works], mapping.payments)
         removal = db.apply_listing(shard.shard_id, mapping.listing,
                                    consistent=consistent, confirm_after=RETIRE_CONFIRM)
 
@@ -451,6 +542,12 @@ class Poller:
                      f"({'; '.join(d['tile'] + ' ' + d['measure'] for d in differences)}); "
                      f"re-reading in {PARITY_RECHECK.seconds // 60} min")
 
+        data_changed = bool(result["inserted"] or result["changed"] or removal["retired"]
+                            or removal["restored"] or removal["listing_changed"])
+        if data_changed:
+            # What the analysis reads has changed, so the flags are now behind.
+            db.set_state("data_changed_at", _now())
+
         for tile, rows in tiles.items():
             shard_cache.write(shard.shard_id, tile, rows)
         db.save_watermark(
@@ -471,13 +568,18 @@ class Poller:
             parts.append(f"{len(removal['restored'])} listed again")
         if removal["newly_missing"]:
             parts.append(f"{len(removal['newly_missing'])} no longer listed, confirming")
-        what = ", ".join(parts) or "re-read; no tracked field changed"
-        db.append_provenance([{
-            "source": f"eSAKSHI API {shard.label}", "mode": "api",
-            "table": "works", "rows": len(works), "status": "ok",
-            "detail": f"{what}; portal count {portal_count}; shard {shard.shard_id}",
-            "fetched_at": _now()}])
+        # Only reads that found something are logged. The nightly sweep and the
+        # rotation mostly re-read areas where nothing changed; logging those too
+        # would push the real updates out of the capped log the site shows.
+        if parts:
+            db.append_provenance([{
+                "source": f"eSAKSHI API {shard.label}", "mode": "api",
+                "table": "works", "rows": len(works), "status": "ok",
+                "detail": f"{', '.join(parts)}; portal count {portal_count}; "
+                          f"shard {shard.shard_id}",
+                "fetched_at": _now()}])
         outcome.update(status=validate.STORED, stored=len(works),
+                       data_changed=data_changed,
                        changed=result["changed"], versions=result["versions"],
                        exact=not differences, retired=len(removal["retired"]),
                        awaiting_removal=len(awaiting), restored=len(removal["restored"]))
@@ -532,13 +634,66 @@ class Poller:
                 self.log(f"  {outcome['status']} {shard.label}: "
                          f"{outcome['reason'][:120]}")
 
+    # ------------------------------------------------------------ rotation
+    def rolling_reread(self, report: CycleReport | None = None,
+                       now: datetime | None = None) -> list[str]:
+        """Re-read the areas read longest ago, a few a minute, in working hours.
+
+        The heartbeat sees only edits that move a figure. This is what brings
+        in the rest — descriptions, stages, agencies, dates — within hours
+        rather than at the nightly sweep. An ordinary read in every way: the
+        same gates, parity check and history, and an unchanged area writes
+        nothing but the time it was read. Returns the slices it read.
+        """
+        report = report if report is not None else CycleReport(started_at=_now())
+        if ROLLING_AREAS <= 0:
+            return []
+        local = now if now is not None else datetime.now().astimezone()
+        if not in_hours(local, parse_hours(ROLLING_HOURS)):
+            return []
+        breaker = getattr(self.client, "breaker", None)
+        if breaker is not None and breaker.is_open:
+            return []
+        if local.tzinfo is None:
+            local = local.astimezone()
+        read_before = (local.astimezone(timezone.utc) - ROLLING_MIN_AGE).isoformat()
+        due = db.oldest_read_shards(self.houses, read_before=read_before,
+                                    limit=ROLLING_AREAS, skip_lifecycles=PENDING)
+        if not due:
+            return []
+        by_id = {s.shard_id: s for s in self.registry()}
+        done = []
+        for shard_id in due:
+            shard = by_id.get(shard_id)
+            if shard is None or self._stop:
+                continue
+            outcome = self.fetch_shard(shard)
+            done.append(shard_id)
+            db.set_state("last_rolling_at", _now())
+            if outcome["status"] == validate.STORED:
+                report.stored += outcome["stored"]
+                report.changed += outcome["changed"]
+                report.versions += outcome["versions"]
+                if outcome.get("data_changed"):
+                    self.log(f"  rotation found changes in {shard.label}: "
+                             f"{outcome['changed']} updated, "
+                             f"{outcome['versions']} field changes")
+            elif outcome["status"] in (validate.QUARANTINED, validate.RETRY):
+                report.quarantined = report.quarantined + (shard_id,)
+                self.log(f"  rotation: {outcome['status']} {shard.label}: "
+                         f"{outcome['reason'][:120]}")
+        report.rolled = report.rolled + tuple(done)
+        return done
+
     # ------------------------------------------------------------ one cycle
     def heartbeat(self) -> CycleReport:
         """One minute's work: ask nationally, descend only if something moved."""
         report = CycleReport(started_at=_now())
         clock = time.monotonic()
 
+        # Anything that makes this minute busy keeps the rotation out of it.
         pending = self.pending_shards()
+        busy = bool(pending)
         if pending:
             self.log(f"resuming {len(pending)} shard(s) left from earlier")
             self.drain(pending, report)
@@ -546,6 +701,7 @@ class Poller:
         # Slices owed a second read: a parity difference, or a work that
         # stopped being listed and must be confirmed gone before it is retired.
         due = db.due_rechecks(_now(), MAX_RECHECKS)
+        busy = busy or bool(due)
         if due:
             by_id = {s.shard_id: s for s in self.registry()}
             recheck = [by_id[sid] for sid in due if sid in by_id][:RECHECKS_PER_CYCLE]
@@ -558,20 +714,31 @@ class Poller:
                     report.changed += outcome["changed"]
                     report.versions += outcome["versions"]
 
+        breaker = getattr(self.client, "breaker", None)
+        if breaker is not None and breaker.is_open and hasattr(breaker, "allow_trial"):
+            if breaker.allow_trial():
+                self.log("portal paused; trying one national check "
+                         f"(last error: {getattr(breaker, 'last_error', None)})")
         for house in self.houses:
             nid = national_shard_id(house)
             try:
                 moved, signature, count = self._probe(
                     nid, shard_combo(house=house))
+            except CircuitOpen as exc:
+                report.note = f"portal paused: {exc}"
+                busy = True
+                continue
             except SourceError as exc:
                 db.mark_shard_failure(nid, str(exc), lifecycle=validate.RETRY)
                 report.note = f"national probe failed: {exc}"
                 self.log(f"national (house {house}): {exc}")
+                busy = True
                 continue
             report.requests += 1
             if not moved:
                 self._record_probe(nid, signature, count, validate.IDLE)
                 continue
+            busy = True
             self.log(f"national (house {house}) moved -> descending "
                      f"(recommended={count:,})" if count else
                      f"national (house {house}) moved -> descending")
@@ -587,12 +754,23 @@ class Poller:
             # midway leaves it "moved" and the next cycle tries again.
             self._record_probe(nid, signature, count, validate.IDLE)
 
+        if not busy:
+            self.rolling_reread(report)
+
         report.seconds = round(time.monotonic() - clock, 2)
         # In the database rather than only the status file, so the website can
         # say when the portal was last checked without racing a half-written file.
         db.set_state("last_heartbeat_at", _now())
+        self._save_portal_status()
         self._write_status(report)
         return report
+
+    def _save_portal_status(self) -> None:
+        """Whether the portal is answering, when the breaker tries next, and the
+        last real error — for the website, which cannot see this process."""
+        status = getattr(getattr(self.client, "breaker", None), "status", None)
+        if callable(status):
+            db.set_state("portal_status", json.dumps(status(), default=str))
 
     # ------------------------------------------------------- full sweep
     def reconcile_all(self, house: int | None = None) -> dict:
@@ -739,6 +917,78 @@ class Poller:
             return False
         return True
 
+    def analysis_due(self, now: datetime | None = None, *,
+                     after_sweep: bool = False) -> bool:
+        """Are the risk flags behind the stored data, and is a re-run allowed?
+
+        Only a change the analysis reads counts: new, edited, removed or
+        restored works, or a change in which reports list them. A re-read that
+        found nothing never triggers a run. Decided from the database, so a
+        restart does not forget a change the flags have not caught up with.
+        """
+        if ANALYSIS_EVERY <= timedelta(0):
+            return False
+        changed = _parse_ts(db.get_state("data_changed_at"))
+        if changed is None:
+            return False
+        covered = _parse_ts(db.get_state("analysis_covers_changes_at"))
+        if covered is not None and covered >= changed:
+            return False
+        now = now or datetime.now(timezone.utc)
+        last_ok = _parse_ts(db.get_state("last_analysis_at"))
+        last_try = _parse_ts(db.get_state("last_analysis_attempt_at"))
+        if (last_try is not None and (last_ok is None or last_try > last_ok)
+                and now - last_try < RETRY_GAP):
+            return False
+        if after_sweep or last_ok is None:
+            return True
+        return now - last_ok >= ANALYSIS_EVERY
+
+    def note_unrecorded_analysis(self) -> bool:
+        """Mark flags from before analysis runs were recorded as behind.
+
+        A database analysed by an earlier version, or by the switch-over
+        before any change was recorded, has flags but no record of which
+        stored changes they include. Treating them as behind costs one
+        re-run and guarantees they cover everything stored. Returns whether
+        it did so.
+        """
+        if db.get_state("last_analysis_at") or db.get_state("data_changed_at"):
+            return False
+        with db.connect() as con:
+            if con.execute("SELECT 1 FROM flags LIMIT 1").fetchone() is None:
+                return False
+        db.set_state("data_changed_at", _now())
+        self.log("risk flags predate recorded analysis runs; recomputing them once")
+        return True
+
+    def refresh_analysis(self, reason: str = "") -> dict | None:
+        """Re-run the analysis over the corpus as it now stands.
+
+        Rebuilds the fund positions derived from the works, recomputes every
+        flag and keeps the review decisions people recorded. Returns the
+        pipeline summary, or None if it failed; a failure leaves the previous
+        flags in place and is retried after `RETRY_GAP`.
+        """
+        # Deferred: the analysis stack is heavy and no other mode needs it.
+        from ..pipeline import run_pipeline
+
+        db.set_state("last_analysis_attempt_at", _now())
+        # Lets the website say the flags are being recomputed, in the same way
+        # as the sweep marker.
+        db.set_state("analysis_started_at", _now())
+        self.log("recomputing risk flags" + (f" ({reason})" if reason else ""))
+        try:
+            summary = run_pipeline(verbose=False)
+        except Exception as exc:
+            self.log(f"analysis error: {type(exc).__name__}: {exc}")
+            return None
+        finally:
+            db.set_state("analysis_started_at", "")
+        self.log(f"risk flags recomputed in {summary['seconds']}s: "
+                 f"{summary['flags']:,} flags, {summary['alerts']:,} alerts")
+        return summary
+
     def registry_due(self, now: datetime | None = None) -> bool:
         """Wall-clock and persisted, so sleep and restarts cannot postpone it."""
         now = now or datetime.now(timezone.utc)
@@ -757,9 +1007,13 @@ class Poller:
             {"last_cycle": report.as_dict(),
              "poll_interval_seconds": POLL_INTERVAL,
              "reconcile_at": RECONCILE_AT,
+             "rolling": {"areas_per_check": ROLLING_AREAS, "hours": ROLLING_HOURS,
+                         "min_age_hours": ROLLING_MIN_AGE.total_seconds() / 3600},
+             "analysis_every_minutes": ANALYSIS_EVERY.total_seconds() / 60,
              "last_reconcile_at": db.get_state("last_reconcile_at"),
              "last_registry_at": db.get_state("last_registry_at"),
              "houses": list(self.houses),
+             "portal": json.loads(db.get_state("portal_status") or "null"),
              "watermarks": db.watermark_summary(),
              "cache": shard_cache.usage()}, indent=2, default=str),
             encoding="utf-8")
@@ -772,8 +1026,11 @@ class Poller:
         signal.signal(signal.SIGTERM, self.stop)
         if not db.load_shards():
             self.refresh_registry()
+        self.note_unrecorded_analysis()
         self.log(f"watching every {POLL_INTERVAL:.0f}s; nightly sweep at "
-                 f"{RECONCILE_AT}; houses {self.houses}")
+                 f"{RECONCILE_AT}; houses {self.houses}; rotation "
+                 f"{ROLLING_AREAS} area(s) a check, {ROLLING_HOURS}; analysis "
+                 f"at most every {ANALYSIS_EVERY.total_seconds() / 60:.0f} min")
         while not self._stop:
             cycle_start = time.monotonic()
             try:
@@ -792,14 +1049,19 @@ class Poller:
                 except SourceError as exc:
                     self.log(f"registry refresh failed: {exc}")
 
+            swept = False
             if self.reconcile_due():
                 last = db.get_state("last_reconcile_at")
                 self.log("nightly sweep is due "
                          + (f"(last completed {last})" if last else "(never completed)"))
                 try:
-                    self.reconcile_all()
+                    swept = bool(self.reconcile_all().get("recorded_as_complete"))
                 except Exception as exc:
                     self.log(f"reconciliation error: {type(exc).__name__}: {exc}")
+
+            if not self._stop and self.analysis_due(after_sweep=swept):
+                self.refresh_analysis("after the nightly sweep" if swept
+                                      else "portal data changed")
 
             # jittered, so restarts do not synchronise onto the same second
             elapsed = time.monotonic() - cycle_start
@@ -819,6 +1081,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="run one full record-level sweep and exit")
     parser.add_argument("--registry", action="store_true",
                         help="re-enumerate shards from the portal and exit")
+    parser.add_argument("--analyse", action="store_true",
+                        help="re-run the analysis over the stored data and exit")
     parser.add_argument("--house", type=int, choices=(HOUSE_LS, HOUSE_RS),
                         help="restrict to one house")
     parser.add_argument("--quiet", action="store_true")
@@ -838,8 +1102,24 @@ def main(argv: list[str] | None = None) -> int:
         # A sweep killed mid-run (closed window, power cut) cannot clear its own
         # marker. Holding the lock proves no sweep is running now.
         db.set_state("sweep_started_at", "")
+        db.set_state("analysis_started_at", "")
         houses = (args.house,) if args.house else HOUSES
         poller = Poller(houses=houses, verbose=not args.quiet)
+        if backfill.pending():
+            # Before any read: a slice read first would log each field it
+            # fills in as an edit, and an unchanged slice is never rewritten.
+            try:
+                backfill.run_pending(log=poller.log)
+            except Exception as exc:              # never blocks polling
+                poller.log(f"completing stored works from the cache failed: "
+                           f"{type(exc).__name__}: {exc}")
+
+        if args.analyse:
+            summary = poller.refresh_analysis("requested")
+            if summary:
+                print(json.dumps({k: v for k, v in summary.items() if k != "router_trace"},
+                                 indent=2, default=str))
+            return 0 if summary else 1
 
         if args.registry:
             poller.refresh_registry()

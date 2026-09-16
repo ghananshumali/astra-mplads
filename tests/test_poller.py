@@ -27,12 +27,16 @@ os.environ["ASTRA_DB_PATH"] = str(_TMP / "scratch.db")
 os.environ["ASTRA_PROCESSED_DIR"] = str(_TMP / "processed")
 os.environ["ASTRA_SHARD_CACHE"] = str(_TMP / "shards")
 os.environ["ASTRA_ESCALATE_AFTER"] = "3"
+# The rotation depends on the time of day, so it is off unless a test turns it
+# on; [13] and [14] exercise it and the analysis re-run explicitly.
+os.environ["ASTRA_ROLLING_AREAS"] = "0"
 
 from astra import db                                            # noqa: E402
 from astra.ingestion import poller as pmod                      # noqa: E402
 from astra.ingestion import validate                            # noqa: E402
 from astra.ingestion.esakshi_api import (                       # noqa: E402
-    HOUSE_LS, RECORD_TILES, CircuitOpen, EsakshiClient, SourceError, Watermark,
+    HOUSE_LS, RECORD_TILES, CircuitBreaker, CircuitOpen, EsakshiClient, SourceError,
+    Watermark,
 )
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "esakshi"
@@ -299,6 +303,15 @@ def test_hash_skip(tiles) -> None:
     shard = next(s for s in poller.registry() if s.shard_id == "2:33:418")
     first = poller.fetch_shard(shard)
     check("first fetch stores", first["status"] == validate.STORED, str(first))
+    with db.connect() as con:
+        stored = con.execute("SELECT COUNT(*), SUM(amount) FROM payments WHERE shard_id = ?",
+                             (shard.shard_id,)).fetchone()
+        listed = con.execute("SELECT SUM(payments) FROM work_listing WHERE shard_id = ?",
+                             (shard.shard_id,)).fetchone()[0]
+        paid = con.execute("SELECT SUM(total_paid) FROM works").fetchone()[0]
+    check("and keeps every payment record the slice lists, adding up to the works",
+          stored[0] == listed > 0 and abs(stored[1] - paid) < 0.01,
+          f"{stored[0]} payments, {listed} listed")
     second = poller.fetch_shard(shard)
     check("second fetch is skipped as unchanged", second["status"] == "unchanged",
           str(second))
@@ -764,15 +777,21 @@ def test_recent_updates(tiles) -> None:
     shard = next(s for s in poller.registry() if s.shard_id == "2:33:418")
     other = next(s for s in poller.registry() if s.shard_id == "2:12:105")
     poller.fetch_shard(shard)
+    check("a store that brings new works is logged",
+          len(db.load_provenance()) == 1, f"{len(db.load_provenance())} rows")
+    # The fake's slices share the fixture's rows, so this one holds nothing new.
     poller.fetch_shard(other)
-    check("each store is appended to the ledger, not written over it",
-          len(db.load_provenance()) == 2, f"{len(db.load_provenance())} rows")
+    check("a read that found nothing new is not logged, so re-reads cannot "
+          "crowd out real updates", len(db.load_provenance()) == 1,
+          f"{len(db.load_provenance())} rows")
 
     row = moved["recommended"][0]
     old_text = row["WORK_DESCRIPTION"]
     row["WORK_DESCRIPTION"] = old_text + " (revised)"
     outcome = poller.fetch_shard(shard, force=True)
     check("an edited work is stored as a change", outcome["changed"] >= 1, str(outcome))
+    check("each store is appended to the ledger, not written over it",
+          len(db.load_provenance()) == 2, f"{len(db.load_provenance())} rows")
 
     client = TestClient(app)
     body = client.get("/meta/recent-updates?limit=5").json()
@@ -1098,6 +1117,508 @@ def test_later_report_only(tiles) -> None:
               for t in ("sanctioned", "completed", "expenditure")), str(portal_side)[:160])
 
 
+class _OpenBreaker(_NullBreaker):
+    is_open = True
+
+    def check(self):
+        raise CircuitOpen("breaker open")
+
+
+SLICES = {"2:33:418": ("Uttar Pradesh", "ALIGARH"),
+          "2:33:419": ("Uttar Pradesh", "BARABANKI(SC)"),
+          "2:12:105": ("Goa", "SOUTH GOA"),
+          "2:36:500": ("Kerala", "KOLLAM")}
+
+
+def _distinct_slices(portal, tiles) -> None:
+    """Give each slice its own works, as on the real portal, where no two
+    slices list one work. The shared fixture would make every store touch
+    every slice's listing."""
+    rows = [r for r in tiles["recommended"] if r.get("WORK_RECOMMENDATION_DTL_ID")]
+    per = len(rows) // len(SLICES)
+    for i, (shard_id, (state, place)) in enumerate(SLICES.items()):
+        portal.shard_tiles[shard_id] = _slice(tiles, rows[i * per:(i + 1) * per],
+                                              state=state, constituency=place)
+
+
+def _read_hours_ago(hours_by_shard: dict[str, float]) -> None:
+    """Pretend each slice's records were last read this many hours ago."""
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+    with db.connect() as con:
+        for shard_id, hours in hours_by_shard.items():
+            con.execute("UPDATE shard_watermarks SET fetched_at = ? WHERE shard_id = ?",
+                        ((now - timedelta(hours=hours)).isoformat(), shard_id))
+
+
+def _rotation(areas: int = 1, hours: str = "always", min_age_h: float = 3.0) -> None:
+    from datetime import timedelta
+    pmod.ROLLING_AREAS, pmod.ROLLING_HOURS = areas, hours
+    pmod.ROLLING_MIN_AGE = timedelta(hours=min_age_h)
+
+
+def _count(table: str) -> int:
+    with db.connect() as con:
+        return con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+
+
+def test_rotation(tiles) -> None:
+    print("\n[13] the rotation re-reads the area read longest ago, gently")
+    from datetime import datetime, timedelta
+    from fastapi.testclient import TestClient
+    from astra.api.main import app
+    from astra.ingestion.esakshi_api import TILE_KEYS
+
+    wide = {sid: 10 for sid in SLICES}
+    saved = (pmod.ROLLING_AREAS, pmod.ROLLING_HOURS, pmod.ROLLING_MIN_AGE)
+    try:
+        check("working hours parse, including a window across midnight",
+              pmod.parse_hours("08:00-20:00") == (480, 1200)
+              and pmod.parse_hours("22:00-06:00") == (1320, 360)
+              and pmod.parse_hours("always") == (0, 1440)
+              and all(pmod.parse_hours(v) is None
+                      for v in ("off", "", "9-5", "25:00-06:00", "10:00-10:00")))
+        night = datetime(2026, 9, 14, 23, 30).astimezone()
+        check("and a time is tested against them the way a clock reads",
+              pmod.in_hours(night, (1320, 360))
+              and pmod.in_hours(night.replace(hour=5, minute=59), (1320, 360))
+              and not pmod.in_hours(night.replace(hour=12), (1320, 360))
+              and not pmod.in_hours(night.replace(hour=20, minute=0), (480, 1200))
+              and pmod.in_hours(night.replace(hour=8, minute=0), (480, 1200)))
+
+        portal = FakePortal(tiles)
+        _distinct_slices(portal, tiles)
+        poller = fresh_poller(portal)
+        poller.reconcile_all()
+        _rotation()
+        _read_hours_ago({"2:33:418": 1, "2:33:419": 7, "2:12:105": 5, "2:36:500": 9})
+        history, logged = _count("work_versions"), len(db.load_provenance())
+        changed_at = db.get_state("data_changed_at")
+        portal.calls.clear()
+        first = poller.rolling_reread()
+        check("it reads one area: the one read longest ago", first == ["2:36:500"], str(first))
+        check("at five requests, every one about that area",
+              len(portal.calls) == 5 and {sid for _, sid in portal.calls} == {"2:36:500"},
+              str(portal.calls))
+        check("an unchanged area adds no history, no log entry and no analysis trigger",
+              _count("work_versions") == history and len(db.load_provenance()) == logged
+              and db.get_state("data_changed_at") == changed_at)
+        second, third = poller.rolling_reread(), poller.rolling_reread()
+        check("each further minute moves on to the next-oldest area",
+              second == ["2:33:419"] and third == ["2:12:105"], f"{second} {third}")
+        portal.calls.clear()
+        check("an area read in the last three hours is not due, so a fresh corpus "
+              "costs nothing", poller.rolling_reread() == [] and not portal.calls,
+              str(portal.calls))
+
+        _read_hours_ago(wide)
+        soon = datetime.now().astimezone()
+        _rotation(hours=f"{soon + timedelta(hours=1):%H:%M}-{soon + timedelta(hours=2):%H:%M}")
+        check("outside its hours it reads nothing",
+              poller.rolling_reread() == [] and not portal.calls, str(portal.calls))
+        _rotation(areas=0)
+        off_by_count = poller.rolling_reread()
+        _rotation(hours="off")
+        check("and it can be switched off by count or by hours",
+              off_by_count == [] and poller.rolling_reread() == [] and not portal.calls)
+        _rotation()
+        portal.breaker = _OpenBreaker()
+        check("it stands down while the circuit breaker is open",
+              poller.rolling_reread() == [] and not portal.calls, str(portal.calls))
+        portal.breaker = _NullBreaker()
+
+        goa = next(s for s in poller.registry() if s.shard_id == "2:12:105")
+        portal.fail_shards.add("2:12:105")
+        poller.fetch_shard(goa)
+        portal.fail_shards.clear()
+        _read_hours_ago({"2:33:418": 1, "2:33:419": 1, "2:36:500": 1, "2:12:105": 12})
+        portal.calls.clear()
+        check("an area already waiting for a retry is left to that queue",
+              poller.rolling_reread() == [] and not portal.calls, str(portal.calls))
+        poller.fetch_shard(goa)
+
+        print("      an edit that moves no figure")
+        row = portal.shard_tiles["2:33:418"]["recommended"][0]
+        old_text = row["WORK_DESCRIPTION"]
+        row["WORK_DESCRIPTION"] = old_text + " (corrected)"
+        _rotation(areas=0)
+        portal.calls.clear()
+        quiet = poller.heartbeat()
+        check("is invisible to the minute check on its own",
+              quiet.requests == 1 and not quiet.dirty and quiet.changed == 0,
+              f"requests={quiet.requests} dirty={quiet.dirty} changed={quiet.changed}")
+        _rotation()
+        _read_hours_ago({"2:33:418": 10, "2:33:419": 1, "2:12:105": 1, "2:36:500": 1})
+        caught = poller.heartbeat()
+        check("and is picked up by the rotation in a quiet minute",
+              caught.rolled == ("2:33:418",) and caught.changed == 1,
+              f"rolled={caught.rolled} changed={caught.changed}")
+        check("stored as a field change with its old and new text",
+              any(v["field"] == "description" and v["old_value"] == old_text
+                  and (v["new_value"] or "").endswith("(corrected)")
+                  for v in db.work_versions(_work_id(row))))
+        check("which tells the analysis the data changed",
+              db.get_state("data_changed_at") not in (None, "", changed_at))
+
+        print("      busy minutes")
+        _read_hours_ago(wide)
+        portal.n["2:0:0"] += 1
+        portal.n["2:33:0"] += 1
+        busy = poller.heartbeat()
+        check("a minute in which a figure moved is not used for the rotation",
+              busy.houses_moved == (HOUSE_LS,) and busy.rolled == (),
+              f"moved={busy.houses_moved} rolled={busy.rolled}")
+        check("an area the descent found unchanged keeps its records fingerprint",
+              (db.get_watermark("2:33:419") or {}).get("payload_sha256"))
+        history = _count("work_versions")
+        portal.calls.clear()
+        calm = poller.heartbeat()
+        check("the next quiet minute is used, for one area and one national check",
+              len(calm.rolled) == 1 and calm.requests == 1
+              and len(portal.calls) == 1 + 5, f"rolled={calm.rolled} calls={portal.calls}")
+        check("and that area, unchanged, is not rewritten",
+              calm.stored == 0 and _count("work_versions") == history,
+              f"stored={calm.stored}")
+
+        kollam = next(s for s in poller.registry() if s.shard_id == "2:36:500")
+        portal.claimed_counts["2:36:500"] = {TILE_KEYS["sanctioned"]: 999}
+        lagging = poller.fetch_shard(kollam)
+        portal.claimed_counts.clear()
+        check("identical records under figures that moved are not skipped as unchanged",
+              lagging["status"] != "unchanged", str(lagging)[:140])
+
+        _rotation(hours="08:00-20:00")
+        poller.heartbeat()
+        rolling = TestClient(app).get("/meta/freshness").json().get("rolling") or {}
+        check("the site shows the rotation as the poller runs it",
+              rolling.get("enabled") is True and rolling.get("hours") == "08:00-20:00"
+              and rolling.get("areas_per_check") == 1 and rolling.get("last_at")
+              and rolling.get("active_now") is False, json.dumps(rolling))
+    finally:
+        pmod.ROLLING_AREAS, pmod.ROLLING_HOURS, pmod.ROLLING_MIN_AGE = saved
+
+
+def test_analysis_refresh(tiles) -> None:
+    print("\n[14] the risk flags follow the data, and only when it changed")
+    from datetime import datetime, timedelta, timezone
+    from fastapi.testclient import TestClient
+    import astra.pipeline as pipeline_mod
+    from astra.agents.orchestrator import Orchestrator
+    from astra.api.main import app
+    from astra.ingestion import esakshi_map as emap
+    from astra.ingestion import instance_lock
+
+    portal = FakePortal(tiles)
+    _distinct_slices(portal, tiles)
+    poller = fresh_poller(portal)
+    check("no analysis is due before anything is stored", not poller.analysis_due())
+    check("and an empty database has no old flags to catch up on",
+          not poller.note_unrecorded_analysis() and not poller.analysis_due())
+    poller.heartbeat()
+    changed_at = db.get_state("data_changed_at")
+    check("storing new works marks the data as changed", bool(changed_at), str(changed_at))
+    check("so an analysis is due, one never having run", poller.analysis_due())
+
+    summary = poller.refresh_analysis("test")
+    check("it analyses the stored corpus and saves the flags",
+          summary is not None and summary["works"] == _count("works")
+          and summary["flags"] == _count("flags") and summary["flags"] > 0,
+          summary and f"works={summary['works']} flags={summary['flags']}")
+    check("it records which stored changes the flags include",
+          db.get_state("analysis_covers_changes_at") == changed_at
+          and db.get_state("last_analysis_at"))
+    check("its in-progress marker is cleared", not db.get_state("analysis_started_at"))
+    check("with nothing new, no further run is due", not poller.analysis_due())
+    with db.connect() as con:
+        live_rows = con.execute("SELECT COUNT(*), SUM(works_count) FROM fundflows "
+                                "WHERE source = 'esakshi_api'").fetchone()
+        dated = con.execute("SELECT COUNT(*) FROM works WHERE fy IS NOT NULL").fetchone()[0]
+    check("fund positions are built from the stored works",
+          live_rows[0] > 0 and live_rows[1] == dated, f"{tuple(live_rows)} vs {dated} dated works")
+
+    poller.reconcile_all()
+    check("re-reading every area and finding nothing new does not mark the data changed",
+          db.get_state("data_changed_at") == changed_at)
+
+    print("      a change, the interval and the nightly sweep")
+    aligarh = next(s for s in poller.registry() if s.shard_id == "2:33:418")
+    row = next(r for r in portal.shard_tiles["2:33:418"]["recommended"]
+               if emap._FY_IN_CODE.search(emap.row_code(r) or ""))
+    row["RECOMMENDED_AMOUNT"] = (row.get("RECOMMENDED_AMOUNT") or 0) + 50000
+    with db.connect() as con:
+        before_total = con.execute("SELECT SUM(recommended) FROM fundflows "
+                                   "WHERE source = 'esakshi_api'").fetchone()[0]
+    poller.fetch_shard(aligarh)
+    newer = db.get_state("data_changed_at")
+    check("an edited amount marks the data changed again", newer and newer != changed_at)
+    now = datetime.now(timezone.utc)
+    check("within the interval since the last run it waits", not poller.analysis_due(now))
+    check("unless a nightly sweep has just completed",
+          poller.analysis_due(now, after_sweep=True))
+    check("and once the interval has passed it is due",
+          poller.analysis_due(now + pmod.ANALYSIS_EVERY + timedelta(minutes=1)))
+    saved_every = pmod.ANALYSIS_EVERY
+    pmod.ANALYSIS_EVERY = timedelta(0)
+    check("it can be switched off", not poller.analysis_due(now, after_sweep=True))
+    pmod.ANALYSIS_EVERY = saved_every
+
+    print("      review decisions and pre-2023 fund rows")
+    with db.connect() as con:
+        top = [dict(r) for r in con.execute(
+            "SELECT flag_id, created_at FROM flags ORDER BY risk_score DESC, flag_id LIMIT 2")]
+        con.execute("INSERT INTO fundflows (row_id, source, era, state, fy, expenditure) "
+                    "VALUES ('FF-HISTORY-1', 'MPLADS 17th Lok Sabha (2019-2024)', 'pre2023', "
+                    "'UTTAR PRADESH', '2019-2020', 12345.0)")
+    decided, midrun = top[0]["flag_id"], top[1]["flag_id"]
+    db.record_feedback(decided, "confirmed", "district", "checked on site")
+    original_run = Orchestrator.run
+
+    def run_then_review(self, works, flows, context=None):
+        flags = original_run(self, works, flows, context)
+        db.record_feedback(midrun, "under_review", "state", "recorded mid-run")
+        return flags
+
+    lock = instance_lock.WriterLock()
+    lock.acquire()
+    client = TestClient(app)
+    seen = {}
+    original_pipeline = pipeline_mod.run_pipeline
+
+    def spy(**kwargs):
+        seen["during"] = client.get("/meta/freshness").json().get("analysis")
+        return original_pipeline(**kwargs)
+
+    Orchestrator.run = run_then_review
+    pipeline_mod.run_pipeline = spy
+    try:
+        second = poller.refresh_analysis("test")
+    finally:
+        Orchestrator.run = original_run
+        pipeline_mod.run_pipeline = original_pipeline
+    try:
+        during = seen.get("during") or {}
+        check("while it runs the site says the flags are being recomputed",
+              during.get("in_progress") is True and during.get("changes_waiting") is True,
+              json.dumps(during))
+        after = client.get("/meta/freshness").json().get("analysis") or {}
+        check("and afterwards when, with no change left waiting",
+              after.get("in_progress") is False and after.get("last_at")
+              and after.get("changes_waiting") is False, json.dumps(after))
+    finally:
+        lock.release()
+    with db.connect() as con:
+        flags = {r["flag_id"]: dict(r) for r in con.execute(
+            "SELECT flag_id, review_status, reviewer_note, created_at FROM flags")}
+        history = con.execute("SELECT expenditure FROM fundflows "
+                              "WHERE row_id = 'FF-HISTORY-1'").fetchone()
+        after_total = con.execute("SELECT SUM(recommended) FROM fundflows "
+                                  "WHERE source = 'esakshi_api'").fetchone()[0]
+    check("the re-run completed", second is not None)
+    check("a review decision survives the re-run",
+          flags.get(decided, {}).get("review_status") == "confirmed"
+          and flags[decided]["reviewer_note"] == "checked on site",
+          str(flags.get(decided)))
+    check("so does one recorded while the analysis was computing",
+          flags.get(midrun, {}).get("review_status") == "under_review", str(flags.get(midrun)))
+    check("a case keeps the time it was first flagged",
+          flags.get(decided, {}).get("created_at") == top[0]["created_at"])
+    check("the fund positions follow the edited amount",
+          round((after_total or 0) - (before_total or 0)) == 50000,
+          f"{before_total} -> {after_total}")
+    check("while pre-2023 fund rows are left exactly as they were",
+          history is not None and history[0] == 12345.0)
+
+    print("      members with no constituency, as in the Rajya Sabha")
+    with db.connect() as con:
+        con.execute("UPDATE works SET constituency = NULL WHERE UPPER(state) = 'GOA'")
+    seen_flows = {}
+
+    def capture(self, works, flows, context=None):
+        seen_flows["constituency"] = list(flows.loc[flows["source"] == "esakshi_api",
+                                                    "constituency"])
+        return original_run(self, works, flows, context)
+
+    Orchestrator.run = capture
+    try:
+        pipeline_mod.run_pipeline(verbose=False)
+    finally:
+        Orchestrator.run = original_run
+    values = seen_flows.get("constituency") or []
+    check("the analysis sees a missing constituency as missing, not as the text 'nan'",
+          any(v is None for v in values)
+          and all(v is None or isinstance(v, str) for v in values),
+          str(sorted({type(v).__name__ for v in values})))
+    with db.connect() as con:
+        named = [r[0] for r in con.execute("SELECT entity_id FROM flags")]
+    check("so no case is named after a 'nan' constituency",
+          not any(str(name).startswith("nan|") for name in named))
+
+    print("      a failing run")
+
+    def broken(**kwargs):
+        raise RuntimeError("simulated failure")
+
+    flag_count = _count("flags")
+    row["RECOMMENDED_AMOUNT"] += 1000
+    poller.fetch_shard(aligarh)
+    pipeline_mod.run_pipeline = broken
+    try:
+        failed = poller.refresh_analysis("test")
+    finally:
+        pipeline_mod.run_pipeline = original_pipeline
+    now = datetime.now(timezone.utc)
+    check("returns nothing and leaves the flags in place",
+          failed is None and _count("flags") == flag_count)
+    check("clears its marker even so", not db.get_state("analysis_started_at"))
+    check("is not retried straight away, even after a sweep",
+          not poller.analysis_due(now + timedelta(minutes=5), after_sweep=True))
+    check("but is retried once the retry gap and interval have passed",
+          poller.analysis_due(now + max(pmod.RETRY_GAP, pmod.ANALYSIS_EVERY)
+                              + timedelta(minutes=1)))
+
+    print("      flags from before runs were recorded")
+    for key in ("last_analysis_at", "data_changed_at", "analysis_covers_changes_at",
+                "last_analysis_attempt_at"):
+        db.set_state(key, "")
+    check("flags with no recorded run are treated as behind, once",
+          poller.note_unrecorded_analysis() and poller.analysis_due()
+          and not poller.note_unrecorded_analysis())
+
+    with db.connect() as con:
+        con.execute("UPDATE works SET source = 'esakshi_csv'")
+        kept = con.execute("SELECT COUNT(*), SUM(recommended) FROM fundflows "
+                           "WHERE source = 'esakshi_api'").fetchone()
+    pipeline_mod.run_pipeline(verbose=False)
+    with db.connect() as con:
+        still = con.execute("SELECT COUNT(*), SUM(recommended) FROM fundflows "
+                            "WHERE source = 'esakshi_api'").fetchone()
+    check("a corpus not read from the portal keeps its fund positions untouched",
+          tuple(kept) == tuple(still), f"{tuple(kept)} -> {tuple(still)}")
+
+
+class _BreakerPortal(FakePortal):
+    """The fake portal behind a real circuit breaker, as EsakshiClient uses one:
+    every call asks the breaker first and reports how it went."""
+
+    def _guarded(self, call, *args):
+        self.breaker.check()
+        try:
+            out = call(*args)
+        except SourceError as exc:
+            self.breaker.record(False, str(exc))
+            raise
+        self.breaker.record(True)
+        return out
+
+    def watermark(self, combo):
+        return self._guarded(super().watermark, combo)
+
+    def tile_report(self, combo, tile):
+        return self._guarded(super().tile_report, combo, tile)
+
+
+def _open_breaker(portal, error: str, trial_due: bool = False) -> None:
+    import time as _time
+    breaker = CircuitBreaker(window=8, threshold=0.5, base_seconds=1800, trial_seconds=300)
+    for _ in range(8):
+        breaker.record(False, error)
+    if trial_due:
+        breaker._last_trial = _time.monotonic() - 301
+    portal.breaker = breaker
+
+
+def test_portal_pause(tiles) -> None:
+    print("\n[15] a portal that stops answering: paused, named, and retried")
+    from fastapi.testclient import TestClient
+    from astra.api.main import app
+    from astra.ingestion import instance_lock
+
+    portal = _BreakerPortal(tiles)
+    portal.breaker = CircuitBreaker()
+    poller = fresh_poller(portal)
+    poller.heartbeat()
+    client = TestClient(app)
+    goa = next(s for s in poller.registry() if s.shard_id == "2:12:105")
+    db.save_watermark("2:12:105", lifecycle=validate.DIRTY)
+
+    print("      while the breaker is open")
+    _open_breaker(portal, "ReadTimeout: portal did not answer in 45 s")
+    portal.calls.clear()
+    for _ in range(4):
+        report = poller.heartbeat()
+    national = db.get_watermark("2:0:0") or {}
+    area = db.get_watermark("2:12:105") or {}
+    check("nothing is asked of the portal", not portal.calls, str(portal.calls[:4]))
+    check("the minutes it held back are not counted as failures",
+          not national.get("consecutive_failures") and not area.get("consecutive_failures"),
+          f"national={national.get('consecutive_failures')} area={area.get('consecutive_failures')}")
+    check("a slice owed a read keeps its place in the queue",
+          area.get("lifecycle") == validate.DIRTY and goa in poller.pending_shards(),
+          str(area.get("lifecycle")))
+    check("the cycle says it is paused", report.note.startswith("portal paused"), report.note)
+    saved = json.loads(db.get_state("portal_status") or "{}")
+    check("the real error is saved for the website, not 'circuit open'",
+          saved.get("open") and saved.get("last_error") == "ReadTimeout: portal did not answer in 45 s"
+          and saved.get("failing_since") and saved.get("next_attempt_at"), json.dumps(saved)[:160])
+
+    lock = instance_lock.WriterLock()
+    lock.acquire()
+    try:
+        fresh = client.get("/meta/freshness").json()
+    finally:
+        lock.release()
+    check("the website is told the portal is not answering, and why",
+          fresh["status"] == "degraded" and (fresh.get("portal") or {}).get("open") is True
+          and "ReadTimeout" in (fresh["portal"].get("last_error") or ""),
+          json.dumps(fresh.get("portal"))[:160])
+    stopped = client.get("/meta/freshness").json()
+    check("but not once the poller has stopped: its last word is history",
+          (stopped.get("portal") or {}).get("open") is False)
+
+    print("      a trial every few minutes")
+    _open_breaker(portal, "HTTP 503 from /getTilesData", trial_due=True)
+    portal.calls.clear()
+    report = poller.heartbeat()
+    check("once a trial is due, the national check is tried",
+          ("watermark", "2:0:0") in portal.calls, str(portal.calls[:4]))
+    check("the portal answering closes the breaker", not portal.breaker.is_open)
+    portal.calls.clear()
+    poller.heartbeat()
+    check("and the next minute resumes the queue it held back",
+          ("report", "2:12:105") in portal.calls
+          and (db.get_watermark("2:12:105") or {}).get("lifecycle") != validate.DIRTY,
+          str(portal.calls[:8]))
+    check("and the website hears the portal is back",
+          json.loads(db.get_state("portal_status") or "{}").get("open") is False)
+
+    _open_breaker(portal, "HTTP 503 from /getTilesData", trial_due=True)
+    portal.fail_shards.add("2:0:0")
+    wait = portal.breaker.opens_in()
+    portal.calls.clear()
+    poller.heartbeat()
+    check("a trial that fails is one real failure, and the wait does not grow",
+          (db.get_watermark("2:0:0") or {}).get("consecutive_failures") == 1
+          and portal.breaker.opens_in() <= wait
+          and portal.calls.count(("watermark", "2:0:0")) == 1, str(portal.calls))
+    portal.calls.clear()
+    poller.heartbeat()
+    check("and the next minute waits for the next trial", not portal.calls, str(portal.calls))
+    portal.fail_shards.clear()
+    portal.breaker = CircuitBreaker()
+
+    print("      failing checks are named for what they are")
+    for sid in ("2:0:0", "2:0:0", "2:0:0", "2:33:0", "2:33:0", "2:33:0"):
+        db.mark_shard_failure(sid, "HTTP 500", lifecycle=validate.RETRY)
+    stale = {s["shard_id"]: s for s in client.get("/meta/freshness").json()["stale"]}
+    national, state = stale.get("2:0:0") or {}, stale.get("2:33:0") or {}
+    check("the national check is a Lok Sabha national check, not an unnamed '(RS)'",
+          national.get("scope") == "national" and national.get("house") == "LS"
+          and national.get("place") is None, json.dumps(national)[:160])
+    check("a state-level check carries its state's name",
+          state.get("scope") == "state" and state.get("house") == "LS"
+          and state.get("place") == "UTTAR PRADESH", json.dumps(state)[:160])
+
+
 def test_live() -> None:
     print("\n[12] live portal — the loop's assumptions still hold")
     client = EsakshiClient()
@@ -1141,13 +1662,15 @@ def main() -> int:
                    test_live_status, test_recent_updates,
                    test_data_source_live, test_duplicate_listings,
                    test_removal_lifecycle, test_move_between_slices,
-                   test_later_report_only):
+                   test_later_report_only, test_rotation,
+                   test_analysis_refresh, test_portal_pause):
             db.init_db(force=True)
             with db.connect() as con:
                 for table in ("works", "shards", "shard_watermarks",
                               "work_versions", "provenance", "poller_state",
                               "work_listing", "missing_works", "retired_works",
-                              "shard_parity"):
+                              "shard_parity", "flags", "fundflows", "feedback",
+                              "payments"):
                     con.execute(f"DELETE FROM {table}")
             fn(tiles)
         if "--live" in sys.argv:

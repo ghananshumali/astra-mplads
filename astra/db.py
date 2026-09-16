@@ -16,6 +16,10 @@ Tables:
   missing_works    — works a slice stopped listing, awaiting confirmation
   retired_works    — works the portal no longer lists, kept whole
   shard_parity     — each slice's four tile figures, portal against stored
+  analysis_runs    — one row per analysis run: what it read, which rules ran
+                     or stood down and why, what it produced
+  payments         — every payment record the portal lists, one row each: what
+                     `works.total_paid` and `payment_count` add up
 
 Two distinct write paths
 ------------------------
@@ -50,7 +54,9 @@ CREATE TABLE IF NOT EXISTS works (
     ia_name TEXT, vendor_name TEXT, work_type TEXT, total_paid REAL,
     payment_count INTEGER, last_payment_date TEXT, payment_status TEXT,
     is_sc_constituency INTEGER, is_st_constituency INTEGER,
-    lat REAL, lon REAL, fy TEXT
+    lat REAL, lon REAL, fy TEXT,
+    work_category TEXT, letter_no TEXT, term_start TEXT, term_end TEXT,
+    implementing_agency TEXT, vendor_id TEXT
 );
 CREATE TABLE IF NOT EXISTS fundflows (
     row_id TEXT PRIMARY KEY, source TEXT, era TEXT, state TEXT, constituency TEXT,
@@ -110,6 +116,17 @@ CREATE TABLE IF NOT EXISTS shard_parity (
     stored_json TEXT, differences_json TEXT, duplicates_json TEXT,
     recheck_after TEXT, rechecks INTEGER DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS analysis_runs (
+    run_id TEXT PRIMARY KEY, started_at TEXT, finished_at TEXT, seconds REAL,
+    works INTEGER, fundflows INTEGER, flags INTEGER, alerts INTEGER,
+    covers_changes_at TEXT, rules_sha256 TEXT, guidelines TEXT, code_version TEXT,
+    rule_coverage_json TEXT, contract_json TEXT, summary_json TEXT
+);
+CREATE TABLE IF NOT EXISTS payments (
+    work_id TEXT, seq INTEGER, shard_id TEXT, paid_on TEXT, amount REAL,
+    vendor_id TEXT, vendor_name TEXT, implementing_agency TEXT, status TEXT,
+    PRIMARY KEY (work_id, seq)
+);
 CREATE INDEX IF NOT EXISTS ix_flags_state ON flags(state);
 CREATE INDEX IF NOT EXISTS ix_flags_status ON flags(review_status);
 CREATE INDEX IF NOT EXISTS ix_flags_district ON flags(district);
@@ -122,6 +139,7 @@ CREATE INDEX IF NOT EXISTS ix_work_versions_work ON work_versions(work_id);
 CREATE INDEX IF NOT EXISTS ix_work_versions_observed ON work_versions(observed_at);
 CREATE INDEX IF NOT EXISTS ix_listing_shard ON work_listing(shard_id);
 CREATE INDEX IF NOT EXISTS ix_missing_shard ON missing_works(shard_id);
+CREATE INDEX IF NOT EXISTS ix_payments_shard ON payments(shard_id);
 """
 
 #: Tables `init_db()` may rebuild when their columns drift from SCHEMA. The
@@ -143,15 +161,20 @@ def connect():
         con.close()
 
 
-def _expected_columns(table: str) -> list[str]:
-    """Column names declared for `table` in SCHEMA."""
+def _column_definitions(table: str) -> list[tuple[str, str]]:
+    """(name, declaration) of each column declared for `table` in SCHEMA."""
     body = SCHEMA.split(f"CREATE TABLE IF NOT EXISTS {table} (")[1].split(");")[0]
     cols = []
     for part in body.split(","):
         tok = part.strip().split()
         if tok and tok[0].upper() not in ("PRIMARY", "FOREIGN", "UNIQUE", "CHECK"):
-            cols.append(tok[0])
+            cols.append((tok[0], " ".join(tok[1:])))
     return cols
+
+
+def _expected_columns(table: str) -> list[str]:
+    """Column names declared for `table` in SCHEMA."""
+    return [name for name, _ in _column_definitions(table)]
 
 
 _SCHEMA_READY = False
@@ -163,9 +186,12 @@ def init_db(force: bool = False) -> None:
     Memoised per process: this used to run a PRAGMA sweep on every query, which
     dominated the cost of the dashboard's small, frequent reads.
 
-    Data tables are fully re-ingested on every run, so dropping a stale table is
-    safe and keeps schema evolution frictionless during the build. `feedback` is
-    preserved because it holds human review decisions.
+    A table that only lacks columns SCHEMA has since added gains them, empty,
+    and keeps its rows: on the live corpus `works` is not re-ingested on every
+    run, and dropping it would empty a corpus the watermarks still call current,
+    so nothing would fetch it again. A table whose columns drifted any other way
+    is dropped and rebuilt, which the CSV path's full re-ingest tolerates.
+    `feedback` is never touched because it holds human review decisions.
     """
     global _SCHEMA_READY
     if _SCHEMA_READY and not force:
@@ -175,9 +201,21 @@ def init_db(force: bool = False) -> None:
         for table in _REBUILDABLE:
             have = [r[1] for r in con.execute(f"PRAGMA table_info({table})").fetchall()]
             want = _expected_columns(table)
-            if have and set(have) != set(want):
-                con.execute(f"DROP TABLE {table}")
-                con.executescript(SCHEMA)
+            if not have or set(have) == set(want):
+                continue
+            if set(have) < set(want):
+                for name, declaration in _column_definitions(table):
+                    if name in have:
+                        continue
+                    try:
+                        con.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+                    except sqlite3.OperationalError as exc:
+                        # The API and the poller start together; one may add it first.
+                        if "duplicate column" not in str(exc).lower():
+                            raise
+                continue
+            con.execute(f"DROP TABLE {table}")
+            con.executescript(SCHEMA)
         # Write-ahead logging lets the API keep reading while the poller writes.
         # It is a persistent property of the file, so setting it once is enough.
         #
@@ -200,6 +238,21 @@ def replace_df(table: str, df: pd.DataFrame) -> int:
     with connect() as con:
         con.execute(f"DELETE FROM {table}")
         df.to_sql(table, con, if_exists="append", index=False)
+    return len(df)
+
+
+def replace_rows(table: str, df: pd.DataFrame, *, where: str,
+                 params: tuple = ()) -> int:
+    """Replace only the rows matching `where`, in one transaction.
+
+    For a table two sources share: the analysis rebuilds the fund positions it
+    derives from the live works and must leave the pre-2023 rows alone.
+    """
+    init_db()
+    with connect() as con:
+        con.execute(f"DELETE FROM {table} WHERE {where}", params)
+        if not df.empty:
+            df.to_sql(table, con, if_exists="append", index=False)
     return len(df)
 
 
@@ -337,6 +390,44 @@ def upsert_works(works: list[Work], *, shard_id: str | None = None,
             "changed": changed, "versions": len(versions)}
 
 
+#: `payments` columns, as `esakshi_map.payment_rows` builds them plus the slice.
+PAYMENT_COLUMNS = ("work_id", "seq", "shard_id", "paid_on", "amount", "vendor_id",
+                   "vendor_name", "implementing_agency", "status")
+
+
+def replace_payments(shard_id: str, work_ids, payments: list[dict]) -> int:
+    """Store what one read of a slice lists as paid, for the works it lists.
+
+    Every stored payment of those works is replaced, in one transaction, so a
+    payment the portal no longer lists goes and a new one arrives. A work the
+    read does not list keeps the payments last seen: it may be awaiting
+    confirmation that it has gone (`apply_listing`), and a retired work's
+    payments are the record of what it was paid. There is no history here;
+    changes to what was paid show in `work_versions` through `total_paid`.
+    """
+    init_db()
+    ids = list(dict.fromkeys(work_ids))
+    rows = [tuple(shard_id if c == "shard_id" else payment.get(c) for c in PAYMENT_COLUMNS)
+            for payment in payments]
+    with connect() as con:
+        for start in range(0, len(ids), 500):                   # SQLite param limit
+            chunk = ids[start:start + 500]
+            con.execute(f"DELETE FROM payments WHERE work_id IN ({', '.join('?' * len(chunk))})",
+                        chunk)
+        con.executemany(f"INSERT INTO payments ({', '.join(PAYMENT_COLUMNS)}) "
+                        f"VALUES ({', '.join('?' * len(PAYMENT_COLUMNS))})", rows)
+    return len(rows)
+
+
+def work_payments(work_id: str) -> list[dict]:
+    """One work's payment records, oldest first."""
+    init_db()
+    with connect() as con:
+        return [dict(r) for r in con.execute(
+            f"SELECT {', '.join(PAYMENT_COLUMNS)} FROM payments WHERE work_id = ? "
+            f"ORDER BY paid_on, seq", (work_id,))]
+
+
 def work_versions(work_id: str) -> list[dict]:
     """The observed history of one work, oldest first."""
     init_db()
@@ -376,6 +467,9 @@ def missing_ids(ids: list[str]) -> set[str]:
     return out
 
 
+_LISTING_COUNTS = ("in_recommended", "in_sanctioned", "in_completed", "payments")
+
+
 def apply_listing(shard_id: str, listing: dict[str, dict[str, int]], *,
                   consistent: bool, confirm_after: timedelta,
                   now: datetime | None = None) -> dict:
@@ -394,10 +488,17 @@ def apply_listing(shard_id: str, listing: dict[str, dict[str, int]], *,
     now = now or datetime.now(timezone.utc)
     stamp = now.isoformat()
     listed = set(listing)
-    out = {"newly_missing": [], "still_missing": [], "retired": [], "restored": []}
+    out = {"newly_missing": [], "still_missing": [], "retired": [], "restored": [],
+           "listing_changed": False}
     with connect() as con:
-        previous = {r["work_id"] for r in con.execute(
-            "SELECT work_id FROM work_listing WHERE shard_id = ?", (shard_id,))}
+        before = {r["work_id"]: tuple(r[k] for k in _LISTING_COUNTS) for r in con.execute(
+            "SELECT work_id, in_recommended, in_sanctioned, in_completed, payments "
+            "FROM work_listing WHERE shard_id = ?", (shard_id,))}
+        # Which reports list a work is analysis input too (the duplicate check
+        # reads it), so a change here must be able to trigger a re-analysis.
+        out["listing_changed"] = before != {
+            w: tuple(v[k] for k in _LISTING_COUNTS) for w, v in listing.items()}
+        previous = set(before)
         pending = {r["work_id"]: r for r in con.execute(
             "SELECT * FROM missing_works WHERE shard_id = ?", (shard_id,))}
         if not previous and not pending:
@@ -626,12 +727,14 @@ def save_watermark(shard_id: str, *, signature: object = None,
                    n_records: int | None = None, total_amount: float | None = None,
                    payload_sha256: str | None = None, lifecycle: str = "IDLE",
                    n_stored: int | None = None, count_matched: bool | None = None,
-                   fetched: bool = False) -> None:
+                   fetched: bool = False, keep_payload: bool = False) -> None:
     """Record what the portal told us about a shard, and how it went.
 
     A successful call clears `consecutive_failures` and `stale_since`; that is
     the only thing that does. `checked_at` moves on every watermark read,
-    `fetched_at` only when records were actually pulled.
+    `fetched_at` only when records were actually pulled. `keep_payload` keeps
+    the stored records fingerprint when none is given; otherwise it is cleared,
+    which forces the next fetch of the shard through the full write path.
     """
     init_db()
     now = datetime.now(timezone.utc).isoformat()
@@ -660,7 +763,9 @@ def save_watermark(shard_id: str, *, signature: object = None,
             "ON CONFLICT(shard_id) DO UPDATE SET "
             "signature_json=excluded.signature_json, n_records=excluded.n_records, "
             "total_amount=excluded.total_amount, "
-            "payload_sha256=excluded.payload_sha256, "
+            + ("payload_sha256=COALESCE(excluded.payload_sha256, "
+               "shard_watermarks.payload_sha256), " if keep_payload
+               else "payload_sha256=excluded.payload_sha256, ") +
             "lifecycle=excluded.lifecycle, "
             "n_stored=COALESCE(excluded.n_stored, shard_watermarks.n_stored), "
             "count_matched=COALESCE(excluded.count_matched, "
@@ -718,6 +823,34 @@ def set_state(key: str, value: str) -> None:
             (key, value, datetime.now(timezone.utc).isoformat()))
 
 
+def oldest_read_shards(houses, *, read_before: str, limit: int,
+                       skip_lifecycles=()) -> list[str]:
+    """Registered slices whose records were last read before `read_before`.
+
+    Least recently read first, and never-read slices before any of them. A
+    read by any path counts: a change, a recheck, the nightly sweep or the
+    rotation itself. Slices in `skip_lifecycles` are left to the queue that
+    already owns them.
+    """
+    houses = [int(h) for h in houses]
+    if not houses or limit <= 0:
+        return []
+    init_db()
+    skip = list(skip_lifecycles)
+    house_marks = ", ".join("?" * len(houses))
+    skip_sql = (f"AND COALESCE(w.lifecycle, '') NOT IN ({', '.join('?' * len(skip))}) "
+                if skip else "")
+    with connect() as con:
+        rows = con.execute(
+            f"SELECT s.shard_id FROM shards s "
+            f"LEFT JOIN shard_watermarks w ON w.shard_id = s.shard_id "
+            f"WHERE s.house IN ({house_marks}) "
+            f"AND (w.fetched_at IS NULL OR w.fetched_at < ?) {skip_sql}"
+            f"ORDER BY w.fetched_at IS NOT NULL, w.fetched_at, s.shard_id LIMIT ?",
+            (*houses, read_before, *skip, int(limit))).fetchall()
+    return [r["shard_id"] for r in rows]
+
+
 def stale_shards(min_failures: int = 3) -> list[dict]:
     """Shards that have failed repeatedly — the escalation list.
 
@@ -727,13 +860,30 @@ def stale_shards(min_failures: int = 3) -> list[dict]:
     """
     init_db()
     with connect() as con:
-        return [dict(r) for r in con.execute(
+        rows = [dict(r) for r in con.execute(
             "SELECT w.shard_id, w.consecutive_failures, w.stale_since, "
             "       w.last_error, w.lifecycle, w.fetched_at, "
             "       s.state_name, s.constituency_name, s.house "
             "FROM shard_watermarks w LEFT JOIN shards s USING (shard_id) "
             "WHERE w.consecutive_failures >= ? "
             "ORDER BY w.consecutive_failures DESC, w.stale_since", (min_failures,))]
+        states = {r["state_id"]: r["state_name"] for r in con.execute(
+            "SELECT DISTINCT state_id, state_name FROM shards WHERE state_name IS NOT NULL")}
+    for row in rows:
+        # The national and state checks the poller compares at are not areas in
+        # the registry, so the join finds no row for them. Their id still says
+        # what they are: house:state:constituency, with 0 for "all".
+        try:
+            house, state_id, constituency_id = (int(p) for p in str(row["shard_id"]).split(":"))
+        except ValueError:
+            row["scope"] = "area"
+            continue
+        registered = row["house"] is not None
+        row["house"] = row["house"] if registered else house
+        row["state_name"] = row["state_name"] or states.get(state_id)
+        row["scope"] = ("national" if state_id == 0 else
+                        "area" if registered or constituency_id else "state")
+    return rows
 
 
 def watermark_summary() -> dict:
@@ -755,9 +905,17 @@ def watermark_summary() -> dict:
 
 
 def save_flags(flags: list[Flag]) -> int:
+    """Replace the flags with a fresh analysis, keeping what people decided.
+
+    The analysis re-runs while the site is in use, so the table is rewritten
+    under reviewers. A case's review status and note come from its latest
+    entry in `feedback`, and a case already flagged keeps the time it was
+    first flagged. Both are read inside the same write transaction as the
+    rewrite, so a decision recorded while the analysis was computing is kept.
+    """
     init_db()
     now = datetime.now(timezone.utc).isoformat()
-    rows = [
+    payloads = [
         (
             f.flag_id, f.entity_type, f.entity_id, f.entity_label, f.state,
             f.district, f.constituency, f.era, f.risk_score, int(f.alert),
@@ -769,12 +927,75 @@ def save_flags(flags: list[Flag]) -> int:
         for f in flags
     ]
     with connect() as con:
+        con.execute("BEGIN IMMEDIATE")
+        decided = {r["flag_id"]: (r["action"], r["note"]) for r in con.execute(
+            "SELECT flag_id, action, note FROM feedback WHERE id IN "
+            "(SELECT MAX(id) FROM feedback GROUP BY flag_id)")}
+        first_seen = {r["flag_id"]: r["created_at"] for r in con.execute(
+            "SELECT flag_id, created_at FROM flags")}
+        rows = []
+        for row in payloads:
+            flag_id = row[0]
+            status, note = decided.get(flag_id, (row[13], row[14]))
+            rows.append(row[:13] + (status, note, first_seen.get(flag_id) or row[15])
+                        + row[16:])
         con.execute("DELETE FROM flags")
         con.executemany(
             "INSERT OR REPLACE INTO flags VALUES "
             "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows
         )
     return len(rows)
+
+
+def record_analysis_run(run: dict, keep: int = 200) -> None:
+    """Keep the record of one analysis run; the newest `keep` are retained.
+
+    The flags table holds only the latest results. This is what lets anyone
+    say later which rules and thresholds produced them, on which data.
+    """
+    init_db()
+    columns = ("run_id", "started_at", "finished_at", "seconds", "works", "fundflows",
+               "flags", "alerts", "covers_changes_at", "rules_sha256", "guidelines",
+               "code_version")
+    row = [run.get(c) for c in columns] + [
+        json.dumps(run.get("rule_coverage") or [], default=str),
+        json.dumps(run.get("contract") or {}, default=str),
+        json.dumps(run.get("summary") or {}, default=str)]
+    with connect() as con:
+        con.execute(
+            f"INSERT OR REPLACE INTO analysis_runs ({', '.join(columns)}, "
+            f"rule_coverage_json, contract_json, summary_json) "
+            f"VALUES ({', '.join('?' * (len(columns) + 3))})", row)
+        con.execute("DELETE FROM analysis_runs WHERE run_id NOT IN "
+                    "(SELECT run_id FROM analysis_runs ORDER BY started_at DESC LIMIT ?)",
+                    (keep,))
+
+
+def analysis_runs(limit: int = 10) -> list[dict]:
+    init_db()
+    with connect() as con:
+        rows = [dict(r) for r in con.execute(
+            "SELECT * FROM analysis_runs ORDER BY started_at DESC LIMIT ?", (limit,))]
+    for row in rows:
+        for key in ("rule_coverage_json", "contract_json", "summary_json"):
+            row[key[:-5]] = json.loads(row.pop(key) or "null")
+    return rows
+
+
+def area_health() -> pd.DataFrame:
+    """Per slice: parity, read failures and removals awaiting confirmation.
+
+    What the analysis uses to say how far a work's record can be trusted
+    right now. Empty for a corpus that was not read from the portal.
+    """
+    init_db()
+    with connect() as con:
+        return pd.read_sql_query(
+            "SELECT s.shard_id, p.exact, w.lifecycle, w.consecutive_failures, "
+            "w.stale_since, w.fetched_at, "
+            "(SELECT COUNT(*) FROM missing_works m WHERE m.shard_id = s.shard_id) AS awaiting_removal "
+            "FROM shards s LEFT JOIN shard_parity p ON p.shard_id = s.shard_id "
+            "LEFT JOIN shard_watermarks w ON w.shard_id = s.shard_id", con)
 
 
 def load_flags(where: str = "", params: tuple = ()) -> list[dict]:

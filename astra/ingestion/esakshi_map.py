@@ -12,11 +12,15 @@ deliberately reproduces its conventions so the two paths yield the same corpus:
     of the work label after the code (`offline.py:_work_type`). `category` is
     the anomaly module's peer-group key, so it must not drift.
   * `fy` prefers the financial year embedded in the work code, else derives it
-    from the recommendation date on an April-March year (`_fy_from`).
+    from the recommendation date on an April-March year (`_fy_from`). The code
+    is issued at sanction, so for a sanctioned work that is the sanction year
+    (see `data_contract`).
   * `is_sc_constituency` / `is_st_constituency` come from the `(SC)` / `(ST)`
     marker in the constituency label (`_reservation`).
   * `vendor_name` is the vendor paid the **most** on that work, not the most
-    recent one.
+    recent one. Payments are added up per `VENDOR_ID`, and `vendor_id` names
+    the same vendor: names are not unique on the portal (on 16 Sep 2026, 1,424
+    names belonged to more than one vendor id; "gurpreet singh" to 17).
   * `expenditure` is the sum of payment tranches, falling back to the amount
     disbursed on completion.
   * `lat` / `lon` stay empty — the CSV path leaves them empty too.
@@ -62,6 +66,24 @@ in counts and in rupees. So nothing the portal lists is dropped or merged away:
 works listed only in a later report are built from that report, a work listed
 twice is counted twice, ₹1 placeholder recommendations are kept, and
 `portal_figures()` reproduces the four tile figures from what was stored.
+
+Fields only the portal interface carries
+----------------------------------------
+Measured over every cached slice on 16 Sep 2026:
+
+  * `work_category` is the portal's own class of the work, `WORK_CATEGORY`:
+    "Normal/Others", "Repair and Renovation", "Trust and Society", "Bar and
+    Associations" or "N/A". It is not `category`, which is the activity type.
+  * `letter_no` is the MP's recommendation letter, `LETTER_NO`. One letter can
+    recommend many works.
+  * `term_start` / `term_end` are the recommending member's term, from
+    `TENURE_START_DATE` / `TENURE_END_DATE`.
+  * `implementing_agency` is `IA_NAME`, the agency executing the work. Only
+    payment records carry it, so it is empty until a first payment; every
+    paid work had exactly one.
+  * `vendor_id` is `VENDOR_ID`, only on payment records too.
+
+A report that does not carry a field leaves it to the next report that does.
 
 Known vocabulary difference
 ---------------------------
@@ -237,6 +259,17 @@ def _first_date(row: dict) -> str | None:
     return None
 
 
+def _described(row: dict) -> dict:
+    """The descriptive fields a record carries that its report may not repeat."""
+    category = clean_text(row.get("WORK_CATEGORY"))
+    return {
+        "work_category": None if category is None or category.upper() in _NULLISH else category,
+        "letter_no": squash(row.get("LETTER_NO")),
+        "term_start": iso_date(row.get("TENURE_START_DATE")),
+        "term_end": iso_date(row.get("TENURE_END_DATE")),
+    }
+
+
 @dataclass
 class ShardMapping:
     """Everything one slice's four reports say, in ASTRA's terms.
@@ -246,11 +279,43 @@ class ShardMapping:
                   what reproduces the portal's own tile counts exactly, and
                   what tells a later fetch which works have gone.
     `duplicates`  works the portal lists more than once in one report.
+    `payments`    one row per payment record, as `db.PAYMENT_COLUMNS` less the
+                  slice id: every row the expenditure report lists, so they add
+                  up to each work's `total_paid` and `payment_count`.
     """
 
     works: list[Work]
     listing: dict[str, dict[str, int]]
     duplicates: list[dict] = field(default_factory=list)
+    payments: list[dict] = field(default_factory=list)
+
+
+def payment_rows(work_id: str, rows: list[dict]) -> list[dict]:
+    """A work's payment records, in a stable order.
+
+    The portal gives a payment no id of its own, and two records can be
+    identical in every field but the row number (the same amount to the same
+    vendor on the same day). Both are kept, as the portal counts both. `seq`
+    numbers them after sorting on their content, so it does not depend on the
+    order the report happens to list them in.
+    """
+    out = []
+    for row in rows:
+        vendor_id = row.get("VENDOR_ID")
+        out.append({
+            "work_id": work_id,
+            "paid_on": iso_date(row.get("EXPENDITURE_DATE")),
+            "amount": number(row.get("FUND_DISBURSED_AMT")),
+            "vendor_id": clean_text(str(vendor_id)) if vendor_id is not None else None,
+            "vendor_name": clean_text(row.get("VENDOR_NAME")),
+            "implementing_agency": clean_text(row.get("IA_NAME")),
+            "status": clean_text(row.get("WORK_STATUS")),
+        })
+    out.sort(key=lambda r: (r["paid_on"] or "", r["amount"] or 0.0, r["vendor_id"] or "",
+                            r["vendor_name"] or "", r["status"] or ""))
+    for seq, row in enumerate(out, start=1):
+        row["seq"] = seq
+    return out
 
 
 def _empty_listing() -> dict[str, int]:
@@ -326,7 +391,14 @@ def map_shard(tiles: dict[str, list[dict]]) -> ShardMapping:
             is_sc_constituency=is_sc,
             is_st_constituency=is_st,
             fy=financial_year(code, rec_date),
+            **_described(row),
         )
+
+    def fill(work: Work, row: dict) -> None:
+        """Take what an earlier report did not carry from this one."""
+        for name, value in _described(row).items():
+            if getattr(work, name) is None and value is not None:
+                setattr(work, name, value)
 
     def register(key, work_id: str, work: Work) -> None:
         works[work_id] = work
@@ -388,6 +460,7 @@ def map_shard(tiles: dict[str, list[dict]]) -> ShardMapping:
         if work_id is None:
             continue
         work = works[work_id]
+        fill(work, row)
         listing[work_id]["in_sanctioned"] += 1
         seen_sanctioned[work_id] = seen_sanctioned.get(work_id, 0) + 1
         work.sanction_date = iso_date(row.get("SANCTION_DATE")) or work.sanction_date
@@ -405,6 +478,7 @@ def map_shard(tiles: dict[str, list[dict]]) -> ShardMapping:
         if work_id is None:
             continue
         work = works[work_id]
+        fill(work, row)
         listing[work_id]["in_completed"] += 1
         work.completion_date = iso_date(row.get("ACTUAL_END_DATE"))
         amount = number(row.get("ACTUAL_AMOUNT"))
@@ -419,8 +493,12 @@ def map_shard(tiles: dict[str, list[dict]]) -> ShardMapping:
             tranches.setdefault(work_id, []).append(row)
             listing[work_id]["payments"] += 1
 
+    payments: list[dict] = []
     for work_id, rows in tranches.items():
         work = works[work_id]
+        for row in rows:
+            fill(work, row)
+        payments += payment_rows(work_id, rows)
         amounts = [number(r.get("FUND_DISBURSED_AMT")) or 0.0 for r in rows]
         dates = sorted(d for d in (iso_date(r.get("EXPENDITURE_DATE")) for r in rows)
                        if d)
@@ -428,20 +506,26 @@ def map_shard(tiles: dict[str, list[dict]]) -> ShardMapping:
         work.payment_count = len(rows)
         work.last_payment_date = dates[-1] if dates else None
         work.payment_status = clean_text(rows[-1].get("WORK_STATUS"))
-        # primary vendor = the one paid the most on this work (offline.py parity)
-        paid_by_vendor: dict[str, float] = {}
+        # primary vendor = the one paid the most on this work (offline.py parity),
+        # added up per vendor id: two vendors can share a name
+        paid_by_vendor: dict[tuple[str | None, str], float] = {}
         for row, amount in zip(rows, amounts):
             name = clean_text(row.get("VENDOR_NAME"))
             if name:
-                paid_by_vendor[name] = paid_by_vendor.get(name, 0.0) + amount
+                vendor = (clean_text(str(row["VENDOR_ID"])) if row.get("VENDOR_ID") is not None
+                          else None, name)
+                paid_by_vendor[vendor] = paid_by_vendor.get(vendor, 0.0) + amount
         if paid_by_vendor:
-            work.vendor_name = max(paid_by_vendor, key=paid_by_vendor.get)
+            work.vendor_id, work.vendor_name = max(paid_by_vendor, key=paid_by_vendor.get)
+        agencies = [a for a in (clean_text(r.get("IA_NAME")) for r in rows) if a]
+        if agencies:
+            work.implementing_agency = max(sorted(set(agencies)), key=agencies.count)
 
     # ---- derived: expenditure prefers tranches, falls back to completion
     for work_id, work in works.items():
         work.expenditure = work.total_paid if work.total_paid else disbursed.get(work_id)
 
-    return ShardMapping(list(works.values()), listing, duplicates)
+    return ShardMapping(list(works.values()), listing, duplicates, payments)
 
 
 def to_works(tiles: dict[str, list[dict]]) -> list[Work]:
