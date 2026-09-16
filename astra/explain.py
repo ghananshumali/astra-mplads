@@ -117,10 +117,11 @@ def humanize(finding: dict, lang: str = DEFAULT) -> dict:
         "agent_label": agent_label(agent, lang),
         "severity": sev,
         "severity_label": text_or(lang, f"severity.{sev}", sev.title()),
-        "contribution": 0 if d.get("portal_record_pair") or d.get("standalone") is False
-                        else weights.get(sev, 0),
+        "contribution": 0 if d.get("portal_record_pair") or d.get("held")
+                        or d.get("standalone") is False else weights.get(sev, 0),
         # shown for completeness, deliberately outside the score
-        "context": bool(d.get("portal_record_pair") or d.get("standalone") is False),
+        "context": bool(d.get("portal_record_pair") or d.get("held")
+                        or d.get("standalone") is False),
         "clause": clause_text(finding.get("clause"), lang),
         "headline": finding.get("rule_title", rid),
         "plain": finding.get("summary", ""),
@@ -353,6 +354,31 @@ def humanize(finding: dict, lang: str = DEFAULT) -> dict:
         out["metric"] = t("D-DUP-01.pair.metric", **values)
         out["benchmark"] = t("D-DUP-01.pair.benchmark")
         out["actions"] = ts("D-DUP-01.pair.actions", **values)
+
+    elif rid == "D-DUP-01" and d.get("batch"):
+        groups = d.get("same_payee_groups") or []
+        values = dict(size=d.get("batch_size"), mp=d.get("batch_mp"), total=rs(d.get("batch_total")),
+                      letters=d.get("batch_letters"), payees=d.get("batch_payees"))
+        out["headline"] = t("D-DUP-01.batch.headline", **values)
+        out["plain"] = t("D-DUP-01.batch.plain", **values)
+        out["metric"] = t("D-DUP-01.batch.metric", **values)
+        out["benchmark"] = t("D-DUP-01.batch.benchmark")
+        out["actions"] = ts("D-DUP-01.batch.actions", **values)
+        for group in groups[:3]:
+            out["actions"].append(t("D-DUP-01.batch.same_payee", payee=group.get("payee"),
+                                    works=", ".join(group.get("work_ids") or [])))
+
+    elif rid == "D-DUP-01" and d.get("held"):
+        values = dict(similarity=d.get("semantic_sim", 0) * 100, pair=d.get("pair_work_id"))
+        out["headline"] = t("D-DUP-01.held.headline")
+        out["plain"] = t("D-DUP-01.held.plain", **values,
+                         same_amount=t("D-DUP-01.match.same_amount", cost=rs(d.get("this_cost")))
+                         if d.get("same_sanction_amount") else "",
+                         same_payee=t("D-DUP-01.held.same_payee", payee=d.get("shared_payee"))
+                         if d.get("shared_payee") else "")
+        out["metric"] = t("D-DUP-01.held.metric", **values)
+        out["benchmark"] = t("D-DUP-01.held.benchmark")
+        out["actions"] = ts("D-DUP-01.held.actions", **values)
 
     elif rid == "D-DUP-01":
         strong = d.get("evidence_strength") == "strong"

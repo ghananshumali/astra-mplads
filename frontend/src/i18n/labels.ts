@@ -34,6 +34,7 @@ export function houseName(i18n: I18n, house: string): string {
 
 /** The entity-resolution agent's duplication pattern, as it records it. */
 const DUP_MODES: Record<string, MessageKey> = {
+  "batch of identical works": "dup.mode.batch",
   "identical recommendation double-entry": "dup.mode.identical",
   "same-recommender near-duplicate": "dup.mode.sameRecommender",
   "cross-MP overlap (constituency-boundary duplication)": "dup.mode.crossMp",

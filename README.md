@@ -116,7 +116,7 @@ authority (see *AI synthesis layer*).
 | **Ingestion** | Dual-mode router; era tagging around the 2023-04 eSAKSHI cutover; pdfplumber pipeline for utilisation certificates | canonical `works` + `fundflows` |
 | **Compliance** | Deterministic rules, thresholds in `config/rules.yaml`, each finding citing its paragraph of the MPLADS Guidelines 2023 | paragraph-cited findings |
 | **Statistical Anomaly** | Robust z-score (median/MAD) within *state × work-type × era* peer groups (empirical SoR proxy), materiality floor, degenerate-group and scale-mismatch handling; a peer profile across time to sanction, time to complete, share paid and payment count. Isolation Forest only corroborates | cost, expenditure and peer-profile outliers |
-| **Entity-Resolution** | Blocked top-k sparse TF-IDF neighbours + rapidfuzz + **shared-rare-token evidence gate** + numeric-locator discriminator + geo gate | duplicate pairs with likely mode |
+| **Entity-Resolution** | Blocked top-k sparse TF-IDF neighbours + rapidfuzz + **shared-rare-token evidence gate** + numeric-locator discriminator + geo gate find candidates; the record decides: a separating detail clears a pair, a batch of identical works is one held item, anything else is held until evidence | held duplicate pairs and batches (outside the score) |
 | **Network** | Vendors (by portal vendor id), implementing agencies and district authorities: district spread, overrun concentration, national-supplier down-weighting | concentration signals |
 | **Revision** | Edits the poller observed on the portal after sanction; normal progress is never a revision | post-sanction change signals |
 | **Payment** | Every payment record the portal lists, read against the work's sanction and completion dates | payment-record signals |
@@ -145,7 +145,7 @@ own **indicator**, which never claims to be a scheme rule.
 | `A-COST-01` | statistical | Cost anomaly vs peer benchmark (SoR proxy, 3.2.13) |
 | `A-PEER-01` | statistical | Extreme on two or more of time to sanction, time to complete, share paid, payment count |
 | `A-EXP-01` | statistical | Expenditure-pattern outlier |
-| `D-DUP-01` | statistical | Duplicate / near-duplicate work |
+| `D-DUP-01` | statistical | Works that may be one work recorded twice: held, outside the score, until evidence decides |
 | `D-DUP-02` | indicator | Repeated low-detail descriptions in one district |
 | `N-NET-01` | indicator | Vendor, implementing-agency or district-authority concentration |
 | `V-REV-01` | 3.2.15 | Work or site changed after sanction |
@@ -191,6 +191,18 @@ difference between a demo and a system an authority could trust:
   identifiers (place names, ward numbers), and **differing numeric locators**
   (culverts at KM 0+400 vs KM 1+200) are treated as evidence *against*
   duplication.
+- **Matching text finds candidates; the record decides.** On 16 Sep 2026, 4,459
+  of the 4,522 duplicate alerts came from a member recommending three or more
+  works with one identical description (benches, high-mast lights, borewells for
+  different villages), and payment records showed such batches paid to different
+  gram panchayats. Now a detail that separates two works clears the pair (numbers
+  or place names only one description carries, amounts at least 10% apart,
+  different panchayats or municipalities paid); a batch of identical works is one
+  held item per work; any other match is held at low severity, outside the risk
+  score, until evidence such as the works' photos decides. Ids, dates, letter
+  numbers, stages and vendors never clear a pair. Measured on copies of the live
+  database the same day: alerts 5,791 → 611, and no work newly became an alert.
+  The photo comparison itself is not built yet.
 - **Cost anomalies need a materiality floor.** 17% of peer groups are degenerate
   (costs concentrated at one value, MAD = 0), so those use a percentile rule.
   A flag also requires ≥30% and ≥₹1 lakh above benchmark.
@@ -537,7 +549,9 @@ The pre-existing endpoints (`/flags/{tier}`, `/flags/case/{id}`, `/synthesis`,
 4. **Agent trace** — the four agents, their measurements and benchmarks, their
    individual risk contributions, feeding the synthesiser.
 5. **Evidence** — the exact numbers and the raw audit trail behind each signal.
-6. **Duplicates** — side-by-side text comparison of the two matching records.
+6. **Duplicates** — this work once, its batch of identical works (amount, who was
+   paid, stage, letter; works paid to the same panchayat marked), and the matched
+   works held for evidence, side by side.
 7. **AI synthesis & action plan** — the evidence-grounded explanation plus a
    staged action plan (IMMEDIATE → NEXT → IF CONCERNS PERSIST → ESCALATION),
    with the deterministic allow-list shown beneath it.

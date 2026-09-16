@@ -381,7 +381,16 @@ duplicates:
   geo_radius_km: 2.0                    # only when lat/long available
   same_scope_keys: [state, district]    # candidate blocking keys
   cross_era_bonus: 0.05                 # migration-era duplication is a known pattern
-  severity: high
+  # Text finds candidates; the record decides (astra/agents/entity_resolution.py).
+  # A text match is never scored by itself: it is cleared by a detail that
+  # separates the two works, grouped into a batch of identical items, or held
+  # at low severity outside the risk score until evidence (such as the works'
+  # photos) shows whether they are one work or two.
+  batch_min_works: 3                    # one member, one exact description, this many works: a batch
+  batch_members_shown: 60               # works of a batch listed on each of its findings
+  amount_differs_pct: 10                # amounts this far apart are two works
+  typo_similarity: 85                   # a word this close to one in the other description is the same word
+  same_body_similarity: 90              # payee names this close are the same panchayat or municipality
   # MPLADS descriptions are templated ("Construction of CC road from X to Y"),
   # so text similarity alone is not evidence of duplication. A pair must also
   # share several RARE tokens (place names, ward numbers, landmarks). Tokens

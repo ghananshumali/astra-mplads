@@ -305,6 +305,22 @@ D-DUP-01:
     actions:
       - "Compare this work's file against work {pair}."
       - "Confirm the two works are at different locations before further release."
+  batch:
+    headline: "One of {size} identical works recommended together"
+    plain: "{mp} recommended {size} works with exactly this description, worth {total} together, under {letters} recommendation letter(s); payments so far went to {payees} payee(s). Identical items for different sites are normal, so these works are not treated as duplicates of each other. The batch is held outside the risk score until the sites are confirmed."
+    metric: "{size} identical works, {total}"
+    benchmark: "a separate site for each work"
+    actions:
+      - "Confirm that each of the {size} works has its own site, for example from the completion photos."
+    same_payee: "Check first: works {works} were all paid to {payee}."
+  held:
+    headline: "Held: matches another work, and nothing recorded tells them apart"
+    plain: "The description is {similarity:.0f}% identical to work {pair}{same_amount}{same_payee}, and no recorded detail separates the two: no different numbers or place names in the descriptions, amounts close together, and no different panchayat or municipality paid. It is held outside the risk score until evidence, such as the works' photos, shows whether they are one work or two."
+    same_payee: ", both paid to {payee}"
+    metric: "{similarity:.0f}% description match, nothing separating"
+    benchmark: "one record per work"
+    actions:
+      - "Compare this work's file and photos with work {pair}."
 
 D-DUP-02:
   headline: "Several works share one vague description"

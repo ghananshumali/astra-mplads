@@ -462,10 +462,13 @@ def test_rbac_engine() -> None:
     check("physical inspection is withheld at low risk",
           "conduct_physical_inspection" not in low)
 
-    # evidence gating
+    # evidence gating: the richest case need not carry a duplicate match (held
+    # duplicate matches add nothing to a score), so one is added where missing
     no_dup = [f for f in findings if not str(f["rule_id"]).startswith("D-")]
+    with_dup = no_dup + [{"rule_id": "D-DUP-01", "agent": "entity_resolution",
+                          "severity": "low", "details": {"held": True}}]
     check("duplicate action requires duplicate evidence",
-          "cross_check_duplicate" in rbac.allowed_ids("district", score, findings)
+          "cross_check_duplicate" in rbac.allowed_ids("district", score, with_dup)
           and "cross_check_duplicate" not in rbac.allowed_ids("district", score, no_dup))
 
     # validation strips anything not permitted

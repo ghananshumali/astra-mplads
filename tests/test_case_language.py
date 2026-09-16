@@ -139,6 +139,15 @@ SAMPLES = [
     finding("D-DUP-01", "entity_resolution", {
         "semantic_sim": 1.0, "pair_work_id": "WS/MP195/2023-2024/23344",
         "evidence_strength": "strong", "same_sanction_amount": True, "this_cost": 106850}),
+    finding("D-DUP-01", "entity_resolution", {
+        "held": True, "semantic_sim": 1.0, "pair_work_id": "WS/MP18335/2024-2025/150941",
+        "evidence_strength": "held", "same_sanction_amount": True, "this_cost": 499206,
+        "shared_payee": "GP Kapisda B"}, severity="low"),
+    finding("D-DUP-01", "entity_resolution", {
+        "batch": True, "held": True, "batch_size": 6, "batch_mp": "RADHE SHYAM RATHIYA",
+        "batch_total": 2994230, "batch_letters": 1, "batch_payees": 5, "evidence_strength": "batch",
+        "same_payee_groups": [{"payee": "GP Kapisda B", "work_ids": [
+            "WS/MP18335/2024-2025/150940", "WS/MP18335/2024-2025/150941"]}]}, severity="low"),
     finding("D-DUP-02", "entity_resolution", {
         "cluster_size": 10, "district": "NANDURBAR", "total_cost": 1700000,
         "normalised_description": "install 2 set of street light"}),
