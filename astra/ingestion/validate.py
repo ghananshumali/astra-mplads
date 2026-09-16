@@ -189,6 +189,27 @@ def reconcile_count(portal_count: int | None, mapped: int, *,
                        "delta": delta, "matched": False})
 
 
+def figure_differences(portal: dict, stored: dict, *,
+                       counts_only: bool = False) -> list[dict]:
+    """Where ASTRA's four tile figures differ from the portal's, if anywhere.
+
+    Both sides map tile -> [count, rupees]; `None` on the portal side means it
+    did not report that figure (expenditure has no count). Rupees are compared
+    to within one rupee: the portal's totals are floating-point sums too.
+    """
+    out = []
+    for tile, (p_count, p_total) in portal.items():
+        s_count, s_total = stored.get(tile) or (None, None)
+        if p_count is not None and tile != "expenditure" and p_count != s_count:
+            out.append({"tile": tile, "measure": "count", "portal": p_count,
+                        "stored": s_count})
+        if (not counts_only and p_total is not None
+                and abs((s_total or 0.0) - p_total) > 1.0):
+            out.append({"tile": tile, "measure": "rupees", "portal": p_total,
+                        "stored": s_total})
+    return out
+
+
 # -------------------------------------------------------------- orchestration
 def validate_shard(tiles: dict[str, list[dict]], *, suspicious_zero: bool = False,
                    portal_count: int | None = None, mapped: int | None = None,

@@ -11,13 +11,17 @@ import type {
   DetectionRow,
   DistrictRow,
   Facets,
+  Freshness,
   LlmStatus,
   PipelineMeta,
+  RecentUpdates,
   StateRow,
   Stats,
   Synthesis,
   Tier,
   WorkRecord,
+  WorkPayments,
+  OpsStatus,
 } from "./types";
 
 export const API_BASE =
@@ -84,25 +88,28 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 export const api = {
   health: () => request<{ platform: string; version: string }>("/"),
 
-  cases: (f: CaseFilters = {}) =>
-    request<CaseListResponse>(`/cases${qs({ ...f })}`),
+  // `lang` asks the backend to write its case text (explanations, synthesis,
+  // action reasons) in that language; English when omitted.
+  cases: (f: CaseFilters = {}, lang?: string) =>
+    request<CaseListResponse>(`/cases${qs({ ...f, lang })}`),
 
-  caseDetail: (flagId: string, tier: Tier) =>
+  caseDetail: (flagId: string, tier: Tier, lang?: string) =>
     request<CaseDetail>(
-      `/flags/case/${encodeURIComponent(flagId)}${qs({ tier })}`,
+      `/flags/case/${encodeURIComponent(flagId)}${qs({ tier, lang })}`,
     ),
 
-  synthesis: (flagId: string, tier: Tier, useLlm = true) =>
+  synthesis: (flagId: string, tier: Tier, lang?: string, useLlm = true) =>
     request<Synthesis>(
       `/flags/case/${encodeURIComponent(flagId)}/synthesis${qs({
         tier,
         use_llm: useLlm,
+        lang,
       })}`,
     ),
 
-  allowedActions: (flagId: string, tier: Tier) =>
+  allowedActions: (flagId: string, tier: Tier, lang?: string) =>
     request<AllowedActions>(
-      `/flags/case/${encodeURIComponent(flagId)}/actions${qs({ tier })}`,
+      `/flags/case/${encodeURIComponent(flagId)}/actions${qs({ tier, lang })}`,
     ),
 
   feedback: (
@@ -133,12 +140,26 @@ export const api = {
   work: (workId: string) =>
     request<WorkRecord>(`/works/${encodeURIComponent(workId)}`),
 
-  agencyWorks: (name: string, limit = 40) =>
-    request<Partial<WorkRecord>[]>(`/agencies/works${qs({ name, limit })}`),
+  /** A work's payment records, oldest first. */
+  payments: (workId: string) =>
+    request<WorkPayments>(`/payments${qs({ work_id: workId })}`),
+
+  /** Works of a network case's actor, by the case's entity id. */
+  agencyWorks: (entityId: string, limit = 40) =>
+    request<Partial<WorkRecord>[]>(
+      `/agencies/works${qs({ entity_id: entityId, limit })}`,
+    ),
 
   dataSource: () => request<DataSource>("/meta/data-source"),
 
-  pipeline: () => request<PipelineMeta>("/meta/pipeline"),
+  freshness: () => request<Freshness>("/meta/freshness"),
+
+  ops: () => request<OpsStatus>("/meta/ops"),
+
+  recentUpdates: (limit = 10) =>
+    request<RecentUpdates>(`/meta/recent-updates${qs({ limit })}`),
+
+  pipeline: (lang?: string) => request<PipelineMeta>(`/meta/pipeline${qs({ lang })}`),
 
   llm: () => request<LlmStatus>("/meta/llm"),
 };

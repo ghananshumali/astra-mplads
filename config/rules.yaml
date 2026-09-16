@@ -1,18 +1,29 @@
 # ASTRA — MPLADS compliance & risk rule configuration
-# Every rule here is DETERMINISTIC and cites the MPLADS Guidelines clause it enforces.
+# Every rule names the paragraph of the MPLADS Guidelines (1 April 2023) it
+# rests on (`para`, indexed in guidelines_2023.yaml) and says what kind of rule
+# it is (`basis`):
+#   guideline            enforces a provision the data lets us check directly
+#   guideline-screening  points at a provision the data cannot check directly
+#   heuristic            ASTRA's own risk indicator; not a scheme rule
 # Thresholds are parameterized so authorities can tune them without code changes.
 # All outputs are RISK FLAGS FOR HUMAN REVIEW — never automated determinations.
 
+guidelines:
+  index: guidelines_2023.yaml
+  citation: "MPLADS Guidelines, 1 April 2023"
+
 scheme:
-  annual_entitlement_cr: 5.0          # Rs 5 crore per MP per year under MPLADS
-  fund_regime: non_lapsable            # funds carry forward; never lapse
+  annual_entitlement_cr: 5.0          # para 2.7: Rs 5 crore per MP per year
+  fund_regime: non_lapsable            # paras 10.2.3, 10.4.4: funds carry forward
 
 rules:
 
   scst_allocation:
     id: R-SCST-01
     title: "SC/ST area allocation minimum"
-    clause: "MPLADS Guidelines 2023: at least 15% of MPLADS funds for areas inhabited by SC population and 7.5% for ST areas"
+    para: "5.4.1"
+    basis: guideline
+    clause: "MPLADS Guidelines 2023, para 5.4.1: works worth at least 15% of the year's entitlement for areas inhabited by Scheduled Castes and 7.5% for Scheduled Tribe areas (para 5.4.2 lets one share substitute for the other)"
     sc_min_pct: 15.0
     st_min_pct: 7.5
     severity: high
@@ -22,11 +33,13 @@ rules:
   # available, this state-level proxy measures the share of MPLADS spend
   # flowing to SC/ST-reserved constituencies. It is a screening indicator that
   # tells a State Nodal Authority where to pull the DA-level ledger - it is
-  # explicitly NOT a finding of non-compliance with para 2.8.
+  # explicitly NOT a finding of non-compliance with para 5.4.1.
   scst_reserved_proxy:
     id: R-SCST-02
     title: "SC/ST reserved-constituency spend share (screening proxy)"
-    clause: "Screening proxy for the MPLADS Guidelines 2023 SC/ST allocation provision (15% / 7.5%) - not a compliance determination"
+    para: "5.4.1"
+    basis: guideline-screening
+    clause: "Screening proxy for MPLADS Guidelines 2023, para 5.4.1 (15% / 7.5% for SC/ST areas) - not a compliance determination"
     sc_min_pct: 15.0
     st_min_pct: 7.5
     min_state_expenditure: 50000000     # Rs 5 crore before a state share is meaningful
@@ -36,50 +49,71 @@ rules:
   completion_norm:
     id: R-TIME-01
     title: "One-year work completion norm"
-    clause: "MPLADS Guidelines 2023: sanctioned works are to be completed within one year of sanction"
+    para: "3.2.12"
+    basis: guideline
+    clause: "MPLADS Guidelines 2023, para 3.2.12: the completion time in the sanction letter should generally not exceed one year; a longer period needs justification recorded in the sanction letter"
     max_days: 365
+    # Not a guideline limit. The guidelines allow justified exceptions to the
+    # one-year norm (para 3.2.12); 18 months is ASTRA's marker for escalating
+    # severity, borrowed from the 18-month limits in paras 8.12.1 and 10.6.1.
     outer_limit_days: 548
+    outer_limit_basis: heuristic
     severity: medium
     overdue_severity: high              # beyond outer limit
 
   prohibited_works:
     id: R-PROH-01
     title: "Prohibited work category"
-    clause: "MPLADS Guidelines 2023: negative list of works not permissible under the scheme"
+    para: "5.2"
+    basis: guideline
+    clause: "MPLADS Guidelines 2023, para 5.2: works not permissible under MPLADS"
     severity: critical
+    # Each term maps to the paragraph of the 2023 negative list (5.2.1-5.2.14)
+    # it indicates, and every finding cites that paragraph.
+    #
+    # Removed on 13 Sep 2026 after checking the 2023 text, because they were
+    # flagging permitted works: "repair of" and "renovation of" (para 5.1.9
+    # permits repair and renovation, capped by R-REPAIR-01), "office building"
+    # (the portal's own category "Construction of Government office buildings"
+    # is permissible), and "memorial", "statue", "purchase of inventory" and
+    # "naming of", none of which the 2023 negative list names. Naming an asset
+    # after a person (5.2.4) cannot be read from a work description.
+    #
     # ASSET patterns: the term must be the thing actually being BUILT. MPLADS
     # descriptions constantly use religious buildings as landmarks ("hall near
     # X temple", "road from Y church"), so these are matched only against the
     # head asset phrase that follows the construction verb.
     asset_patterns:
-      - "temple"
-      - "mandir"
-      - "mosque"
-      - "masjid"
-      - "church"
-      - "gurudwara"
-      - "gurdwara"
-      - "religious"
-      - "memorial"
-      - "statue"
-      - "idol"
-      - "gate of honour"
-      - "welcome gate"
-      - "office building"
-      - "residential building"
-      - "commercial establishment"
+      "temple": "5.2.11"
+      "mandir": "5.2.11"
+      "mosque": "5.2.11"
+      "masjid": "5.2.11"
+      "church": "5.2.11"
+      "gurudwara": "5.2.11"
+      "gurdwara": "5.2.11"
+      "religious": "5.2.11"
+      "idol": "5.2.11"
+      "welcome gate": "5.2.12"
+      "swagat dwar": "5.2.12"
+      "swagat dwaar": "5.2.12"
+      "gate of honour": "5.2.12"
+      "residential building": "5.2.2"
+      "residential quarters": "5.2.2"
+      "commercial establishment": "5.2.3"
     # ACTIVITY patterns: these describe the NATURE of the expenditure rather
     # than an asset, so they are matched against the description directly.
-    # Operation & maintenance is the state's responsibility, not MPLADS.
     activity_patterns:
-      - "maintenance of"
-      - "repair of"
-      - "renovation of"
-      - "land acquisition"
-      - "grants and loans"
-      - "recurring expenditure"
-      - "purchase of inventory"
-      - "naming of"
+      "maintenance of": "5.2.1"
+      "operation and maintenance": "5.2.1"
+      "land acquisition": "5.2.7"
+      "acquisition of land": "5.2.7"
+      "compensation for land": "5.2.7"
+      "grants and loans": "5.2.5"
+      "relief fund": "5.2.6"
+      "reimbursement": "5.2.8"
+      "unauthorised colony": "5.2.13"
+      "unauthorized colony": "5.2.13"
+      "recurring expenditure": "5.2.14"
     activity_severity: medium
     # nouns that identify a permissible asset; if one of these heads the work,
     # a religious term elsewhere in the text is a landmark, not the asset
@@ -183,16 +217,42 @@ rules:
 
   cost_ceiling:
     id: R-COST-01
-    title: "Per-work cost ceiling / floor checks"
-    clause: "MPLADS Guidelines 2023: no work costing less than Rs 1 lakh is permissible under the scheme"
-    min_work_cost: 100000               # Rs 1 lakh floor (verified against the 2023 guidelines)
-    max_work_cost: 25000000             # Rs 2.5 crore soft ceiling for a single work (flag, human reviews)
-    severity: medium
+    title: "Work sanctioned below the normal minimum value"
+    para: "3.2.9"
+    basis: guideline
+    clause: "MPLADS Guidelines 2023, para 3.2.9: a work should normally be sanctioned for at least Rs 2.5 lakh; a smaller sanction is allowed when the district authority records its reasons in the sanction letter"
+    # Rs 2.5 lakh, per para 3.2.9. An earlier revision of this file used Rs 1
+    # lakh and wrongly called it verified against the 2023 guidelines.
+    min_work_cost: 250000
+    # The minimum concerns the SANCTIONED amount. A work awaiting sanction
+    # carries only the MP's recommended amount, which the district may revise.
+    sanctioned_only: true
+    # Low: the guideline itself allows smaller works with recorded reasons, so
+    # each finding asks for that record rather than asserting a breach.
+    severity: low
+    # 35,295 sanctioned works fall below Rs 2.5 lakh (13 Sep 2026). As separate
+    # cases they would bury the review queue, so a work's finding joins its case
+    # only when the work has another finding, and each district authority gets
+    # one case summarising its count, share and example works.
+    standalone: false
+    district_summary_min_works: 10
+    # Not a guideline limit: the 2023 guidelines set no maximum for a single
+    # work. Above this marker ASTRA suggests checking the detailed estimate.
+    max_work_cost: 25000000
+    max_basis: heuristic
+    max_severity: low
 
+  # Both fund-series rules below measure spending on works RECOMMENDED in a
+  # financial year (the year in the work code) against that year's
+  # entitlement. That is not the year the money was paid, and a year whose
+  # works are still being executed always looks under-spent. So only
+  # financial years that have ended, and that carry an entitlement, are used.
   utilization_spike:
     id: R-SPIKE-01
     title: "Non-lapsable fund utilization spike"
-    clause: "Risk heuristic: MPLADS funds never lapse, so a sudden year-end/terminal-year spike after low utilization is the true risk signal, not high spending per se"
+    para: "10.4.4"
+    basis: heuristic
+    clause: "Risk heuristic under the non-lapsable fund regime (MPLADS Guidelines 2023, paras 10.2.3 and 10.4.4): a sudden spike after low-utilisation years is the risk signal, not high spending per se"
     low_util_pct: 40.0                  # 'dormant' years threshold
     spike_util_pct: 65.0                # spike year threshold
     min_dormant_years: 2                # at least this many consecutive low years before the spike
@@ -202,15 +262,77 @@ rules:
   unspent_pileup:
     id: R-PILE-01
     title: "Chronic under-utilization (funds idling)"
-    clause: "Inefficiency signal: cumulative utilization far below releases over multiple years"
+    para: "10.4.4"
+    basis: heuristic
+    clause: "Inefficiency heuristic under the carry-forward provision (MPLADS Guidelines 2023, para 10.4.4): cumulative spending far below entitlement over several completed years"
     max_cum_util_pct: 50.0
     min_years: 3
+    severity: medium
+
+  sanction_timeline:
+    id: R-SANC-01
+    title: "Recommendation awaiting sanction beyond 45 days"
+    para: "3.2.4"
+    basis: guideline
+    clause: "MPLADS Guidelines 2023, para 3.2.4: sanction or rejection within 45 days of receiving the recommendation; para 3.2.6 excludes model code of conduct periods"
+    max_days: 45
+    # Days run from the recommendation date the portal records, which can be
+    # earlier than receipt by the implementing district, and model code of
+    # conduct periods are not excluded because ASTRA holds no calendar of
+    # them. The count is therefore an upper bound: low severity, and every
+    # finding says so.
+    severity: low
+    # Like R-COST-01: 20,974 recommendations were waiting beyond 45 days on
+    # 13 Sep 2026, so the per-work finding joins an existing case, and each
+    # district authority gets one case for its backlog.
+    standalone: false
+    district_summary_min_works: 10
+    district_pattern:
+      id: R-SANC-02
+      title: "District's sanctions routinely take longer than 45 days"
+      para: "3.2.4"
+      basis: guideline-screening
+      clause: "Screening indicator for MPLADS Guidelines 2023, para 3.2.4: the district authority's typical time from recommendation to sanction"
+      min_sanctioned_works: 20
+      median_days_over: 45
+      severity: medium
+
+  repair_cap:
+    id: R-REPAIR-01
+    title: "Repair and renovation above Rs 50 lakh in a year"
+    para: "5.1.9"
+    basis: guideline
+    clause: "MPLADS Guidelines 2023, para 5.1.9: repair and renovation of immovable assets is permitted up to Rs 50 lakh a year per MP for all such works together"
+    yearly_cap: 5000000
+    # A work counts if the portal classes it as `category`, or if its activity
+    # type or description matches `patterns`: the two disagree often, and a
+    # repair recorded under another category is still a repair. A year over
+    # the cap only because of works of the second kind is reported at
+    # `described_only_severity`. Findings name the works counted each way.
+    category: "Repair and Renovation"
+    patterns: ["repair", "renovation", "renovate", "marammat"]
+    severity: medium
+    described_only_severity: low
+
+  trust_cap:
+    id: R-TRUST-01
+    title: "Societies and trusts above Rs 50 lakh in a year"
+    para: "6.2.6.2"
+    basis: guideline
+    clause: "MPLADS Guidelines 2023, para 6.2.6.2: an MP can recommend up to Rs 50 lakh a year to all societies and trusts together"
+    yearly_cap: 5000000
+    # Works the portal classes as this category. The same paragraph's Rs 1
+    # crore a term per society or trust is not checked: works do not name the
+    # society or trust.
+    category: "Trust and Society"
     severity: medium
 
 anomaly:
   cost_overrun:
     id: A-COST-01
     title: "Cost anomaly vs peer benchmark (SoR proxy)"
+    para: "3.2.13"
+    basis: statistical
     method: "robust z-score (median/MAD) within state x category x era peer group; IsolationForest cross-check"
     z_threshold: 2.5
     iforest_contamination: 0.02
@@ -233,12 +355,27 @@ anomaly:
   expenditure_pattern:
     id: A-EXP-01
     title: "Expenditure pattern outlier"
+    basis: statistical
     z_threshold: 3.0
+    severity: medium
+  peer_profile:
+    id: A-PEER-01
+    title: "Unusual combination of time and payments for this work type"
+    basis: statistical
+    clause: "Statistical indicator: a work that is extreme on two or more of time to sanction, time to complete, share of the sanction paid and number of payments, compared with works of the same type in the same state"
+    # Cost alone is A-COST-01's job; this looks for works unusual on SEVERAL
+    # measures at once, and names the measures. Isolation Forest only
+    # corroborates: it never raises a finding by itself.
+    z_threshold: 3.0
+    min_features: 2
+    min_peer_group: 30
+    iforest_contamination: 0.01
     severity: medium
 
 duplicates:
   id: D-DUP-01
   title: "Duplicate / near-duplicate work"
+  basis: statistical
   semantic_threshold: 0.80              # TF-IDF char-ngram cosine
   fuzzy_threshold: 88                   # rapidfuzz token_set_ratio 0-100
   geo_radius_km: 2.0                    # only when lat/long available
@@ -261,15 +398,124 @@ duplicates:
   generic_cluster:
     id: D-DUP-02
     title: "Repeated low-detail work descriptions in one district"
+    basis: heuristic
     min_cluster_size: 8
     severity: medium
 
+revisions:
+  # Edits the poller observed on the portal (work_versions). The portal
+  # publishes no history, so nothing before ASTRA began polling is visible.
+  # Normal progress (payments arriving, stages advancing, a completion date
+  # being filled in, the first vendor appearing) is never treated as a revision.
+  post_sanction_change:
+    id: V-REV-01
+    title: "Work or site changed after sanction"
+    para: "3.2.15"
+    basis: guideline
+    clause: "MPLADS Guidelines 2023, para 3.2.15: once a work is sanctioned, no change to the work or its site is allowed"
+    fields: [description, category, work_type, district, state, constituency]
+    severity: medium
+  amount_revision:
+    id: V-AMT-01
+    title: "Work amount revised after sanction"
+    para: "3.2.3"
+    basis: heuristic
+    clause: "Risk heuristic: a sanctioned amount that changes later. Para 3.2.3 requires the MP's consent when an estimate exceeds the amount recommended."
+    min_pct: 10.0
+    min_abs: 100000
+    severity: medium
+    downward_severity: low
+    year_end_days: 15
+  agency_change:
+    id: V-IA-01
+    title: "Implementing district authority changed after sanction"
+    para: "3.2.10"
+    basis: heuristic
+    clause: "Risk heuristic: the district authority executing a sanctioned work changed (para 3.2.10 assigns selection of the executing agency to that authority)"
+    severity: medium
+  vendor_switch:
+    id: V-VEN-01
+    title: "Main vendor on a work changed"
+    para: "3.2.13"
+    basis: heuristic
+    clause: "Risk heuristic: the vendor paid the most on a work changed (para 3.2.13 requires vendors to be selected through open bidding)"
+    severity: low
+    relabel_severity: medium
+  payment_reversal:
+    id: V-PAY-01
+    title: "Payments recorded against a work went down"
+    para: "10.7.1"
+    basis: heuristic
+    clause: "Risk heuristic: the total paid to vendors on a work decreased (para 10.7.1: payments go directly to vendors)"
+    min_abs: 1000
+    severity: medium
+  removed_after_payment:
+    id: V-LIST-01
+    title: "Work with payments no longer listed on the portal"
+    para: "3.2.19"
+    basis: heuristic
+    clause: "Risk heuristic: a work that had received payments stopped being listed by the portal (para 3.2.19 requires stoppage or abandonment to be referred to the State Nodal Authority)"
+    severity: medium
+  revision_frequency:
+    id: V-FREQ-01
+    title: "Unusually many revisions on one work"
+    basis: heuristic
+    clause: "Statistical indicator: revisions on a work compared with works of the same type"
+    # Stands down until the observed history is long and broad enough to
+    # compare against; with a few weeks of polling every work looks unusual.
+    min_history_days: 90
+    min_revised_works: 200
+    min_revisions: 3
+    z_threshold: 3.0
+    severity: low
+
+payments:
+  # Individual payment records (db.payments): date, amount, vendor, status.
+  # The portal gives a payment no id and no reason; each finding is a prompt to
+  # look at the payment orders.
+  before_sanction:
+    id: P-SEQ-01
+    title: "Payment dated before the work was sanctioned"
+    basis: heuristic
+    clause: "Data-integrity indicator: payments are made against sanctioned works, so a payment dated before the sanction means one of the two dates is wrong"
+    severity: high
+  after_completion:
+    id: P-LATE-01
+    title: "Payments long after the work was completed"
+    para: "11.2"
+    basis: guideline-screening
+    clause: "Screening indicator for MPLADS Guidelines 2023, para 11.2: on completion of a work the implementing agency finalises its accounts quickly"
+    min_days: 180
+    severity: low
+  repeated:
+    id: P-DUP-01
+    title: "Same payment recorded more than once"
+    para: "10.7.1"
+    basis: heuristic
+    clause: "Risk heuristic: the same amount paid to the same vendor on the same day more than once on one work (para 10.7.1: payments go directly to vendors once the implementing agency authorises them)"
+    # repeats worth at least this in total are reported at material_severity
+    material_amount: 100000
+    severity: low
+    material_severity: medium
+
+data_confidence:
+  # Findings on works from an area that is not in exact parity with the portal,
+  # whose latest read failed or was held back, that is waiting to confirm
+  # removals, or that has failed to read successfully for this long, are marked
+  # "reduced confidence" rather than hidden. Time since the last re-read is not
+  # a reason: the minute check confirms unchanged areas' figures continuously.
+  stale_after_hours: 36
+
 network:
   id: N-NET-01
-  title: "Implementing-agency / vendor concentration"
+  title: "Vendor, agency or district-authority concentration"
+  basis: heuristic
   min_works: 5
-  overrun_share_threshold: 0.5          # >50% of an IA's works flagged for overrun
-  district_spread_threshold: 4          # same IA across >4 districts is unusual for local works
+  overrun_share_threshold: 0.5          # >50% of an actor's works flagged for overrun
+  district_spread_threshold: 4          # same vendor across >4 districts is unusual for local works
+  # Actors for which wide geographic spread is a signal. Not implementing
+  # agencies: state bodies execute works across their state by design.
+  spread_actors: [vendor, district_authority]
   severity: medium
 
 risk_score:

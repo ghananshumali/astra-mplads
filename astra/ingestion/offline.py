@@ -337,10 +337,17 @@ def build_fundflows(works: pd.DataFrame) -> pd.DataFrame:
         st_works=("is_st_constituency", "max"),
     ).reset_index()
 
-    years_per_mp = ff.groupby(["constituency", "mp_name"])["fy"].transform("nunique")
+    years_per_mp = ff.groupby(["constituency", "mp_name"],
+                              dropna=False)["fy"].transform("nunique")
+
+    def _text(value) -> str:
+        # `value or ""` is not enough: a missing value arrives as a NaN float,
+        # which is truthy. Rajya Sabha works from the live path have no
+        # constituency, so this is reached on every RS member.
+        return value.upper() if isinstance(value, str) else ""
 
     def _entitlement(row, n_years):
-        key = ((row["constituency"] or "").upper(), (row["mp_name"] or "").upper())
+        key = (_text(row["constituency"]), _text(row["mp_name"]))
         total = alloc_map.get(key)
         if total is None or np.isnan(total):
             return np.nan

@@ -23,7 +23,10 @@ import {
   SkeletonRows,
   StatusChip,
 } from "../components/ui";
-import { AGENT_META, STATUS_META, TIERS, compact } from "../lib/format";
+import { useI18n } from "../i18n/context";
+import { agentText, ruleTitle } from "../i18n/labels";
+import { T } from "../i18n/T";
+import { AGENT_COLOR, REVIEW_STATUSES, compact } from "../lib/format";
 import { useAuthority } from "../state/AuthorityContext";
 import "./pages.css";
 
@@ -40,6 +43,8 @@ function useDebounced<T>(value: T, ms = 300): T {
 }
 
 export default function Cases() {
+  const i18n = useI18n();
+  const { t } = i18n;
   const nav = useNavigate();
   const { flagId } = useParams();
   const [params, setParams] = useSearchParams();
@@ -94,9 +99,10 @@ export default function Cases() {
     stateFilter, districtFilter,
   ]);
 
+  const lang = i18n.language.code;
   const list = useQuery({
-    queryKey: ["cases", filters],
-    queryFn: () => api.cases(filters),
+    queryKey: ["cases", filters, lang],
+    queryFn: () => api.cases(filters, lang),
     placeholderData: (prev) => prev,
   });
 
@@ -127,9 +133,9 @@ export default function Cases() {
       <div className="cases-list stack gap-4">
         <header className="page-head" style={{ marginBottom: 0 }}>
           <div>
-            <h1 className="page-title">Risk cases</h1>
+            <h1 className="page-title">{t("cases.title")}</h1>
             <p className="page-sub">
-              {TIERS[tier].short} scope · {scopeLabel}
+              {t("cases.scope", { tier: t(`tier.${tier}.short`), scope: scopeLabel })}
             </p>
           </div>
         </header>
@@ -140,7 +146,7 @@ export default function Cases() {
               <Search size={14} />
               <input
                 className="input"
-                placeholder="Search work code, title or district…"
+                placeholder={t("cases.search")}
                 value={search}
                 onChange={(e) => setSearch(e.target.value)}
               />
@@ -149,14 +155,14 @@ export default function Cases() {
               className={`btn btn-sm${showFilters ? " btn-primary" : ""}`}
               onClick={() => setShowFilters((f) => !f)}
             >
-              <Filter size={13} /> Filters
+              <Filter size={13} /> {t("cases.filters")}
               {activeFilters > 0 && (
                 <span className="tab-count">{activeFilters}</span>
               )}
             </button>
             {activeFilters > 0 && (
               <button className="btn btn-sm btn-ghost" onClick={clearAll}>
-                <X size={13} /> Clear
+                <X size={13} /> {t("cases.clear")}
               </button>
             )}
           </div>
@@ -164,7 +170,7 @@ export default function Cases() {
           {showFilters && (
             <div className="filter-panel fade-in">
               <div className="filter-field">
-                <label className="field-label">Minimum risk score</label>
+                <label className="field-label">{t("cases.minScore")}</label>
                 <div className="row gap-3">
                   <input
                     type="range"
@@ -182,9 +188,9 @@ export default function Cases() {
               </div>
 
               <div className="filter-field">
-                <label className="field-label">Review status</label>
+                <label className="field-label">{t("cases.reviewStatus")}</label>
                 <div className="row gap-2" style={{ flexWrap: "wrap" }}>
-                  {(Object.keys(STATUS_META) as ReviewStatus[]).map((s) => (
+                  {REVIEW_STATUSES.map((s) => (
                     <button
                       key={s}
                       className={`pill${statuses.includes(s) ? " on" : ""}`}
@@ -196,61 +202,62 @@ export default function Cases() {
                         )
                       }
                     >
-                      {STATUS_META[s].short}
+                      {t(`status.${s}.short`)}
                     </button>
                   ))}
                 </div>
               </div>
 
               <div className="filter-field">
-                <label className="field-label">Detection type</label>
+                <label className="field-label">{t("cases.detectionType")}</label>
                 <div className="row gap-2" style={{ flexWrap: "wrap" }}>
                   {(facets.data?.rules ?? [])
                     .filter((r) => r.count > 0)
-                    .map((r) => (
-                      <button
-                        key={r.rule_id}
-                        className={`pill${rules.includes(r.rule_id) ? " on" : ""}`}
-                        title={r.title}
-                        onClick={() =>
-                          setRules((cur) =>
-                            cur.includes(r.rule_id)
-                              ? cur.filter((x) => x !== r.rule_id)
-                              : [...cur, r.rule_id],
-                          )
-                        }
-                      >
-                        {r.title.length > 34
-                          ? `${r.title.slice(0, 34)}…`
-                          : r.title}
-                      </button>
-                    ))}
+                    .map((r) => {
+                      const title = ruleTitle(i18n, r.rule_id, r.title);
+                      return (
+                        <button
+                          key={r.rule_id}
+                          className={`pill${rules.includes(r.rule_id) ? " on" : ""}`}
+                          title={title}
+                          onClick={() =>
+                            setRules((cur) =>
+                              cur.includes(r.rule_id)
+                                ? cur.filter((x) => x !== r.rule_id)
+                                : [...cur, r.rule_id],
+                            )
+                          }
+                        >
+                          {title.length > 34 ? `${title.slice(0, 34)}…` : title}
+                        </button>
+                      );
+                    })}
                 </div>
               </div>
 
               {tier === "ministry" && (
                 <div className="row gap-3" style={{ flexWrap: "wrap" }}>
                   <div className="filter-field grow">
-                    <label className="field-label">State</label>
+                    <label className="field-label">{t("cases.state")}</label>
                     <select
                       className="select"
                       value={stateFilter}
                       onChange={(e) => setStateFilter(e.target.value)}
                     >
-                      <option value="">All states</option>
+                      <option value="">{t("scope.allStates")}</option>
                       {(facets.data?.states ?? []).map((s) => (
                         <option key={s}>{s}</option>
                       ))}
                     </select>
                   </div>
                   <div className="filter-field grow">
-                    <label className="field-label">District</label>
+                    <label className="field-label">{t("cases.district")}</label>
                     <select
                       className="select"
                       value={districtFilter}
                       onChange={(e) => setDistrictFilter(e.target.value)}
                     >
-                      <option value="">All districts</option>
+                      <option value="">{t("cases.allDistricts")}</option>
                       {(facets.data?.districts ?? []).map((d) => (
                         <option key={d}>{d}</option>
                       ))}
@@ -269,12 +276,12 @@ export default function Cases() {
             <SkeletonRows rows={8} />
           ) : total === 0 ? (
             <Empty
-              title="No cases match these filters"
-              hint="Widen the filters, clear the search, or switch authority scope."
+              title={t("cases.empty")}
+              hint={t("cases.emptyHint")}
               action={
                 activeFilters > 0 ? (
                   <button className="btn btn-sm" onClick={clearAll}>
-                    Clear filters
+                    {t("cases.clearFilters")}
                   </button>
                 ) : undefined
               }
@@ -291,7 +298,7 @@ export default function Cases() {
                         style={{ width: 96 }}
                       >
                         <span className="row gap-1">
-                          Risk
+                          {t("cases.col.risk")}
                           {order === "risk" ? (
                             <ArrowDown size={11} />
                           ) : order === "risk_asc" ? (
@@ -299,16 +306,16 @@ export default function Cases() {
                           ) : null}
                         </span>
                       </th>
-                      <th>Case</th>
+                      <th>{t("cases.col.case")}</th>
                       <th
                         className="sortable"
                         style={{ width: 190 }}
                         onClick={() => sortBy("state")}
                       >
-                        Location
+                        {t("cases.col.location")}
                       </th>
-                      <th style={{ width: 148 }}>Signals</th>
-                      <th style={{ width: 110 }}>Status</th>
+                      <th style={{ width: 148 }}>{t("cases.col.signals")}</th>
+                      <th style={{ width: 110 }}>{t("cases.col.status")}</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -341,9 +348,9 @@ export default function Cases() {
                               <span
                                 key={a}
                                 className="agent-dot"
-                                title={AGENT_META[a]?.label ?? a}
+                                title={agentText(i18n, a, "label")}
                                 style={{
-                                  background: AGENT_META[a]?.color ?? "var(--text-3)",
+                                  background: AGENT_COLOR[a] ?? "var(--text-3)",
                                 }}
                               />
                             ))}
@@ -363,7 +370,14 @@ export default function Cases() {
 
               <div className="pager">
                 <span className="text-sm muted">
-                  <b>{compact(total)}</b> cases · page {page + 1} of {pages}
+                  <T
+                    k="cases.pager"
+                    values={{
+                      total: <b>{compact(total)}</b>,
+                      page: compact(page + 1),
+                      pages: compact(pages),
+                    }}
+                  />
                 </span>
                 <div className="row gap-2">
                   <button
@@ -371,14 +385,14 @@ export default function Cases() {
                     disabled={page === 0}
                     onClick={() => setPage((p) => Math.max(0, p - 1))}
                   >
-                    <ChevronLeft size={13} /> Prev
+                    <ChevronLeft size={13} className="flip-rtl" /> {t("cases.prev")}
                   </button>
                   <button
                     className="btn btn-sm"
                     disabled={page + 1 >= pages}
                     onClick={() => setPage((p) => p + 1)}
                   >
-                    Next <ChevronRight size={13} />
+                    {t("cases.next")} <ChevronRight size={13} className="flip-rtl" />
                   </button>
                 </div>
               </div>
@@ -392,10 +406,7 @@ export default function Cases() {
           <CaseDetail flagId={flagId} onClose={() => nav("/cases")} />
         ) : (
           <Card>
-            <Empty
-              title="Select a case to investigate"
-              hint="Choose a case from the list to see why it was flagged, the evidence behind it, and the actions available to your authority."
-            />
+            <Empty title={t("cases.select")} hint={t("cases.selectHint")} />
           </Card>
         )}
       </aside>

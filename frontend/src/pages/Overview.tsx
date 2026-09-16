@@ -29,7 +29,10 @@ import {
   Skeleton,
   Tip,
 } from "../components/ui";
-import { RISK_META, TIERS, compact } from "../lib/format";
+import { useI18n } from "../i18n/context";
+import { ruleTitle } from "../i18n/labels";
+import { T } from "../i18n/T";
+import { RISK_META, compact, riskLevel } from "../lib/format";
 import { useAuthority } from "../state/AuthorityContext";
 import "./pages.css";
 
@@ -93,6 +96,8 @@ function Kpi({
 
 /* ------------------------------------------------------------- overview */
 export default function Overview() {
+  const i18n = useI18n();
+  const { t } = i18n;
   const nav = useNavigate();
   const { tier, scopeFilters, scopeLabel } = useAuthority();
 
@@ -115,9 +120,9 @@ export default function Overview() {
     queryFn: () => api.detections(scopeFilters),
   });
   const topCases = useQuery({
-    queryKey: ["top-cases", scopeFilters],
+    queryKey: ["top-cases", scopeFilters, i18n.language.code],
     queryFn: () =>
-      api.cases({ ...scopeFilters, order: "risk", limit: 6, min_score: 40 }),
+      api.cases({ ...scopeFilters, order: "risk", limit: 6, min_score: 40 }, i18n.language.code),
   });
 
   const s = stats.data;
@@ -128,9 +133,9 @@ export default function Overview() {
 
   const bandData = s
     ? [
-        { name: "High", value: s.high, fill: RISK_META.high.color },
-        { name: "Medium", value: s.medium, fill: RISK_META.medium.color },
-        { name: "Low", value: s.low, fill: RISK_META.low.color },
+        { name: t("band.high"), value: s.high, fill: RISK_META.high.color },
+        { name: t("band.medium"), value: s.medium, fill: RISK_META.medium.color },
+        { name: t("band.low"), value: s.low, fill: RISK_META.low.color },
       ].filter((d) => d.value > 0)
     : [];
 
@@ -138,9 +143,11 @@ export default function Overview() {
     <div className="stack gap-5">
       <header className="page-head">
         <div>
-          <h1 className="page-title">{TIERS[tier].short} overview</h1>
+          <h1 className="page-title">
+            {t("overview.title", { tier: t(`tier.${tier}.short`) })}
+          </h1>
           <p className="page-sub">
-            {TIERS[tier].lens} · <span className="semibold">{scopeLabel}</span>
+            {t(`tier.${tier}.lens`)} · <span className="semibold">{scopeLabel}</span>
           </p>
         </div>
       </header>
@@ -151,31 +158,31 @@ export default function Overview() {
         <>
           <div className="kpi-grid">
             <Kpi
-              label="Works analysed"
+              label={t("overview.kpi.works")}
               value={s?.corpus.works ?? 0}
-              hint="Official MPLADS work records in the analysed corpus"
+              hint={t("overview.kpi.worksHint")}
               icon={<Layers size={18} />}
               loading={stats.isLoading}
             />
             <Kpi
-              label="Risk cases"
+              label={t("overview.kpi.cases")}
               value={s?.total ?? 0}
-              hint="Cases raised by the agents within your authority scope"
+              hint={t("overview.kpi.casesHint")}
               icon={<FileSearch size={18} />}
               onClick={() => goCases()}
               loading={stats.isLoading}
             />
             <Kpi
-              label="High risk"
+              label={t("overview.kpi.high")}
               value={s?.high ?? 0}
-              hint="Composite risk score of 70 or above"
+              hint={t("overview.kpi.highHint")}
               icon={<ShieldAlert size={18} />}
               tone="danger"
               onClick={() => goCases({ min: "70" })}
               loading={stats.isLoading}
             />
             <Kpi
-              label="Under review"
+              label={t("overview.kpi.underReview")}
               value={s?.under_review ?? 0}
               icon={<ClipboardCheck size={18} />}
               tone="warn"
@@ -183,7 +190,7 @@ export default function Overview() {
               loading={stats.isLoading}
             />
             <Kpi
-              label="Reviewed / closed"
+              label={t("overview.kpi.closed")}
               value={s?.closed ?? 0}
               icon={<ClipboardCheck size={18} />}
               tone="success"
@@ -194,9 +201,7 @@ export default function Overview() {
 
           {s && s.total === 0 && (
             <Banner tone="neutral">
-              No risk cases fall within <b>{scopeLabel}</b>. Choose a different
-              scope from the authority menu, or switch to the Ministry view to
-              see the national picture.
+              <T k="overview.noCases" values={{ scope: <b>{scopeLabel}</b> }} />
             </Banner>
           )}
 
@@ -204,8 +209,8 @@ export default function Overview() {
             {/* --------------------------------------------- geography */}
             {tier === "ministry" && (
               <Card
-                title="States by high-risk cases"
-                subtitle="Ranked by high-risk cases · click a bar to drill in"
+                title={t("overview.states.title")}
+                subtitle={t("overview.states.sub")}
               >
                 {states.isLoading ? (
                   <Skeleton h={260} />
@@ -240,15 +245,16 @@ export default function Overview() {
                         cursor={{ fill: "var(--navy-50)" }}
                         contentStyle={tooltipStyle}
                         formatter={((v: unknown, _n: unknown, item: unknown) => [
-                          `${v} high risk of ${
-                            rowOf<StateRow>(item)?.flags ?? "?"
-                          } cases`,
-                          "State",
+                          t("overview.states.tooltip", {
+                            high: String(v),
+                            total: String(rowOf<StateRow>(item)?.flags ?? "?"),
+                          }),
+                          t("chart.state"),
                         ]) as never}
                       />
                       <Bar
                         dataKey="high_risk"
-                        name="High risk"
+                        name={t("chart.highRisk")}
                         fill={RISK_META.high.color}
                         radius={[0, 3, 3, 0]}
                         cursor="pointer"
@@ -267,20 +273,20 @@ export default function Overview() {
               <Card
                 title={
                   tier === "state"
-                    ? "Districts by high-risk cases"
-                    : "Risk distribution in your scope"
+                    ? t("overview.districts.title")
+                    : t("overview.bands.title")
                 }
                 subtitle={
                   tier === "state"
-                    ? "Cross-district comparison for your state"
-                    : "Where your open cases sit on the risk scale"
+                    ? t("overview.districts.sub")
+                    : t("overview.bands.sub")
                 }
               >
                 {tier === "state" ? (
                   districts.isLoading ? (
                     <Skeleton h={260} />
                   ) : (districts.data ?? []).length === 0 ? (
-                    <Empty title="No district cases in this state" />
+                    <Empty title={t("overview.districts.empty")} />
                   ) : (
                     <ResponsiveContainer width="100%" height={280}>
                       <BarChart
@@ -310,15 +316,16 @@ export default function Overview() {
                           cursor={{ fill: "var(--navy-50)" }}
                           contentStyle={tooltipStyle}
                           formatter={((v: unknown, _n: unknown, item: unknown) => [
-                            `${v} of ${
-                              rowOf<DistrictRow>(item)?.flags ?? "?"
-                            } cases`,
-                            "High risk",
+                            t("overview.districts.tooltip", {
+                              value: String(v),
+                              total: String(rowOf<DistrictRow>(item)?.flags ?? "?"),
+                            }),
+                            t("chart.highRisk"),
                           ]) as never}
                         />
                         <Bar
                           dataKey="flags"
-                          name="Cases"
+                          name={t("chart.cases")}
                           fill="var(--navy-300)"
                           radius={[0, 3, 3, 0]}
                           cursor="pointer"
@@ -331,7 +338,7 @@ export default function Overview() {
                     </ResponsiveContainer>
                   )
                 ) : bandData.length === 0 ? (
-                  <Empty title="No cases in scope" />
+                  <Empty title={t("overview.bands.empty")} />
                 ) : (
                   <ResponsiveContainer width="100%" height={280}>
                     <BarChart data={bandData} margin={{ left: 0, right: 8 }}>
@@ -351,7 +358,7 @@ export default function Overview() {
                         cursor={{ fill: "var(--navy-50)" }}
                         contentStyle={tooltipStyle}
                       />
-                      <Bar dataKey="value" name="Cases" radius={[4, 4, 0, 0]}>
+                      <Bar dataKey="value" name={t("chart.cases")} radius={[4, 4, 0, 0]}>
                         {bandData.map((d) => (
                           <Cell key={d.name} fill={d.fill} cursor="pointer" />
                         ))}
@@ -364,13 +371,13 @@ export default function Overview() {
 
             {/* --------------------------------------------- detections */}
             <Card
-              title="What is being detected"
-              subtitle="Click a detection type to filter the case list"
+              title={t("overview.detections.title")}
+              subtitle={t("overview.detections.sub")}
             >
               {detections.isLoading ? (
                 <Skeleton h={260} />
               ) : (detections.data ?? []).length === 0 ? (
-                <Empty title="No detections in scope" />
+                <Empty title={t("overview.detections.empty")} />
               ) : (
                 <div className="det-list">
                   {(detections.data ?? []).slice(0, 8).map((d) => {
@@ -378,14 +385,15 @@ export default function Overview() {
                       ...(detections.data ?? []).map((x) => x.count),
                       1,
                     );
+                    const title = ruleTitle(i18n, d.rule_id, d.title);
                     return (
                       <button
                         key={d.rule_id}
                         className="det-row"
                         onClick={() => goCases({ rule: d.rule_id })}
                       >
-                        <span className="det-name" title={d.title}>
-                          {d.title}
+                        <span className="det-name" title={title}>
+                          {title}
                         </span>
                         <span className="det-bar">
                           <span
@@ -403,11 +411,11 @@ export default function Overview() {
 
           {/* --------------------------------------------- priority queue */}
           <Card
-            title="Needs attention first"
-            subtitle="Highest-scoring open cases within your authority"
+            title={t("overview.queue.title")}
+            subtitle={t("overview.queue.sub")}
             actions={
               <button className="btn btn-sm" onClick={() => goCases()}>
-                View all cases <ArrowRight size={13} />
+                {t("overview.queue.viewAll")} <ArrowRight size={13} />
               </button>
             }
             tight
@@ -417,8 +425,8 @@ export default function Overview() {
             ) : (topCases.data?.cases ?? []).length === 0 ? (
               <Empty
                 icon={<AlertTriangle size={20} />}
-                title="No elevated-risk cases in scope"
-                hint="Nothing above the medium-risk threshold needs your attention right now."
+                title={t("overview.queue.empty")}
+                hint={t("overview.queue.emptyHint")}
               />
             ) : (
               <div className="queue">
@@ -431,22 +439,8 @@ export default function Overview() {
                     <span
                       className="queue-score"
                       style={{
-                        background:
-                          RISK_META[
-                            c.risk_score >= 70
-                              ? "high"
-                              : c.risk_score >= 40
-                                ? "medium"
-                                : "low"
-                          ].bg,
-                        color:
-                          RISK_META[
-                            c.risk_score >= 70
-                              ? "high"
-                              : c.risk_score >= 40
-                                ? "medium"
-                                : "low"
-                          ].color,
+                        background: RISK_META[riskLevel(c.risk_score)].bg,
+                        color: RISK_META[riskLevel(c.risk_score)].color,
                       }}
                     >
                       {c.risk_score.toFixed(0)}

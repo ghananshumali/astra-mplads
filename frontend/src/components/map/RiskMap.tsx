@@ -15,6 +15,7 @@ import "leaflet/dist/leaflet.css";
 import { useEffect, useRef, useState } from "react";
 
 import type { StateRow } from "../../api/types";
+import { useI18n } from "../../i18n/context";
 import { STATE_CENTROIDS } from "../../lib/centroids";
 import { RISK_META, compact } from "../../lib/format";
 import "./map.css";
@@ -31,7 +32,13 @@ export interface RiskMapProps {
   height?: number;
 }
 
+/** Escape text placed into Leaflet's HTML tooltips and popups. */
+function esc(text: string): string {
+  return text.replace(/[&<>"']/g, (ch) => `&#${ch.charCodeAt(0)};`);
+}
+
 export function RiskMap({ rows, onSelectState, height = 460 }: RiskMapProps) {
+  const { t } = useI18n();
   const holder = useRef<HTMLDivElement | null>(null);
   const map = useRef<L.Map | null>(null);
   const layer = useRef<L.LayerGroup | null>(null);
@@ -151,21 +158,21 @@ export function RiskMap({ rows, onSelectState, height = 460 }: RiskMapProps) {
       });
 
       marker.bindTooltip(
-        `<b>${p.row.state}</b><br>${compact(p.row.high_risk)} high-risk of ` +
-          `${compact(p.row.flags)} cases`,
+        `<b>${esc(p.row.state)}</b><br>` +
+          esc(t("map.tooltip", { high: compact(p.row.high_risk), total: compact(p.row.flags) })),
         { direction: "top", offset: [0, -radius] },
       );
 
       marker.bindPopup(
         `<div class="map-pop">
-           <div class="map-pop-title">${p.row.state}</div>
+           <div class="map-pop-title">${esc(p.row.state)}</div>
            <dl>
-             <dt>High risk</dt><dd class="hi">${compact(p.row.high_risk)}</dd>
-             <dt>All cases</dt><dd>${compact(p.row.flags)}</dd>
-             <dt>Average risk</dt><dd>${p.row.avg_risk}</dd>
+             <dt>${esc(t("map.high"))}</dt><dd class="hi">${compact(p.row.high_risk)}</dd>
+             <dt>${esc(t("map.all"))}</dt><dd>${compact(p.row.flags)}</dd>
+             <dt>${esc(t("map.avg"))}</dt><dd>${p.row.avg_risk}</dd>
            </dl>
            <button type="button" data-state="${encodeURIComponent(p.row.state)}"
-                   class="map-pop-btn">View cases</button>
+                   class="map-pop-btn">${esc(t("map.view"))}</button>
          </div>`,
         { closeButton: true, minWidth: 190 },
       );
@@ -181,7 +188,7 @@ export function RiskMap({ rows, onSelectState, height = 460 }: RiskMapProps) {
 
       marker.addTo(layer.current);
     }
-  }, [rows]);
+  }, [rows, t]);
 
   return (
     <div className="risk-map" style={{ height }}>
@@ -189,27 +196,27 @@ export function RiskMap({ rows, onSelectState, height = 460 }: RiskMapProps) {
 
       {!ready && !tileError && (
         <div className="risk-map-overlay">
-          <span className="risk-map-spinner" /> Loading basemap…
+          <span className="risk-map-spinner" /> {t("map.loading")}
         </div>
       )}
 
       {tileError && (
         <div className="risk-map-overlay warn">
-          Basemap tiles could not be loaded — check the network connection.
+          {t("map.tileError")}
           <br />
-          State markers and the district table below remain accurate.
+          {t("map.tileErrorNote")}
         </div>
       )}
 
       <div className="map-legend">
-        <div className="map-legend-title">High-risk cases</div>
+        <div className="map-legend-title">{t("map.legend")}</div>
         <div className="map-legend-row">
-          <span className="map-legend-dot sm" /> fewer
+          <span className="map-legend-dot sm" /> {t("map.fewer")}
         </div>
         <div className="map-legend-row">
-          <span className="map-legend-dot lg" /> more
+          <span className="map-legend-dot lg" /> {t("map.more")}
         </div>
-        <div className="map-legend-note">Bubble area ∝ case count</div>
+        <div className="map-legend-note">{t("map.legendNote")}</div>
       </div>
     </div>
   );

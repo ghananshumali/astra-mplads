@@ -28,6 +28,15 @@ Non-negotiables enforced here, in code rather than in the prompt alone:
 * If anything fails — no key, timeout, rate limit, bad JSON — the deterministic
   brief from `astra.explain` plus `rbac.default_plan` is returned instead, and
   the caller is told which path produced the result.
+
+Language: for another language the evidence packet is the same brief rendered
+in that language from the same templates as English — the same findings,
+figures and paragraph numbers, which tests/test_case_language.py checks — and
+the model is asked to write in it, under the same rules plus that language's
+forbidden vocabulary. A reply that is empty, or not written in the language,
+falls back to the deterministic brief in that language; a limitation, signal
+or action reason left in another language is replaced by its deterministic
+counterpart.
 """
 from __future__ import annotations
 
@@ -36,9 +45,10 @@ import json
 import re
 from typing import Any
 
-from . import rbac
-from .explain import HUMAN_REVIEW_NOTE, build_brief, risk_band, rupees
+from . import locale, rbac
+from .explain import brief_for, risk_band, rupees
 from .llm import complete_json, provider_status
+from .locale import DEFAULT, text
 
 # --------------------------------------------------------------- schema
 
@@ -171,19 +181,51 @@ BANNED_TERMS = (
     "criminal", "crime", "illegal", "scam", "bribe", "kickback", "theft",
     "stolen", "misappropriat", "culprit", "offender", "perpetrator",
 )
-INSUFFICIENT = "Available evidence is insufficient to draw a stronger conclusion."
+#: the same vocabulary in Hindi, as stems so inflected forms are caught too
+BANNED_TERMS_HI = (
+    "धोखाधड़", "धोखेबाज़", "जालसाज़", "भ्रष्ट", "घोटाल", "गबन", "चोरी", "चुराय", "चुराई",
+    "अपराध", "आपराधिक", "अवैध", "गैरकानूनी", "ग़ैरक़ानूनी", "गैर-कानूनी", "दोषी",
+    "रिश्वत", "घूस", "हेराफेरी", "दुर्विनियोजन", "कसूरवार",
+)
+INSUFFICIENT = text(DEFAULT, "synthesis.insufficient")
+
+#: script each non-English language is written in, to catch a reply in English
+_SCRIPT = {"hi": re.compile(r"[\u0900-\u097F]")}
+
+LANGUAGE_INSTRUCTION = {
+    "hi": (
+        "LANGUAGE: write every text value in the JSON (key_risk_summary, "
+        "case_explanation, supporting_signals, authority_specific_summary, each "
+        "action's reason, plan_rationale, limitations_or_missing_evidence) in Hindi, "
+        "in Devanagari script, as plain official Hindi a district officer would use. "
+        "The evidence is supplied in English; state exactly the same facts. Keep "
+        "these exactly as supplied and do not translate them: action_id values, work "
+        "ids, paragraph numbers, and names of people, places, vendors, authorities "
+        "and works. Write every number with the digits 0-9 exactly as supplied, never "
+        "in Devanagari numerals; lakh may be written लाख and crore करोड़.\n"
+        "Use these terms: risk indicator = जोखिम संकेतक; requires verification = "
+        "सत्यापन आवश्यक; requires human review = मानवीय समीक्षा आवश्यक; district "
+        "authority = ज़िला प्राधिकरण; sanction = स्वीकृति; recommendation = अनुशंसा; "
+        "work = कार्य; vendor = विक्रेता; guidelines = दिशानिर्देश; para = पैरा.\n"
+        "Never use these words or any form of them: धोखाधड़ी, भ्रष्टाचार, घोटाला, गबन, "
+        "चोरी, अपराध, आपराधिक, अवैध, गैरकानूनी, दोषी, रिश्वत, हेराफेरी.\n"
+        "If the evidence does not support a stronger statement, say exactly: "
+        "\"{insufficient}\""
+    ),
+}
 
 
 # --------------------------------------------------------------- evidence
 
-def build_evidence_packet(flag: dict, tier: str, work: dict | None = None) -> dict:
+def build_evidence_packet(flag: dict, tier: str, work: dict | None = None,
+                          lang: str = DEFAULT) -> dict:
     """The ONLY data the model sees: compact, structured, already analysed.
 
     Deliberately excludes the raw dataset, other cases, and any field the model
     has no business reasoning about.
     """
-    brief = (flag.get("tier_briefs") or {}).get(tier) or build_brief(flag, tier)
-    band, _ = risk_band(float(flag.get("risk_score") or 0))
+    brief = brief_for(flag, tier, lang)
+    band, _ = risk_band(float(flag.get("risk_score") or 0), lang)
 
     signals = []
     for s in brief.get("signals", []):
@@ -196,6 +238,7 @@ def build_evidence_packet(flag: dict, tier: str, work: dict | None = None) -> di
             "severity": s.get("severity_label"),
             "risk_contribution": s.get("contribution"),
             "scheme_provision": s.get("clause"),
+            "shown_outside_score": bool(s.get("context")),
         })
 
     packet = {
@@ -211,21 +254,25 @@ def build_evidence_packet(flag: dict, tier: str, work: dict | None = None) -> di
         "review_status": flag.get("review_status"),
         "agent_findings": signals,
         "cross_case_context": brief.get("context_note") or None,
-        "viewing_authority": rbac.ROLE_LABEL.get(tier, tier),
+        "viewing_authority": rbac.role_label(tier, lang),
     }
     if work:
         packet["work_details"] = {
             "full_description": (work.get("description") or None),
             "work_type": work.get("category"),
-            "implementing_agency": work.get("ia_name"),
+            "portal_category": work.get("work_category"),
+            # `ia_name` is the Implementing District Authority; the agency it
+            # chose to execute the work is only known once a payment is made
+            "implementing_district_authority": work.get("ia_name"),
+            "implementing_agency": work.get("implementing_agency"),
             "vendor_paid": work.get("vendor_name"),
-            "sanctioned_amount": (rupees(work["sanctioned_amount"])
+            "sanctioned_amount": (rupees(work["sanctioned_amount"], lang)
                                   if work.get("sanctioned_amount") else None),
-            "amount_paid_to_date": (rupees(work["total_paid"])
+            "amount_paid_to_date": (rupees(work["total_paid"], lang)
                                     if work.get("total_paid") else None),
             "workflow_stage": work.get("status"),
             "sanction_date": work.get("sanction_date"),
-            "completion_date": work.get("completion_date") or "not recorded",
+            "completion_date": work.get("completion_date") or text(lang, "synthesis.not_recorded"),
         }
     return packet
 
@@ -241,9 +288,14 @@ def evidence_fingerprint(packet: dict, tier: str) -> str:
 
 # --------------------------------------------------------------- validation
 
+#: Devanagari numerals read as the digits they stand for
+_DIGITS = str.maketrans("०१२३४५६७८९", "0123456789")
+
+
 def _numbers_in(text: str) -> set[str]:
     """Numeric tokens, normalised so 1,25,000 and 125000 compare equal."""
-    return {t.replace(",", "").rstrip(".") for t in re.findall(r"\d[\d,]*\.?\d*", text or "")}
+    text = (text or "").translate(_DIGITS)
+    return {t.replace(",", "").rstrip(".") for t in re.findall(r"[0-9][0-9,]*\.?[0-9]*", text)}
 
 
 def verify_numbers(generated: str, packet: dict) -> list[str]:
@@ -252,7 +304,9 @@ def verify_numbers(generated: str, packet: dict) -> list[str]:
     Percentages, money and counts must be traceable. Small integers are ignored
     because they occur naturally in prose ("2 records", "step 3").
     """
-    allowed = _numbers_in(json.dumps(packet, default=str))
+    # unescaped: an escaped character (—, क) would add its code's
+    # digits to the allowed figures
+    allowed = _numbers_in(json.dumps(packet, default=str, ensure_ascii=False))
     # tolerate values derived by trivial rounding of an allowed figure
     for a in list(allowed):
         try:
@@ -275,100 +329,104 @@ def verify_numbers(generated: str, packet: dict) -> list[str]:
 def scan_language(*texts: str) -> list[str]:
     """Accusatory vocabulary that must never reach an officer's screen."""
     found = []
-    for text in texts:
-        low = (text or "").lower()
-        for term in BANNED_TERMS:
+    for chunk in texts:
+        low = (chunk or "").lower()
+        for term in BANNED_TERMS + BANNED_TERMS_HI:
             if term in low and term not in found:
                 found.append(term)
     return found
 
 
+def written_in(lang: str, *texts: str) -> bool:
+    """Whether generated text is in the requested language's script."""
+    script = _SCRIPT.get(lang)
+    return script is None or all(script.search(t or "") for t in texts if (t or "").strip())
+
+
 # --------------------------------------------------------------- fallback
 
 def deterministic_synthesis(flag: dict, tier: str, work: dict | None = None,
-                            reason: str = "llm_unavailable") -> dict:
+                            reason: str = "llm_unavailable", lang: str = DEFAULT) -> dict:
     """Template synthesis used whenever the LLM path is not usable.
 
     Still authority-specific, still evidence-grounded, still gives permitted
     next steps — the demo degrades in richness, never in correctness.
     """
-    brief = (flag.get("tier_briefs") or {}).get(tier) or build_brief(flag, tier)
+    lang = locale.normalise(lang)
+    brief = brief_for(flag, tier, lang)
     score = float(flag.get("risk_score") or 0)
-    band, _ = risk_band(score)
+    band, _ = risk_band(score, lang)
     findings = flag.get("findings") or []
     signals = brief.get("signals", [])
 
-    plan = rbac.default_plan(tier, score, findings, signals)
+    plan = rbac.default_plan(tier, score, findings, signals, lang)
     return {
         "source": "deterministic",
         "fallback_reason": reason,
         "model": None,
         "case_id": flag.get("flag_id"),
         "tier": tier,
-        "tier_label": rbac.ROLE_LABEL.get(tier, tier),
+        "tier_label": rbac.role_label(tier, lang),
         "risk_score": score,
         "risk_level": band,
-        "key_risk_summary": brief.get("primary_risk", "Review required"),
+        "key_risk_summary": brief.get("primary_risk", text(lang, "brief.review_required")),
         "case_explanation": brief.get("primary_plain", ""),
         "supporting_signals": [
             {"source_agent": s.get("agent_label"), "signal": s.get("headline"),
-             "evidence": f"{s.get('metric') or '—'} vs {s.get('benchmark') or '—'}"}
+             "evidence": text(lang, "synthesis.evidence", metric=s.get("metric") or "—",
+                              benchmark=s.get("benchmark") or "—")}
             for s in signals
         ],
         "authority_specific_summary": f"{brief.get('opening', '')} {brief.get('closing', '')}".strip(),
         "action_plan": plan,
-        "plan_rationale": ("These steps are the actions available to this "
-                           "authority for the evidence found, ordered from "
-                           "immediate verification through to escalation."),
-        "limitations_or_missing_evidence": _standard_limitations(flag, work),
+        "plan_rationale": text(lang, "synthesis.plan_rationale"),
+        "limitations_or_missing_evidence": _standard_limitations(flag, work, lang),
         "rejected_actions": [],
         "unverified_numbers": [],
-        "constraint_notice": rbac.CONSTRAINT_NOTICE,
-        "human_review_notice": HUMAN_REVIEW_NOTE,
+        "constraint_notice": rbac.constraint_notice(lang),
+        "human_review_notice": text(lang, "brief.disclaimer"),
     }
 
 
-def _standard_limitations(flag: dict, work: dict | None) -> list[str]:
+def _standard_limitations(flag: dict, work: dict | None, lang: str = DEFAULT) -> list[str]:
     """Honest, data-derived caveats — not invented ones."""
     out: list[str] = []
     if work is not None:
         if not work.get("sanctioned_amount"):
-            out.append("This work has not reached sanction, so no sanctioned "
-                       "amount is available for comparison.")
+            out.append(text(lang, "synthesis.limitation.no_sanction"))
         if not work.get("completion_date"):
-            out.append("No completion date is recorded, so completion could not "
-                       "be confirmed from the data.")
+            out.append(text(lang, "synthesis.limitation.no_completion"))
         if not work.get("vendor_name"):
-            out.append("No vendor payment record is present for this work.")
+            out.append(text(lang, "synthesis.limitation.no_vendor"))
     if not any(str(f.get("rule_id", "")).startswith("D-") for f in flag.get("findings") or []):
-        out.append("No duplicate-record evidence was identified for this case.")
-    out.append("The system analyses recorded data only; it cannot verify "
-               "physical work on the ground.")
+        out.append(text(lang, "synthesis.limitation.no_duplicate"))
+    out.append(text(lang, "synthesis.limitation.records_only"))
     return out[:4]
 
 
 # --------------------------------------------------------------- main entry
 
 def synthesise(flag: dict, tier: str, work: dict | None = None,
-               use_llm: bool = True) -> dict:
+               use_llm: bool = True, lang: str = DEFAULT) -> dict:
     """Produce an authority-specific synthesis + constrained action plan.
 
     Always returns a usable result. `source` says which path produced it.
     """
     if tier not in rbac.ROLES:
         tier = "district"
+    lang = locale.normalise(lang)
     score = float(flag.get("risk_score") or 0)
     findings = flag.get("findings") or []
-    packet = build_evidence_packet(flag, tier, work)
+    packet = build_evidence_packet(flag, tier, work, lang)
     permitted = rbac.allowed_actions(tier, score, findings)
 
     if not use_llm:
-        return deterministic_synthesis(flag, tier, work, reason="llm_disabled")
+        return deterministic_synthesis(flag, tier, work, reason="llm_disabled", lang=lang)
 
     user_prompt = (
         f"{AUTHORITY_BRIEFING.get(tier, '')}\n\n"
         f"EVIDENCE PRODUCED BY THE ANALYTICAL PIPELINE (the only facts you may use):\n"
-        f"{json.dumps(packet, indent=2, default=str)}\n\n"
+        f"{json.dumps(packet, indent=2, default=str, ensure_ascii=False)}\n\n"
         f"ALLOWED ACTIONS for {rbac.ROLE_LABEL.get(tier, tier)} — you may only "
         f"select from these, using the action_id exactly as written:\n"
         f"{json.dumps([{k: a[k] for k in ('action_id', 'label', 'stage')} for a in permitted], indent=2)}\n\n"
@@ -376,11 +434,16 @@ def synthesise(flag: dict, tier: str, work: dict | None = None,
         f"evidence — you need not use every allowed action — and order them "
         f"from immediate verification to escalation."
     )
+    if lang in LANGUAGE_INSTRUCTION:
+        user_prompt += "\n\n" + LANGUAGE_INSTRUCTION[lang].format(
+            insufficient=text(lang, "synthesis.insufficient"))
 
+    # Devanagari takes several times the tokens of the same sentence in English
     result = complete_json(SYSTEM_PROMPT, user_prompt, SYNTHESIS_SCHEMA,
-                           schema_name="astra_case_synthesis")
+                           schema_name="astra_case_synthesis",
+                           max_tokens=1400 if lang == DEFAULT else 2600)
     if not result.ok or not result.data:
-        return deterministic_synthesis(flag, tier, work, reason=result.reason)
+        return deterministic_synthesis(flag, tier, work, reason=result.reason, lang=lang)
 
     d = result.data
     text_fields = [
@@ -388,42 +451,58 @@ def synthesise(flag: dict, tier: str, work: dict | None = None,
         str(d.get("authority_specific_summary", "")), str(d.get("plan_rationale", "")),
     ]
 
+    # Guardrail 0 — a reply with no summary or explanation is not a synthesis.
+    if not all(t.strip() for t in text_fields[:2]):
+        return deterministic_synthesis(flag, tier, work, reason="incomplete_response", lang=lang)
+
     # Guardrail 1 — accusatory language is never acceptable, so fall back.
     if scan_language(*text_fields):
-        return deterministic_synthesis(flag, tier, work, reason="language_guardrail")
+        return deterministic_synthesis(flag, tier, work, reason="language_guardrail", lang=lang)
+
+    # Guardrail 1b — a reply in the wrong language is not shown as if it were.
+    if not written_in(lang, *text_fields[:2]):
+        return deterministic_synthesis(flag, tier, work, reason="language_mismatch", lang=lang)
 
     # Guardrail 2 — the plan is filtered against the RBAC allow-list.
     accepted, rejected = rbac.validate_plan(
         d.get("action_plan") or [], tier, score, findings)
+    # The deterministic plan is built from the BRIEF signals so each action
+    # still cites the finding that motivates it.
+    grounded = rbac.default_plan(tier, score, findings,
+                                 brief_for(flag, tier, lang).get("signals", []), lang)
     if not accepted:
-        # The model returned no usable plan. Fall back to the deterministic one,
-        # built from the BRIEF signals so each action still cites the finding
-        # that motivates it.
-        brief = (flag.get("tier_briefs") or {}).get(tier) or build_brief(flag, tier)
-        accepted = rbac.default_plan(tier, score, findings, brief.get("signals", []))
+        # The model returned no usable plan. Fall back to the deterministic one.
+        accepted = grounded
+    reasons = {a["action_id"]: a["reason"] for a in grounded}
+    for action in accepted:
+        # an action the model chose but did not explain (or explained in the
+        # wrong language) still carries the finding that motivates it
+        if not action["reason"] or not written_in(lang, action["reason"]):
+            action["reason"] = reasons.get(action["action_id"], action["reason"])
 
     # Guardrail 3 — figures must be traceable to the evidence packet.
     unverified = verify_numbers(" ".join(text_fields), packet)
 
     signals = []
     for s in (d.get("supporting_signals") or [])[:6]:
-        if isinstance(s, dict):
+        if isinstance(s, dict) and written_in(lang, str(s.get("signal", "")), str(s.get("evidence", ""))):
             signals.append({"source_agent": str(s.get("source_agent", ""))[:80],
                             "signal": str(s.get("signal", ""))[:300],
                             "evidence": str(s.get("evidence", ""))[:300]})
     if not signals:
-        signals = [{"source_agent": s["source_agent"], "signal": s["detection"],
-                    "evidence": f"{s['measured_value']} vs {s['compared_against']}"}
-                   for s in packet["agent_findings"]]
+        if lang == DEFAULT:
+            signals = [{"source_agent": s["source_agent"], "signal": s["detection"],
+                        "evidence": f"{s['measured_value']} vs {s['compared_against']}"}
+                       for s in packet["agent_findings"]]
+        else:
+            signals = deterministic_synthesis(flag, tier, work, lang=lang)["supporting_signals"]
 
     limitations = [str(x)[:240] for x in
-                   (d.get("limitations_or_missing_evidence") or [])][:5]
+                   (d.get("limitations_or_missing_evidence") or []) if written_in(lang, str(x))][:5]
     if not limitations:
-        limitations = _standard_limitations(flag, work)
+        limitations = _standard_limitations(flag, work, lang)
     if unverified:
-        limitations.append(
-            "Some figures in this summary could not be matched to the "
-            "underlying evidence and have been marked for checking.")
+        limitations.append(text(lang, "synthesis.limitation.unverified"))
 
     return {
         "source": "groq",
@@ -432,11 +511,11 @@ def synthesise(flag: dict, tier: str, work: dict | None = None,
         "latency_ms": result.latency_ms,
         "case_id": flag.get("flag_id"),
         "tier": tier,
-        "tier_label": rbac.ROLE_LABEL.get(tier, tier),
+        "tier_label": rbac.role_label(tier, lang),
         # deterministic values are re-imposed AFTER generation, so the model
         # cannot have altered them even if it tried
         "risk_score": score,
-        "risk_level": risk_band(score)[0],
+        "risk_level": risk_band(score, lang)[0],
         "key_risk_summary": str(d.get("key_risk_summary", ""))[:400],
         "case_explanation": str(d.get("case_explanation", ""))[:1500],
         "supporting_signals": signals,
@@ -446,8 +525,8 @@ def synthesise(flag: dict, tier: str, work: dict | None = None,
         "limitations_or_missing_evidence": limitations,
         "rejected_actions": rejected,
         "unverified_numbers": unverified,
-        "constraint_notice": rbac.CONSTRAINT_NOTICE,
-        "human_review_notice": HUMAN_REVIEW_NOTE,
+        "constraint_notice": rbac.constraint_notice(lang),
+        "human_review_notice": text(lang, "brief.disclaimer"),
     }
 
 
@@ -458,19 +537,20 @@ _CACHE_LIMIT = 256
 
 
 def synthesise_cached(flag: dict, tier: str, work: dict | None = None,
-                      use_llm: bool = True) -> dict:
-    """Cache by (case, role, evidence fingerprint).
+                      use_llm: bool = True, lang: str = DEFAULT) -> dict:
+    """Cache by (case, role, evidence fingerprint, language).
 
     The same case seen by two authorities is two different syntheses, and a
     re-run of the pipeline changes the fingerprint, so stale text can never be
     shown for changed evidence.
     """
-    packet = build_evidence_packet(flag, tier, work)
-    key = f"{flag.get('flag_id')}|{tier}|{evidence_fingerprint(packet, tier)}|{int(use_llm)}"
+    lang = locale.normalise(lang)
+    packet = build_evidence_packet(flag, tier, work, lang)
+    key = f"{flag.get('flag_id')}|{tier}|{evidence_fingerprint(packet, tier)}|{int(use_llm)}|{lang}"
     hit = _CACHE.get(key)
     if hit is not None:
         return dict(hit, cached=True)
-    out = synthesise(flag, tier, work, use_llm=use_llm)
+    out = synthesise(flag, tier, work, use_llm=use_llm, lang=lang)
     if len(_CACHE) >= _CACHE_LIMIT:
         _CACHE.pop(next(iter(_CACHE)))
     _CACHE[key] = out

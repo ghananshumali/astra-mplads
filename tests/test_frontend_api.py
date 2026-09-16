@@ -248,11 +248,46 @@ def main() -> int:
         check("GET /works/{id}", r.status_code == 200)
         ok, missing = has_keys(r.json(), {
             "work_id", "description", "category", "state", "district",
-            "sanctioned_amount", "status",
+            "sanctioned_amount", "status", "work_category", "letter_no", "term_start",
+            "term_end", "implementing_agency", "vendor_id",
         })
         check("work record shape matches the TS type", ok, missing)
     check("unknown work returns 404",
           client.get("/works/NOT-A-REAL-WORK").status_code == 404)
+
+    network = client.get("/cases?limit=200&entity_types=agency").json()["cases"]
+    for prefix in ("vendor:", "agency:"):
+        actor = next((c for c in network if c["entity_id"].startswith(prefix)), None)
+        if actor is None:
+            continue
+        works = client.get("/agencies/works", params={"entity_id": actor["entity_id"]}).json()
+        key = actor["entity_id"].split(":", 1)[1]
+        field = "vendor_id" if prefix == "vendor:" else "implementing_agency"
+        check(f"GET /agencies/works finds a {prefix[:-1]} case's works by its entity id",
+              bool(works) and all(str(w[field]).upper() == key.upper() for w in works),
+              f"{actor['entity_id']}: {len(works)} works")
+    paid = client.get("/cases?limit=40&entity_types=work&rule_ids=P-DUP-01").json()["cases"]
+    if paid:
+        r = client.get("/payments", params={"work_id": paid[0]["entity_id"]})
+        body = r.json()
+        ok, missing = has_keys(body.get("summary") or {}, {
+            "count", "total", "sanctioned_amount", "share_of_sanctioned", "vendors",
+            "in_progress", "first_paid_on", "last_paid_on", "after_completion", "repeated"})
+        record_ok = all({"paid_on", "amount", "vendor_name", "vendor_id", "status",
+                         "days_after_completion", "before_sanction", "year_end_week",
+                         "repeats"} <= set(p) for p in body.get("payments") or [])
+        check("GET /payments shape matches the TS type, and a repeated payment is marked",
+              r.status_code == 200 and ok and record_ok and body["summary"]["repeated"] >= 2
+              and len(body["payments"]) == body["summary"]["count"], missing)
+    check("GET /payments for a work with none is empty, not an error",
+          client.get("/payments", params={"work_id": "NOT-A-REAL-WORK"}).json()["payments"] == [])
+    r = client.get("/meta/ops")
+    ok, missing = has_keys(r.json(), {"supervisor_running", "started_at", "last_tick_at",
+                                      "services", "conditions", "last_alert", "backup"})
+    check("GET /meta/ops shape matches the TS type", r.status_code == 200 and ok
+          and "kept" in r.json()["backup"], missing)
+    check("GET /agencies/works needs an entity id or a name",
+          client.get("/agencies/works").status_code == 400)
 
     r = client.get("/meta/pipeline")
     ok, missing = has_keys(r.json(), {"router_trace", "rule_coverage"})
@@ -260,6 +295,17 @@ def main() -> int:
 
     r = client.get("/meta/data-source")
     check("GET /meta/data-source", r.status_code == 200 and "provenance" in r.json())
+
+    r = client.get("/meta/freshness")
+    body = r.json() if r.status_code == 200 else {}
+    ok, missing = has_keys(body.get("analysis") or {}, {
+        "last_at", "in_progress", "started_at", "changes_waiting", "every_minutes"})
+    rolling = body.get("rolling")
+    rolling_ok, rolling_missing = (True, "") if rolling is None else has_keys(rolling, {
+        "enabled", "active_now", "areas_per_check", "hours", "min_age_hours", "last_at"})
+    check("GET /meta/freshness carries the analysis and rotation status",
+          r.status_code == 200 and ok and rolling_ok and "oldest_shard_fetch" in body,
+          missing or rolling_missing)
 
     r = client.get("/meta/llm")
     check("GET /meta/llm never leaks the key",

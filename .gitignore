@@ -5,6 +5,17 @@ data/astra.db
 data/astra.db.bak*
 data/*.db-wal
 data/*.db-shm
+data/live-staging/
+data/*.poller.lock
+data/processed/poller_status.json
+data/processed/ingest_alerts.json
+data/processed/switch_report.json
+data/processed/ops_state.json
+data/processed/ops_state.json.tmp
+data/backups/
+data/logs/
+data/*.supervisor.lock
+data/*.supervisor.stop
 .streamlit/
 .venv/
 

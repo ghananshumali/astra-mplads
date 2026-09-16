@@ -54,7 +54,7 @@ import random
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -80,6 +80,12 @@ HOUSE_LS, HOUSE_RS = 2, 1
 #: Hard ceiling on concurrent requests against the portal. Measured: no
 #: throughput gained above four, and we are a guest on a government service.
 MAX_WORKERS = int(os.environ.get("ASTRA_API_WORKERS", "4"))
+#: While the breaker is open, one trial request is let through this often, so a
+#: portal that recovers is noticed within minutes rather than after a backoff
+#: that has doubled to half an hour. One national check: two cheap requests.
+TRIAL_SECONDS = float(os.environ.get("ASTRA_PORTAL_TRIAL_SECONDS", "300"))
+#: A trial is a single cycle's national check; it lapses if unused.
+TRIAL_WINDOW_SECONDS = 60.0
 #: (connect, read). The read budget is generous because a large state's report
 #: legitimately takes 15 s; a national one never returns and must time out.
 TIMEOUT = (5.0, 45.0)
@@ -115,15 +121,28 @@ class CircuitBreaker:
     Opens once the failure rate over the last `window` outcomes exceeds
     `threshold`, then stays open for a backoff that doubles on each further
     failure, jittered, capped at `cap_seconds`. A single success closes it.
+
+    While open, `allow_trial()` lets one short trial through every
+    `trial_seconds`, so recovery is noticed within minutes; a failed trial
+    neither lengthens the backoff nor counts twice. The last real error and when
+    the failures began are kept, because once open every call fails with the
+    same "circuit open" message, which says nothing about the cause.
     """
 
     def __init__(self, window: int = 20, threshold: float = 0.5,
-                 base_seconds: float = 30.0, cap_seconds: float = 1800.0):
+                 base_seconds: float = 30.0, cap_seconds: float = 1800.0,
+                 trial_seconds: float = TRIAL_SECONDS):
         self.window, self.threshold = window, threshold
         self.base, self.cap = base_seconds, cap_seconds
+        self.trial_seconds = trial_seconds
         self._outcomes: list[bool] = []
         self._open_until = 0.0
         self._consecutive_opens = 0
+        self._last_trial = 0.0
+        self._trial_until = 0.0
+        self.last_error: str | None = None
+        self.last_error_at: str | None = None
+        self.failing_since: str | None = None
         self._lock = threading.Lock()
 
     @property
@@ -135,28 +154,78 @@ class CircuitBreaker:
         with self._lock:
             return max(0.0, self._open_until - time.monotonic())
 
-    def record(self, ok: bool) -> None:
+    def record(self, ok: bool, error: str | None = None) -> None:
         with self._lock:
-            self._outcomes.append(ok)
-            del self._outcomes[:-self.window]
+            now = time.monotonic()
+            trial = now < self._trial_until
+            self._trial_until = 0.0
             if ok:
+                self._outcomes.append(True)
+                del self._outcomes[:-self.window]
                 self._open_until = 0.0
                 self._consecutive_opens = 0
+                self.failing_since = None
                 return
+            stamp = datetime.now(timezone.utc).isoformat()
+            self.last_error = (error or "request failed")[:300]
+            self.last_error_at = stamp
+            if self.failing_since is None:
+                self.failing_since = stamp
+            if trial and now < self._open_until:
+                return                      # a failed trial: the backoff stands as it was
+            self._outcomes.append(False)
+            del self._outcomes[:-self.window]
             if len(self._outcomes) < max(4, self.window // 4):
                 return                      # too few samples to judge
             rate = 1 - sum(self._outcomes) / len(self._outcomes)
             if rate > self.threshold:
                 self._consecutive_opens += 1
                 wait = min(self.cap, self.base * 2 ** (self._consecutive_opens - 1))
-                self._open_until = time.monotonic() + wait * (0.75 + random.random() / 2)
+                self._open_until = now + wait * (0.75 + random.random() / 2)
+                self._last_trial = now
                 self._outcomes.clear()
 
+    def allow_trial(self) -> bool:
+        """While open, admit a short trial once every `trial_seconds`.
+
+        Returns True when calls may go through: the breaker is closed, or a
+        trial has just been granted. The trial ends with the first outcome.
+        """
+        with self._lock:
+            now = time.monotonic()
+            if now >= self._open_until:
+                return True
+            if not self.trial_seconds or now - self._last_trial < self.trial_seconds:
+                return False
+            self._last_trial = now
+            self._trial_until = now + TRIAL_WINDOW_SECONDS
+            return True
+
     def check(self) -> None:
-        if self.is_open:
-            raise CircuitOpen(
-                f"circuit open for another {self.opens_in():.0f}s; "
-                f"serving cached data")
+        with self._lock:
+            now = time.monotonic()
+            blocked = now < self._open_until and now >= self._trial_until
+            wait = self._next_attempt_in(now)
+        if blocked:
+            raise CircuitOpen(f"circuit open for another {wait:.0f}s; serving cached data")
+
+    def _next_attempt_in(self, now: float) -> float:
+        wait = max(0.0, self._open_until - now)
+        if wait and self.trial_seconds:
+            wait = min(wait, max(0.0, self._last_trial + self.trial_seconds - now))
+        return wait
+
+    def status(self) -> dict:
+        """Plain facts for the website: open or not, when it tries next, and why."""
+        with self._lock:
+            now = time.monotonic()
+            is_open = now < self._open_until
+            next_at = (datetime.now(timezone.utc)
+                       + timedelta(seconds=self._next_attempt_in(now))).isoformat() if is_open else None
+            return {"open": is_open, "next_attempt_at": next_at,
+                    "failing_since": self.failing_since if is_open else None,
+                    "last_error": self.last_error, "last_error_at": self.last_error_at,
+                    "checked_at": datetime.now(timezone.utc).isoformat()}
 
 
 # ------------------------------------------------------------------------ shards
@@ -267,12 +336,12 @@ class EsakshiClient:
         try:
             r = self.session().post(url, json=body, timeout=self.timeout)
         except requests.RequestException as exc:
-            self.breaker.record(False)
-            raise SourceError(f"{type(exc).__name__}: {str(exc)[:160]}",
-                              path=path, body=body) from exc
+            message = f"{type(exc).__name__}: {str(exc)[:160]}"
+            self.breaker.record(False, message)
+            raise SourceError(message, path=path, body=body) from exc
         if r.status_code != 200:
             # A malformed combo comes back as an HTML 500 error page.
-            self.breaker.record(False)
+            self.breaker.record(False, f"HTTP {r.status_code} from {path}")
             raise SourceError(f"HTTP {r.status_code}", path=path, body=body,
                               status=r.status_code)
         try:
@@ -280,9 +349,9 @@ class EsakshiClient:
             # are UTF-8, so r.text would mojibake every Indic name.
             payload = r.json()
         except ValueError as exc:
-            self.breaker.record(False)
-            raise SourceError(f"non-JSON response ({len(r.content)} bytes)",
-                              path=path, body=body, status=r.status_code) from exc
+            message = f"non-JSON response ({len(r.content)} bytes)"
+            self.breaker.record(False, f"{message} from {path}")
+            raise SourceError(message, path=path, body=body, status=r.status_code) from exc
         self.breaker.record(True)
         return payload
 

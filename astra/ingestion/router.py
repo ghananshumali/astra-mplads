@@ -121,10 +121,29 @@ def _conform(df: pd.DataFrame, model) -> pd.DataFrame:
 
 def ingest(mode: str = "auto", verbose: bool = True,
            enrich: bool = True) -> dict:
-    """Resolve a data source per the mode and load the canonical tables."""
+    """Resolve a data source per the mode and load the canonical tables.
+
+    Refuses to run while a poller is updating the same database: every mode
+    rewrites the corpus, and the CSV modes replace it outright.
+    """
     if mode not in MODES:
         raise ValueError(f"mode must be one of {MODES}")
+    from .instance_lock import WriterLock, holder
 
+    lock = WriterLock()
+    if not lock.acquire(role=f"ingest --mode {mode}"):
+        note = holder(lock.path) or {}
+        raise RuntimeError(
+            f"a poller is running on this database (pid {note.get('pid', '?')}, "
+            f"since {note.get('since', '?')}) and is keeping it current. Stop it "
+            f"before re-ingesting, so two writers do not update the corpus at once.")
+    try:
+        return _ingest(mode, verbose, enrich)
+    finally:
+        lock.release()
+
+
+def _ingest(mode: str, verbose: bool, enrich: bool) -> dict:
     if mode == "api":
         return _ingest_api(verbose=verbose)
 

@@ -25,15 +25,16 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
+from .locale import DEFAULT, text
+
 Role = Literal["mp", "district", "state", "ministry"]
 ROLES: tuple[str, ...] = ("mp", "district", "state", "ministry")
 
-ROLE_LABEL = {
-    "mp": "Member of Parliament",
-    "district": "District Authority",
-    "state": "State Nodal Authority",
-    "ministry": "Ministry (MoSPI)",
-}
+ROLE_LABEL = {role: text(DEFAULT, f"tier.{role}.label") for role in ROLES}
+
+
+def role_label(role: str, lang: str = DEFAULT) -> str:
+    return text(lang, f"tier.{role}.label") if role in ROLES else role
 
 #: Evidence keys an action may require. Derived from agent output, never guessed.
 EVIDENCE_KEYS = ("cost_anomaly", "duplicate", "network", "compliance",
@@ -229,23 +230,27 @@ def evidence_flags(findings: list[dict]) -> set[str]:
     """
     flags: set[str] = set()
     for f in findings or []:
-        rid = str(f.get("rule_id", ""))
-        agent = str(f.get("agent", ""))
-        if agent == "compliance":
-            flags.add("compliance")
-        if agent == "network":
-            flags.add("network")
-        if rid.startswith("D-"):
-            flags.add("duplicate")
-        if rid == "A-COST-01":
-            flags.add("cost_anomaly")
-        if rid == "A-EXP-01":
-            flags.add("expenditure")
-        if rid == "R-TIME-01":
-            flags.add("delay")
-        if rid in ("R-COST-01", "R-PILE-01"):
-            flags.add("expenditure")
+        flags.update(evidence_keys(str(f.get("rule_id", "")), str(f.get("agent", ""))))
     return flags
+
+
+def evidence_keys(rid: str, agent: str) -> list[str]:
+    """The kinds of evidence one finding provides, in priority order."""
+    keys = []
+    if rid.startswith("D-"):
+        keys.append("duplicate")
+    if rid in ("A-COST-01", "V-AMT-01"):
+        keys.append("cost_anomaly")
+    if rid in ("A-EXP-01", "R-COST-01", "R-PILE-01", "R-REPAIR-01", "V-PAY-01", "V-LIST-01") \
+            or agent == "payments":
+        keys.append("expenditure")
+    if rid in ("R-TIME-01", "R-SANC-01", "R-SANC-02", "A-PEER-01", "P-LATE-01"):
+        keys.append("delay")
+    if agent == "network" or rid in ("V-VEN-01", "V-IA-01"):
+        keys.append("network")
+    if agent == "compliance" or rid == "V-REV-01":
+        keys.append("compliance")
+    return keys
 
 
 def allowed_actions(role: str, risk_score: float,
@@ -319,7 +324,8 @@ def validate_plan(plan_actions: list[dict], role: str, risk_score: float,
 
 def default_plan(role: str, risk_score: float,
                  findings: list[dict] | None = None,
-                 signals: list[dict] | None = None) -> list[dict]:
+                 signals: list[dict] | None = None,
+                 lang: str = DEFAULT) -> list[dict]:
     """Deterministic action plan used when the LLM is unavailable.
 
     Takes the permitted actions in stage order and attaches the plain-language
@@ -334,21 +340,7 @@ def default_plan(role: str, risk_score: float,
     # the finding that actually motivates it rather than a generic headline
     by_evidence: dict[str, dict] = {}
     for sig in signals:
-        rid = str(sig.get("rule_id", ""))
-        agent = str(sig.get("agent", ""))
-        keys = []
-        if rid.startswith("D-"):
-            keys.append("duplicate")
-        if rid == "A-COST-01":
-            keys.append("cost_anomaly")
-        if rid in ("A-EXP-01", "R-COST-01", "R-PILE-01"):
-            keys.append("expenditure")
-        if rid == "R-TIME-01":
-            keys.append("delay")
-        if agent == "network":
-            keys.append("network")
-        if agent == "compliance":
-            keys.append("compliance")
+        keys = evidence_keys(str(sig.get("rule_id", "")), str(sig.get("agent", "")))
         for k in keys:
             by_evidence.setdefault(k, sig)
 
@@ -357,19 +349,19 @@ def default_plan(role: str, risk_score: float,
         a = dict(a)
         req = ACTION_CATALOGUE[a["action_id"]]["requires"]
         motive = next((by_evidence[k] for k in req if k in by_evidence), primary)
-        headline = motive.get("headline") or "the flagged concern"
+        headline = motive.get("headline") or text(lang, "plan.concern")
         if a["stage"] in ("immediate", "next"):
-            a["reason"] = f"The system detected: {headline}."
+            a["reason"] = text(lang, "plan.detected", headline=headline)
         elif a["stage"] == "if_unresolved":
-            a["reason"] = ("Only if the checks above do not resolve the concern.")
+            a["reason"] = text(lang, "plan.if_unresolved")
         else:
-            a["reason"] = ("Only if material concerns remain after verification.")
+            a["reason"] = text(lang, "plan.escalation")
         out.append(a)
     return out
 
 
-CONSTRAINT_NOTICE = (
-    "Recommendations are generated within the actions permitted for this "
-    "authority level. Final decisions and actions remain with authorised "
-    "human officials."
-)
+CONSTRAINT_NOTICE = text(DEFAULT, "plan.constraint_notice")
+
+
+def constraint_notice(lang: str = DEFAULT) -> str:
+    return text(lang, "plan.constraint_notice")

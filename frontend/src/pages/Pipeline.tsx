@@ -3,62 +3,60 @@ import { CircleDot, Circle } from "lucide-react";
 
 import { api } from "../api/client";
 import { Banner, Card, ErrorState, Skeleton } from "../components/ui";
-import { AGENT_META, compact, relativeTime } from "../lib/format";
+import { useI18n } from "../i18n/context";
+import { agentText, ruleTitle } from "../i18n/labels";
+import { T } from "../i18n/T";
+import { AGENT_COLOR, compact } from "../lib/format";
 import "./pages.css";
 
 export default function Pipeline() {
-  const meta = useQuery({ queryKey: ["pipeline"], queryFn: api.pipeline });
+  const i18n = useI18n();
+  const { t, tOr, fmt, language } = i18n;
+  const meta = useQuery({
+    queryKey: ["pipeline", language.code],
+    queryFn: () => api.pipeline(language.code),
+  });
 
   if (meta.isError)
     return <ErrorState error={meta.error} onRetry={() => meta.refetch()} />;
 
-  const zero = (meta.data?.rule_coverage ?? []).filter((r) => r.findings === 0);
+  const coverage = meta.data?.rule_coverage ?? [];
+  const zero = coverage.filter((r) => r.findings === 0 && !r.stood_down);
+  const unchecked = Object.entries(meta.data?.unchecked_provisions ?? {});
 
   return (
     <div className="stack gap-5">
       <header className="page-head">
         <div>
-          <h1 className="page-title">Analysis pipeline</h1>
+          <h1 className="page-title">{t("pipe.title")}</h1>
           <p className="page-sub">
-            Which agents ran on this batch, and what each rule found
-            {meta.data?.ran_at
-              ? ` · last run ${relativeTime(meta.data.ran_at)}`
-              : ""}
+            {t("pipe.sub")}
+            {meta.data?.ran_at ? ` · ${t("pipe.lastRun", { when: fmt.ago(meta.data.ran_at) })}` : ""}
           </p>
         </div>
       </header>
 
-      <Card
-        title="Agent routing"
-        subtitle="The orchestrator dispatches only agents whose required inputs exist in the current data, and records that decision"
-      >
+      <Card title={t("pipe.routing.title")} subtitle={t("pipe.routing.sub")}>
         {meta.isLoading ? (
           <Skeleton h={140} />
         ) : (
           <div className="stack gap-3">
-            {(meta.data?.router_trace ?? []).map((t) => (
-              <div key={t.agent} className="row gap-3">
-                {t.dispatched ? (
-                  <CircleDot
-                    size={16}
-                    style={{ color: AGENT_META[t.agent]?.color }}
-                  />
+            {(meta.data?.router_trace ?? []).map((tr) => (
+              <div key={tr.agent} className="row gap-3">
+                {tr.dispatched ? (
+                  <CircleDot size={16} style={{ color: AGENT_COLOR[tr.agent] }} />
                 ) : (
                   <Circle size={16} className="dim" />
                 )}
                 <div className="grow">
-                  <div className="semibold">
-                    {AGENT_META[t.agent]?.label ?? t.agent}
-                  </div>
-                  <div className="text-xs dim">
-                    {AGENT_META[t.agent]?.role ?? ""}
-                  </div>
+                  <div className="semibold">{agentText(i18n, tr.agent, "label")}</div>
+                  <div className="text-xs dim">{agentText(i18n, tr.agent, "role")}</div>
                 </div>
                 <div className="text-sm">
-                  {t.dispatched ? (
-                    <b>{compact(t.findings ?? 0)} findings</b>
+                  {tr.dispatched ? (
+                    <b>{t("pipe.findings", { count: compact(tr.findings ?? 0) })}</b>
                   ) : (
-                    <span className="dim">{t.reason}</span>
+                    <span className="dim">{tr.reason}</span>
                   )}
                 </div>
               </div>
@@ -67,11 +65,7 @@ export default function Pipeline() {
         )}
       </Card>
 
-      <Card
-        title="Rule coverage"
-        subtitle="Every check the compliance and analytics engines evaluated on this batch"
-        tight
-      >
+      <Card title={t("pipe.coverage.title")} subtitle={t("pipe.coverage.sub")} tight>
         {meta.isLoading ? (
           <Skeleton h={220} />
         ) : (
@@ -80,23 +74,34 @@ export default function Pipeline() {
               <table className="table">
                 <thead>
                   <tr>
-                    <th style={{ width: 108 }}>Rule</th>
-                    <th>Check</th>
-                    <th style={{ width: 110 }}>Cases found</th>
+                    <th style={{ width: 108 }}>{t("pipe.col.rule")}</th>
+                    <th>{t("pipe.col.check")}</th>
+                    <th style={{ width: 150 }}>{t("pipe.col.basis")}</th>
+                    <th style={{ width: 110 }}>{t("pipe.col.findings")}</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {(meta.data?.rule_coverage ?? []).map((r) => (
+                  {coverage.map((r) => (
                     <tr key={r.rule_id} style={{ cursor: "default" }}>
                       <td className="mono text-xs">{r.rule_id}</td>
-                      <td>{r.title}</td>
+                      <td>
+                        {ruleTitle(i18n, r.rule_id, r.title)}
+                        {r.stood_down && (
+                          <div className="text-xs dim">
+                            {t("pipe.notEvaluated", { reason: r.stood_down })}
+                          </div>
+                        )}
+                      </td>
+                      <td className="text-xs muted">
+                        {r.basis ? tOr(`basis.${r.basis}`, r.basis) : "—"}
+                      </td>
                       <td
                         className="num semibold"
                         style={{
                           color: r.findings ? "var(--text)" : "var(--text-3)",
                         }}
                       >
-                        {compact(r.findings)}
+                        {r.stood_down ? "—" : compact(r.findings)}
                       </td>
                     </tr>
                   ))}
@@ -106,10 +111,24 @@ export default function Pipeline() {
             {zero.length > 0 && (
               <div style={{ paddingTop: 12 }}>
                 <Banner tone="neutral">
-                  Rules reporting zero are shown deliberately:{" "}
-                  <b>{zero.map((z) => z.rule_id).join(", ")}</b> found no
-                  matches — either the corpus is clean on that check, or this
-                  data source lacks the inputs the rule requires.
+                  <T
+                    k="pipe.zero"
+                    values={{ rules: <b>{zero.map((z) => z.rule_id).join(", ")}</b> }}
+                  />
+                </Banner>
+              </div>
+            )}
+            {unchecked.length > 0 && (
+              <div style={{ paddingTop: 12 }}>
+                <Banner tone="neutral">
+                  <b>{t("pipe.unchecked")}</b>
+                  <ul className="text-sm" style={{ margin: "6px 0 0", paddingInlineStart: 18 }}>
+                    {unchecked.map(([para, why]) => (
+                      <li key={para}>
+                        {t("pipe.para", { para, text: tOr(`unchecked.${para}`, why) })}
+                      </li>
+                    ))}
+                  </ul>
                 </Banner>
               </div>
             )}

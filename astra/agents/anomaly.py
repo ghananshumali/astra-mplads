@@ -10,6 +10,18 @@ Benchmarking design:
   outliers we hunt. IsolationForest cross-checks multivariate structure.
 - Peer groups NEVER straddle the eSAKSHI era boundary — the 2023 regime
   change would otherwise register as a fake anomaly wave.
+
+Peer profile (A-PEER-01)
+------------------------
+Cost alone is A-COST-01's question. A-PEER-01 asks whether a work is extreme on
+SEVERAL measures at once compared with works of the same type in the same
+state: time from recommendation to sanction, time from sanction to completion,
+the share of the sanctioned amount paid on a completed work, and the number of
+payments. Each measure gets a robust z-score in its peer group; a work is
+reported only when two or more are extreme in the risky direction, and the
+finding names them with the typical value. Isolation Forest is run on the same
+measures only to corroborate (`iforest_agrees`): it never raises a finding by
+itself, because it cannot say why a work looks unusual.
 """
 from __future__ import annotations
 
@@ -34,6 +46,33 @@ def _robust_z(x: pd.Series) -> pd.Series:
     return (x - med) / (1.4826 * mad)
 
 
+#: A-PEER-01 measures: (label, risky direction, log-scale, plain unit)
+_PEER_MEASURES = {
+    "days_to_sanction": ("time from recommendation to sanction", "high", True, "days"),
+    "days_to_complete": ("time from sanction to completion", "high", True, "days"),
+    "paid_share": ("share of the sanctioned amount paid on a completed work", "low", False, "share"),
+    "payment_count": ("number of payments", "high", True, "payments"),
+}
+
+
+def peer_measures(works: pd.DataFrame) -> pd.DataFrame:
+    """The A-PEER-01 measures for each work; NaN where a measure does not apply."""
+    def day(col):
+        return pd.to_datetime(works[col], errors="coerce") if col in works else pd.Series(pd.NaT, index=works.index)
+
+    recommended, sanctioned, completed = day("recommended_date"), day("sanction_date"), day("completion_date")
+    out = pd.DataFrame(index=works.index)
+    out["days_to_sanction"] = (sanctioned - recommended).dt.days.where(lambda d: d >= 0)
+    done = works["is_completed"].astype(bool) if "is_completed" in works else completed.notna()
+    out["days_to_complete"] = (completed - sanctioned).dt.days.where(lambda d: d >= 0).where(done)
+    amount = pd.to_numeric(works.get("sanctioned_amount"), errors="coerce")
+    paid = pd.to_numeric(works.get("total_paid"), errors="coerce")
+    out["paid_share"] = (paid / amount.where(amount > 0)).where(done & paid.notna())
+    count = pd.to_numeric(works.get("payment_count"), errors="coerce")
+    out["payment_count"] = count.where(count > 0)
+    return out
+
+
 class AnomalyAgent(BaseAgent):
     name = "anomaly"
     needs_works = {"work_id"}
@@ -44,6 +83,8 @@ class AnomalyAgent(BaseAgent):
         out: list[Finding] = []
         if not works.empty:
             out += self._cost_outliers(works, cfg["cost_overrun"])
+            if "peer_profile" in cfg:
+                out += self._peer_profile(works, cfg["peer_profile"])
         if not flows.empty:
             out += self._expenditure_outliers(flows, cfg["expenditure_pattern"])
         return out
@@ -142,6 +183,7 @@ class AnomalyAgent(BaseAgent):
                     entity_id=str(grp.loc[idx, "work_id"]),
                     summary=summary,
                     details={
+                        "basis": rule.get("basis"),
                         "cost": c, "benchmark": median_cost,
                         "pct_vs_benchmark": round(pct_over, 1),
                         "z": None if degenerate else round(zval, 2),
@@ -152,6 +194,82 @@ class AnomalyAgent(BaseAgent):
                         "iforest_agrees": bool(iso_flag.loc[idx]),
                         "benchmark_source": _SOR_DIR_NOTE,
                     },
+                ))
+        return out
+
+    def _peer_profile(self, works: pd.DataFrame, rule: dict) -> list[Finding]:
+        measures = peer_measures(works)
+        if measures.notna().sum().sum() == 0:
+            return []
+        keys = works[[c for c in ("state", "category", "era") if c in works.columns]].fillna("NA")
+        frame = pd.concat([works[["work_id"]], keys, measures], axis=1)
+        group_cols = list(keys.columns)
+        out: list[Finding] = []
+        for peer, grp in frame.groupby(group_cols):
+            if len(grp) < rule["min_peer_group"]:
+                continue
+            extreme: dict[str, pd.Series] = {}
+            zs: dict[str, pd.Series] = {}
+            for col, (_label, direction, log, _unit) in _PEER_MEASURES.items():
+                values = grp[col].dropna()
+                if len(values) < rule["min_peer_group"]:
+                    continue
+                scaled = np.log1p(values) if log else values
+                mad = float((scaled - scaled.median()).abs().median())
+                if mad == 0:
+                    continue          # most peers share one value: no spread to measure
+                z = (scaled - scaled.median()) / (1.4826 * mad)
+                zs[col] = z
+                hit = z > rule["z_threshold"] if direction == "high" else z < -rule["z_threshold"]
+                extreme[col] = hit.reindex(grp.index, fill_value=False)
+            if len(extreme) < rule["min_features"]:
+                continue
+            hits = pd.DataFrame(extreme)
+            candidates = hits.index[hits.sum(axis=1) >= rule["min_features"]]
+            if len(candidates) == 0:
+                continue
+
+            iso_agrees = pd.Series(False, index=grp.index)
+            try:
+                from sklearn.ensemble import IsolationForest
+                cols = list(extreme)
+                matrix = grp[cols].apply(lambda c: c.fillna(c.median())).to_numpy(dtype=float)
+                iso = IsolationForest(n_estimators=50, max_samples=min(256, len(grp)),
+                                      contamination=rule["iforest_contamination"],
+                                      random_state=42).fit(matrix)
+                iso_agrees = pd.Series(iso.predict(matrix) == -1, index=grp.index)
+            except Exception:
+                pass
+
+            peer_label = " / ".join(str(p) for p in (peer if isinstance(peer, tuple) else (peer,))[:2])
+            for idx in candidates:
+                named = []
+                for col in hits.columns[hits.loc[idx]]:
+                    label, _direction, _log, unit = _PEER_MEASURES[col]
+                    value = float(grp.loc[idx, col])
+                    typical = float(grp[col].median())
+                    named.append({"measure": col, "label": label, "value": round(value, 3),
+                                  "peer_median": round(typical, 3),
+                                  "z": round(float(zs[col].loc[idx]), 2), "unit": unit})
+                parts = []
+                for m in named:
+                    if m["unit"] == "share":
+                        parts.append(f"{m['label']} {m['value']:.0%} (typical {m['peer_median']:.0%})")
+                    else:
+                        parts.append(f"{m['label']} {m['value']:,.0f} {m['unit']} "
+                                     f"(typical {m['peer_median']:,.0f})")
+                out.append(Finding(
+                    agent="anomaly", rule_id=rule["id"], rule_title=rule["title"],
+                    clause=rule.get("clause"), severity=rule["severity"],
+                    entity_type="work", entity_id=str(grp.loc[idx, "work_id"]),
+                    summary=(f"Unusual on {len(named)} measures compared with {len(grp):,} works "
+                             f"of the same type in {peer_label}: " + "; ".join(parts) + "."),
+                    details={"basis": rule.get("basis"), "measures": named,
+                             "peer_group": "|".join(str(p) for p in (peer if isinstance(peer, tuple) else (peer,))),
+                             "peers": int(len(grp)),
+                             "iforest_agrees": bool(iso_agrees.loc[idx]),
+                             "method": "robust z-score per measure within the peer group; "
+                                       "Isolation Forest as corroboration only"},
                 ))
         return out
 

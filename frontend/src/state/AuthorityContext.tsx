@@ -15,6 +15,7 @@ import {
 import type { ReactNode } from "react";
 
 import type { CaseFilters, Tier } from "../api/types";
+import { useI18n } from "../i18n/context";
 
 interface Scope {
   state?: string;
@@ -36,6 +37,7 @@ const Ctx = createContext<AuthorityValue | null>(null);
 const STORAGE = "astra.authority";
 
 export function AuthorityProvider({ children }: { children: ReactNode }) {
+  const { t } = useI18n();
   const [tier, setTierRaw] = useState<Tier>("ministry");
   const [scopes, setScopes] = useState<Record<Tier, Scope>>({
     ministry: {},
@@ -83,11 +85,11 @@ export function AuthorityProvider({ children }: { children: ReactNode }) {
   }, [tier, scope]);
 
   const scopeLabel = useMemo(() => {
-    if (tier === "ministry") return "All states";
-    if (tier === "state") return scope.state ?? "Select a state";
-    if (tier === "district") return scope.district ?? "Select a district";
-    return scope.constituency ?? "Select a constituency";
-  }, [tier, scope]);
+    if (tier === "ministry") return t("scope.allStates");
+    if (tier === "state") return scope.state ?? t("scope.selectState");
+    if (tier === "district") return scope.district ?? t("scope.selectDistrict");
+    return scope.constituency ?? t("scope.selectConstituency");
+  }, [tier, scope, t]);
 
   const value = useMemo(
     () => ({ tier, setTier, scope, setScope, scopeFilters, scopeLabel }),

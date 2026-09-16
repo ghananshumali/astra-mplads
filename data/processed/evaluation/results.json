@@ -1,0 +1,331 @@
+{
+  "generated_at": "2026-09-13T13:29:03.758788+00:00",
+  "corpus_works": 134481,
+  "per_pattern": 200,
+  "rules_threshold_note": "thresholds as in config/rules.yaml at run time",
+  "detection": [
+    {
+      "pattern": "Work not permitted (para 5.2.11)",
+      "rule": "R-PROH-01",
+      "planted": 200,
+      "detected": 120,
+      "missed": 80,
+      "rate": 0.6,
+      "ci95": [
+        0.531,
+        0.665
+      ]
+    },
+    {
+      "pattern": "Cost above comparable works",
+      "rule": "A-COST-01",
+      "planted": 200,
+      "detected": 122,
+      "missed": 78,
+      "rate": 0.61,
+      "ci95": [
+        0.541,
+        0.675
+      ]
+    },
+    {
+      "pattern": "Same work entered twice",
+      "rule": "D-DUP-01",
+      "planted": 200,
+      "detected": 191,
+      "missed": 9,
+      "rate": 0.955,
+      "ci95": [
+        0.917,
+        0.976
+      ]
+    },
+    {
+      "pattern": "Overdue against the one-year norm (para 3.2.12)",
+      "rule": "R-TIME-01",
+      "planted": 200,
+      "detected": 200,
+      "missed": 0,
+      "rate": 1.0,
+      "ci95": [
+        0.981,
+        1.0
+      ]
+    },
+    {
+      "pattern": "Awaiting sanction beyond 45 days (para 3.2.4)",
+      "rule": "R-SANC-01",
+      "planted": 200,
+      "detected": 200,
+      "missed": 0,
+      "rate": 1.0,
+      "ci95": [
+        0.981,
+        1.0
+      ]
+    },
+    {
+      "pattern": "Below the normal minimum (para 3.2.9)",
+      "rule": "R-COST-01",
+      "planted": 200,
+      "detected": 200,
+      "missed": 0,
+      "rate": 1.0,
+      "ci95": [
+        0.981,
+        1.0
+      ]
+    },
+    {
+      "pattern": "Work changed after sanction (para 3.2.15)",
+      "rule": "V-REV-01",
+      "planted": 200,
+      "detected": 200,
+      "missed": 0,
+      "rate": 1.0,
+      "ci95": [
+        0.981,
+        1.0
+      ]
+    },
+    {
+      "pattern": "Amount revised after sanction",
+      "rule": "V-AMT-01",
+      "planted": 200,
+      "detected": 200,
+      "missed": 0,
+      "rate": 1.0,
+      "ci95": [
+        0.981,
+        1.0
+      ]
+    },
+    {
+      "pattern": "Payments reversed",
+      "rule": "V-PAY-01",
+      "planted": 200,
+      "detected": 200,
+      "missed": 0,
+      "rate": 1.0,
+      "ci95": [
+        0.981,
+        1.0
+      ]
+    },
+    {
+      "pattern": "Unusual time to sanction and to complete",
+      "rule": "A-PEER-01",
+      "planted": 198,
+      "detected": 64,
+      "missed": 134,
+      "rate": 0.32323232323232326,
+      "ci95": [
+        0.262,
+        0.391
+      ]
+    },
+    {
+      "pattern": "Repair and renovation above Rs 50 lakh (para 5.1.9)",
+      "rule": "R-REPAIR-01",
+      "planted": 50,
+      "detected": 50,
+      "missed": 0,
+      "rate": 1.0,
+      "ci95": [
+        0.929,
+        1.0
+      ]
+    }
+  ],
+  "by_variant": [
+    {
+      "pattern": "Work not permitted (para 5.2.11)",
+      "variant": "english",
+      "planted": 40,
+      "detected": 40,
+      "rate": 1.0
+    },
+    {
+      "pattern": "Work not permitted (para 5.2.11)",
+      "variant": "named deity",
+      "planted": 40,
+      "detected": 40,
+      "rate": 1.0
+    },
+    {
+      "pattern": "Work not permitted (para 5.2.11)",
+      "variant": "mosque",
+      "planted": 40,
+      "detected": 40,
+      "rate": 1.0
+    },
+    {
+      "pattern": "Work not permitted (para 5.2.11)",
+      "variant": "hindi, with a wall",
+      "planted": 40,
+      "detected": 0,
+      "rate": 0.0
+    },
+    {
+      "pattern": "Work not permitted (para 5.2.11)",
+      "variant": "temple hall",
+      "planted": 40,
+      "detected": 0,
+      "rate": 0.0
+    },
+    {
+      "pattern": "Cost above comparable works",
+      "variant": "2x the peer median",
+      "planted": 50,
+      "detected": 9,
+      "rate": 0.18
+    },
+    {
+      "pattern": "Cost above comparable works",
+      "variant": "3x the peer median",
+      "planted": 50,
+      "detected": 26,
+      "rate": 0.52
+    },
+    {
+      "pattern": "Cost above comparable works",
+      "variant": "5x the peer median",
+      "planted": 50,
+      "detected": 43,
+      "rate": 0.86
+    },
+    {
+      "pattern": "Cost above comparable works",
+      "variant": "10x the peer median",
+      "planted": 50,
+      "detected": 44,
+      "rate": 0.88
+    },
+    {
+      "pattern": "Same work entered twice",
+      "variant": "clone, one word changed",
+      "planted": 200,
+      "detected": 191,
+      "rate": 0.955
+    },
+    {
+      "pattern": "Overdue against the one-year norm (para 3.2.12)",
+      "variant": "500 days, not complete",
+      "planted": 200,
+      "detected": 200,
+      "rate": 1.0
+    },
+    {
+      "pattern": "Awaiting sanction beyond 45 days (para 3.2.4)",
+      "variant": "120 days",
+      "planted": 200,
+      "detected": 200,
+      "rate": 1.0
+    },
+    {
+      "pattern": "Below the normal minimum (para 3.2.9)",
+      "variant": "Rs 1.5 lakh",
+      "planted": 200,
+      "detected": 200,
+      "rate": 1.0
+    },
+    {
+      "pattern": "Work changed after sanction (para 3.2.15)",
+      "variant": "description edited",
+      "planted": 200,
+      "detected": 200,
+      "rate": 1.0
+    },
+    {
+      "pattern": "Amount revised after sanction",
+      "variant": "+30%",
+      "planted": 200,
+      "detected": 200,
+      "rate": 1.0
+    },
+    {
+      "pattern": "Payments reversed",
+      "variant": "total paid down by Rs 50,000",
+      "planted": 200,
+      "detected": 200,
+      "rate": 1.0
+    },
+    {
+      "pattern": "Unusual time to sanction and to complete",
+      "variant": "3x the peer group's typical times",
+      "planted": 66,
+      "detected": 0,
+      "rate": 0.0
+    },
+    {
+      "pattern": "Unusual time to sanction and to complete",
+      "variant": "10x the peer group's typical times",
+      "planted": 66,
+      "detected": 10,
+      "rate": 0.15151515151515152
+    },
+    {
+      "pattern": "Unusual time to sanction and to complete",
+      "variant": "30x the peer group's typical times",
+      "planted": 66,
+      "detected": 54,
+      "rate": 0.8181818181818182
+    },
+    {
+      "pattern": "Repair and renovation above Rs 50 lakh (para 5.1.9)",
+      "variant": "6 works of Rs 10 lakh",
+      "planted": 50,
+      "detected": 50,
+      "rate": 1.0
+    }
+  ],
+  "findings_per_million_records": {
+    "A-COST-01": 59347,
+    "A-EXP-01": 2052,
+    "A-PEER-01": 74,
+    "D-DUP-01": 163599,
+    "D-DUP-02": 1562,
+    "N-NET-01": 1279,
+    "R-COST-01": 265138,
+    "R-PROH-01": 2565,
+    "R-REPAIR-01": 387,
+    "R-SANC-01": 158855,
+    "R-SANC-02": 3755,
+    "R-SCST-02": 134,
+    "R-TIME-01": 147828
+  },
+  "cases_per_million_records": 293670,
+  "alerts_per_million_records": 42824,
+  "baseline": {
+    "cases": 39493,
+    "alerts": 5759,
+    "findings": 108469
+  },
+  "scaling": {
+    "sizes": [
+      33620,
+      67240,
+      134481
+    ],
+    "seconds": [
+      45.7,
+      72.2,
+      112.4
+    ],
+    "peak_gb": [
+      0.64,
+      0.93,
+      1.51
+    ],
+    "exponent": 0.6489766711526846,
+    "projected_minutes_1m": 6.90319478977767,
+    "projected_gb_1m": 9.009459880698229,
+    "note": "analysis only (orchestrator); loading and saving add to both",
+    "linear_minutes_1m": 13.930096692717434
+  },
+  "caveats": [
+    "Detection rates are on planted cases, which are cleaner than real irregularities: upper bounds.",
+    "Finding volume is not a false-positive rate; precision needs reviewed samples.",
+    "Projection to 1M assumes the same mix of work types, states and stages as the corpus measured."
+  ]
+}

@@ -40,8 +40,8 @@ class Work(BaseModel):
     estimated_cost: Optional[float] = None
     sanctioned_amount: Optional[float] = None
     expenditure: Optional[float] = None
-    ia_name: Optional[str] = None            # implementing agency (IDA)
-    vendor_name: Optional[str] = None        # contractor/vendor paid for the work
+    ia_name: Optional[str] = None            # Implementing District Authority (IDA)
+    vendor_name: Optional[str] = None        # vendor paid the most on the work
     work_type: Optional[str] = None          # standardized MPLADS work-type string
     total_paid: Optional[float] = None       # sum of disbursements to date
     payment_count: Optional[int] = None      # number of disbursement tranches
@@ -52,6 +52,14 @@ class Work(BaseModel):
     lat: Optional[float] = None
     lon: Optional[float] = None
     fy: Optional[str] = None
+    # Portal fields added 16 Sep 2026. Kept last: an existing database gains
+    # them as appended columns (see `db.init_db`).
+    work_category: Optional[str] = None      # portal's own class, e.g. "Repair and Renovation"
+    letter_no: Optional[str] = None          # the MP's recommendation letter
+    term_start: Optional[str] = None         # recommending member's term, ISO dates
+    term_end: Optional[str] = None
+    implementing_agency: Optional[str] = None  # agency executing the work (payment records)
+    vendor_id: Optional[str] = None          # portal id of `vendor_name`
 
 
 class FundFlow(BaseModel):

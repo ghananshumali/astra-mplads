@@ -30,14 +30,19 @@ from datetime import datetime, timezone
 import pandas as pd
 
 from .. import HUMAN_REVIEW_DISCLAIMER
+from .. import data_confidence
+from .. import data_contract as contract
 from ..config import PROCESSED_DIR, load_rules
-from ..explain import brief_to_text, build_brief, humanize, short_title
+from ..explain import brief_to_text, build_brief, context_note, humanize, short_title
+from ..locale import text
 from ..schemas import Finding, Flag
 from .anomaly import AnomalyAgent
 from .base import BaseAgent
 from .compliance import ComplianceAgent
 from .entity_resolution import EntityResolutionAgent
 from .network import NetworkAgent
+from .payments import PaymentAgent
+from .revisions import RevisionAgent
 
 TIERS = ("mp", "district", "state", "ministry")
 
@@ -46,9 +51,12 @@ class Orchestrator:
     def __init__(self) -> None:
         self.agents: list[BaseAgent] = [
             ComplianceAgent(), AnomalyAgent(), EntityResolutionAgent(), NetworkAgent(),
+            RevisionAgent(), PaymentAgent(),
         ]
         self.route_trace: list[dict] = []
         self.rule_coverage: list[dict] = []
+        self.context: dict = {}
+        self.confidence: dict[str, int] = {}
 
     # ---------------- (a) routing ----------------
 
@@ -65,8 +73,8 @@ class Orchestrator:
             self.route_trace.append({
                 "agent": agent.name,
                 "dispatched": ok,
-                "reason": ("required inputs present" if ok else
-                           f"skipped — missing usable inputs: {missing or sorted(agent.needs_flows)}"),
+                "reason": (text("en", "router.ready") if ok else
+                           text("en", "router.skipped", missing=missing or sorted(agent.needs_flows))),
             })
             if ok:
                 selected.append(agent)
@@ -74,16 +82,30 @@ class Orchestrator:
 
     # ---------------- main entry ----------------
 
-    def run(self, works: pd.DataFrame, flows: pd.DataFrame) -> list[Flag]:
+    def run(self, works: pd.DataFrame, flows: pd.DataFrame,
+            context: dict | None = None) -> list[Flag]:
+        """Run every applicable module and fold the findings into cases.
+
+        `context` carries what is not a works or fund-flow row: the observed
+        edits (`versions`), works the portal stopped listing (`retired`) and
+        each area's health (`area_health`) and every payment record
+        (`payments`). `pipeline.run_pipeline` builds it; without it the
+        revision and payment modules and data confidence stand down.
+        """
+        self.context = context or {}
         agents = self.route(works, flows)
         all_findings: list[Finding] = []
         for agent in agents:
+            if hasattr(agent, "context"):
+                agent.context = self.context
             found = agent.run(works, flows)
             for t in self.route_trace:
                 if t["agent"] == agent.name:
                     t["findings"] = len(found)
             all_findings.extend(found)
 
+        self.confidence = data_confidence.annotate(
+            all_findings, works, self.context.get("area_health"))
         self.rule_coverage = self._rule_coverage(all_findings)
         flags = self._aggregate(all_findings, works)
         self._persist_trace(len(flags))
@@ -105,7 +127,7 @@ class Orchestrator:
                 for v in node:
                     walk(v)
 
-        for section in ("rules", "anomaly", "duplicates", "network"):
+        for section in ("rules", "anomaly", "duplicates", "network", "revisions", "payments"):
             walk(cfg.get(section))
         return found
 
@@ -120,11 +142,31 @@ class Orchestrator:
         counts: dict[str, int] = defaultdict(int)
         for f in findings:
             counts[f.rule_id] += 1
-        return [
-            {"rule_id": rid, "title": title, "findings": counts.get(rid, 0),
-             "evaluated": True}
-            for rid, title in sorted(self._known_rules().items())
-        ]
+        notes: dict[str, str] = {}
+        for agent in self.agents:
+            notes.update(getattr(agent, "notes", {}) or {})
+        cfg = load_rules()
+        basis: dict[str, str | None] = {}
+
+        def walk(node):
+            if isinstance(node, dict):
+                if "id" in node:
+                    basis[str(node["id"])] = node.get("basis")
+                for v in node.values():
+                    walk(v)
+            elif isinstance(node, list):
+                for v in node:
+                    walk(v)
+
+        walk(cfg)
+        coverage = []
+        for rid, title in sorted(self._known_rules().items()):
+            entry = {"rule_id": rid, "title": title, "findings": counts.get(rid, 0),
+                     "evaluated": rid not in notes, "basis": basis.get(rid)}
+            if rid in notes:
+                entry["stood_down"] = notes[rid]
+            coverage.append(entry)
+        return coverage
 
     # ---------------- (b) aggregation ----------------
 
@@ -135,6 +177,12 @@ class Orchestrator:
         by_entity: dict[tuple[str, str], list[Finding]] = defaultdict(list)
         for f in findings:
             by_entity[(f.entity_type, f.entity_id)].append(f)
+        # A finding marked `standalone: False` (a common deviation the guideline
+        # allows with recorded reasons) joins a case that exists for another
+        # reason, and never opens one by itself; its district authority's
+        # summary case carries it instead.
+        by_entity = {key: fs for key, fs in by_entity.items()
+                     if any(f.details.get("standalone", True) for f in fs)}
 
         # cross-case context maps (what no single agent can see)
         agency_flagged: dict[str, int] = defaultdict(int)
@@ -150,8 +198,22 @@ class Orchestrator:
         flags: list[Flag] = []
         for (etype, eid), fs in sorted(by_entity.items()):
             fs.sort(key=lambda f: ["critical", "high", "medium", "low"].index(f.severity))
-            score = min(100.0, sum(weights[f.severity] for f in fs))
+            # A portal record pair (one work's recommendation and sanctioned
+            # record, both listed by the portal) stays visible but carries no
+            # weight: it is how the portal records a work, not evidence of risk.
+            # Context findings (`standalone: False`) are shown on the case but
+            # carry no weight either: a deviation the guideline allows with
+            # recorded reasons must not tip a case into an alert.
+            score = min(100.0, sum(weights[f.severity] for f in fs
+                                   if not f.details.get("portal_record_pair")
+                                   and f.details.get("standalone", True)))
             meta = self._entity_meta(etype, eid, widx)
+            if meta.get("actor_type"):
+                # a vendor or implementing agency: its name is on the finding,
+                # since a vendor's entity id is its portal id
+                found = next((f.details for f in fs if f.details.get("actor")), {})
+                meta["actor"] = found.get("actor") or eid.partition(":")[2]
+                meta["vendor_id"] = found.get("vendor_id")
             context = {
                 "agency_other_flags": max(0, agency_flagged.get(meta.get("ia_name") or "", 1) - 1),
                 "state_total_flags": state_flag_count.get(meta.get("state") or "", 0),
@@ -161,11 +223,8 @@ class Orchestrator:
 
             # ---- presentation layer: structured, authority-specific briefs
             raw = {"findings": [f.model_dump() for f in fs]}
-            note = ""
-            if context["agency_other_flags"] > 0 and meta.get("ia_name"):
-                note = (f"The same implementing agency appears in "
-                        f"{context['agency_other_flags']} other flagged cases in this "
-                        f"dataset, so a common cause may be worth checking.")
+            note = context_note(raw["findings"],
+                                context["agency_other_flags"] if meta.get("ia_name") else 0)
             briefs = {t: build_brief(raw, t, {"note": note}) for t in TIERS}
             tier_views = {t: brief_to_text(b) for t, b in briefs.items()}
             primary = briefs["district"]["primary_risk"]
@@ -193,17 +252,30 @@ class Orchestrator:
         flags.sort(key=lambda f: -f.risk_score)
         return flags
 
-    @staticmethod
-    def _entity_meta(etype: str, eid: str, widx: pd.DataFrame) -> dict:
+    def _entity_meta(self, etype: str, eid: str, widx: pd.DataFrame) -> dict:
         if etype == "work" and not widx.empty and eid in widx.index:
             row = widx.loc[eid]
             if isinstance(row, pd.DataFrame):
                 row = row.iloc[0]
-            return {k: (None if pd.isna(v) else v) for k, v in row.to_dict().items()}
+            return {k: (None if not isinstance(v, (list, dict)) and pd.isna(v) else v)
+                    for k, v in row.to_dict().items()}
+        if etype == "work":
+            # a work the portal no longer lists: describe it from its last record
+            retired = self.context.get("retired") if self.context else None
+            if isinstance(retired, pd.DataFrame) and not retired.empty:
+                match = retired[retired["work_id"].astype(str) == str(eid)]
+                if not match.empty:
+                    try:
+                        return json.loads(match.iloc[0].get("record_json") or "{}")
+                    except ValueError:
+                        return {}
         if etype == "constituency" and "|" in eid:
             name, state = eid.split("|", 1)
             return {"constituency": name, "state": state}
         if etype == "agency":
+            kind, sep, _ = eid.partition(":")
+            if sep and kind in ("vendor", "agency"):
+                return {"actor_type": kind}
             return {"ia_name": eid}
         return {}
 
@@ -213,9 +285,13 @@ class Orchestrator:
         if etype == "work":
             return short_title(meta.get("description"), meta.get("category"))
         if etype == "constituency":
-            return f"{meta.get('constituency', eid)} constituency"
+            return text("en", "title.constituency", name=meta.get("constituency", eid))
+        if meta.get("actor_type"):
+            return str(meta.get("actor") or eid.partition(":")[2]).title()[:62]
         actor = str(meta.get("ia_name", eid))
-        return actor.split(":", 1)[-1].title()[:62]
+        if contract.is_district_authority(actor):
+            return text("en", "title.district_authority", name=actor.split("(")[0].strip().title())
+        return actor.title()[:62]
 
     @staticmethod
     def _label(etype: str, eid: str, meta: dict) -> str:
@@ -224,7 +300,16 @@ class Orchestrator:
             return f"Work {eid}" + (f" — {desc}" if desc else "")
         if etype == "constituency":
             return f"{meta.get('constituency', eid)} ({meta.get('state', '')})".strip()
-        return f"Agency: {str(meta.get('ia_name', eid)).title()}"
+        name = str(meta.get("actor") or eid.partition(":")[2]).title()
+        if meta.get("actor_type") == "vendor":
+            return f"Vendor: {name}" + (f" (portal vendor id {meta['vendor_id']})"
+                                        if meta.get("vendor_id") else "")
+        if meta.get("actor_type") == "agency":
+            return f"Implementing agency: {name}"
+        actor = str(meta.get("ia_name", eid))
+        if contract.is_district_authority(actor):
+            return f"District authority: {actor.split('(')[0].strip().title()}"
+        return f"District authority: {actor.title()}"
 
     # ---------------- (c) causal narrative ----------------
 
@@ -234,9 +319,11 @@ class Orchestrator:
         chain = "Flagged because: " + "; furthermore, ".join(parts[:4]) + "."
         extras = []
         if ctx["agency_other_flags"] > 0 and meta.get("ia_name"):
+            # `ia_name` is the district authority, not an implementing agency
+            # (see data_contract), so this is a count for the whole district.
             extras.append(
-                f"The implementing agency ({str(meta['ia_name']).title()}) is associated "
-                f"with {ctx['agency_other_flags']} other flagged case(s) in this dataset."
+                f"The same district authority ({str(meta['ia_name']).split('(')[0].strip().title()}) "
+                f"has {ctx['agency_other_flags']} other flagged case(s) in this dataset."
             )
         if len(fs) > 1:
             agents_involved = sorted({f.agent for f in fs})
@@ -327,4 +414,6 @@ class Orchestrator:
                 "router_trace": self.route_trace,
                 "rule_coverage": getattr(self, "rule_coverage", []),
                 "flags_produced": n_flags,
+                "data_confidence": self.confidence,
+                "unchecked_provisions": contract.UNCHECKABLE,
             }, fh, indent=2)
