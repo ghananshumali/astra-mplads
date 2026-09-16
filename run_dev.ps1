@@ -31,6 +31,7 @@ if (Test-PortBusy 8000) {
   Write-Host "[ASTRA] Port 8000 is already in use." -ForegroundColor Red
   Write-Host "        Stop the process using it, or the API cannot start:" -ForegroundColor Red
   Write-Host "        Get-NetTCPConnection -LocalPort 8000 -State Listen | Select-Object OwningProcess"
+  Write-Host "        If ASTRA is running unattended, stop it first:  python -m astra.ops.supervisor --stop"
   exit 1
 }
 if (Test-PortBusy 5173) {
