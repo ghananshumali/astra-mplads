@@ -34,6 +34,12 @@ BASE_URL = os.environ.get("ASTRA_LLM_BASE_URL",
 DEFAULT_MODEL = os.environ.get("ASTRA_GROQ_MODEL", "openai/gpt-oss-20b")
 #: models known to honour `strict: true` constrained decoding
 STRICT_SCHEMA_MODELS = ("openai/gpt-oss-20b", "openai/gpt-oss-120b", "qwen")
+#: Reasoning models think before they write, and the thinking counts against
+#: max_tokens. At the provider's default effort gpt-oss can spend the whole
+#: budget thinking and return empty fields, or nothing (Groq then answers 400
+#: json_validate_failed). The task is explaining supplied evidence, so low is enough.
+REASONING_MODELS = ("gpt-oss",)
+REASONING_EFFORT = os.environ.get("ASTRA_LLM_REASONING_EFFORT", "low")
 
 TIMEOUT = float(os.environ.get("ASTRA_LLM_TIMEOUT", "20"))
 MAX_RETRIES = int(os.environ.get("ASTRA_LLM_RETRIES", "1"))
@@ -132,6 +138,8 @@ def complete_json(system: str, user: str, schema: dict,
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
+    if any(m in model for m in REASONING_MODELS) and REASONING_EFFORT:
+        base["reasoning_effort"] = REASONING_EFFORT
     attempts = [
         dict(base, response_format={
             "type": "json_schema",

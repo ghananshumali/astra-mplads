@@ -12,6 +12,12 @@ It provides:
                      benchmark, and its contribution to the risk score
   build_brief()      a whole flag -> structured, authority-specific brief:
                      primary risk, supporting signals, evidence, actions
+  brief_for()        the brief for a stored case in the reader's language
+
+Every sentence is a template in config/locales/<language>.yaml (astra/locale),
+so a brief reads the same facts and figures in English and in Hindi. English
+is what the analysis stores; another language is rendered on request from the
+stored findings.
 
 Framing rules enforced here:
   * nothing is ever described as fraud, corruption or wrongdoing;
@@ -20,9 +26,12 @@ Framing rules enforced here:
 """
 from __future__ import annotations
 
+import functools
 import re
 
-from .config import load_rules
+from . import locale
+from .config import cite, load_guidelines, load_rules
+from .locale import DEFAULT, money, text, text_or, texts
 
 # --------------------------------------------------------------- titles
 
@@ -42,78 +51,77 @@ def short_title(description: str | None, category: str | None = None,
     strips boilerplate, and falls back to the standardised work type. The full
     original text is always kept and shown in the case detail view.
     """
-    text = _WS.sub(" ", str(description or "")).strip(" .,-–—")
-    text = _WS.sub(" ", _NOISE.sub("", text)).strip(" .,-–—")
-    if len(text) < 8:
-        text = _WS.sub(" ", str(category or "")).strip()
-    if not text:
+    text_ = _WS.sub(" ", str(description or "")).strip(" .,-–—")
+    text_ = _WS.sub(" ", _NOISE.sub("", text_)).strip(" .,-–—")
+    if len(text_) < 8:
+        text_ = _WS.sub(" ", str(category or "")).strip()
+    if not text_:
         return "Untitled work"
-    if len(text) <= max_len:
-        return text[0].upper() + text[1:]
-    cut = text[:max_len]
+    if len(text_) <= max_len:
+        return text_[0].upper() + text_[1:]
+    cut = text_[:max_len]
     if " " in cut:
         cut = cut[:cut.rindex(" ")]
     return (cut[0].upper() + cut[1:]).rstrip(" .,-–—") + "…"
 
 
-def rupees(value) -> str:
+def rupees(value, lang: str = DEFAULT) -> str:
     """Indian-convention money formatting: lakh / crore."""
-    try:
-        v = float(value)
-    except (TypeError, ValueError):
-        return "—"
-    if abs(v) >= 1e7:
-        return f"₹{v / 1e7:,.2f} crore"
-    if abs(v) >= 1e5:
-        return f"₹{v / 1e5:,.2f} lakh"
-    return f"₹{v:,.0f}"
+    return money(value, lang)
 
 
 # --------------------------------------------------------------- agents
 
-AGENT_LABEL = {
-    "compliance": "Compliance Agent",
-    "anomaly": "Statistical Anomaly Agent",
-    "entity_resolution": "Entity Resolution Agent",
-    "network": "Network Analysis Agent",
-}
-AGENT_ROLE = {
-    "compliance": "Checks each work against MPLADS scheme rules",
-    "anomaly": "Compares cost against similar works in the same state",
-    "entity_resolution": "Looks for the same work recorded more than once",
-    "network": "Looks at contractor and agency patterns across districts",
-}
-
-SEVERITY_LABEL = {"critical": "Critical", "high": "High",
-                  "medium": "Medium", "low": "Low"}
+AGENTS = ("compliance", "anomaly", "entity_resolution", "network", "revisions", "payments")
+AGENT_LABEL = {a: text(DEFAULT, f"agent.{a}.label") for a in AGENTS}
+AGENT_ROLE = {a: text(DEFAULT, f"agent.{a}.role") for a in AGENTS}
+SEVERITY_LABEL = {s: text(DEFAULT, f"severity.{s}") for s in ("critical", "high", "medium", "low")}
 
 
-def risk_band(score: float) -> tuple[str, str]:
+def agent_label(agent: str, lang: str = DEFAULT) -> str:
+    return text_or(lang, f"agent.{agent}.label", agent)
+
+
+def risk_band(score: float, lang: str = DEFAULT) -> tuple[str, str]:
     """(label, colour) for a composite risk score."""
     if score >= 70:
-        return "High risk", "#c0392b"
+        return text(lang, "risk_band.high"), "#c0392b"
     if score >= 40:
-        return "Medium risk", "#d68910"
-    return "Low risk", "#5d6d7e"
+        return text(lang, "risk_band.medium"), "#d68910"
+    return text(lang, "risk_band.low"), "#5d6d7e"
 
 
 # --------------------------------------------------------------- findings
 
-def humanize(finding: dict) -> dict:
+def humanize(finding: dict, lang: str = DEFAULT) -> dict:
     """One agent finding -> plain-language, non-accusatory explanation."""
+    lang = locale.normalise(lang)
     rid = finding.get("rule_id", "")
     d = finding.get("details") or {}
     sev = finding.get("severity", "medium")
     weights = load_rules()["risk_score"]["weights"]
+    agent = finding.get("agent", "")
+
+    def t(key: str, **values) -> str:
+        return text(lang, key, **values)
+
+    def ts(key: str, **values) -> list[str]:
+        return texts(lang, key, **values)
+
+    def rs(value) -> str:
+        return money(value, lang)
 
     out = {
         "rule_id": rid,
-        "agent": finding.get("agent", ""),
-        "agent_label": AGENT_LABEL.get(finding.get("agent", ""), finding.get("agent", "")),
+        "agent": agent,
+        "agent_label": agent_label(agent, lang),
         "severity": sev,
-        "severity_label": SEVERITY_LABEL.get(sev, sev.title()),
-        "contribution": 0 if d.get("portal_record_pair") else weights.get(sev, 0),
-        "clause": finding.get("clause"),
+        "severity_label": text_or(lang, f"severity.{sev}", sev.title()),
+        "contribution": 0 if d.get("portal_record_pair") or d.get("standalone") is False
+                        else weights.get(sev, 0),
+        # shown for completeness, deliberately outside the score
+        "context": bool(d.get("portal_record_pair") or d.get("standalone") is False),
+        "clause": clause_text(finding.get("clause"), lang),
         "headline": finding.get("rule_title", rid),
         "plain": finding.get("summary", ""),
         "metric": None,
@@ -126,265 +134,413 @@ def humanize(finding: dict) -> dict:
     if rid == "R-TIME-01":
         days = d.get("days_elapsed")
         years = (days or 0) / 365.0
-        out["headline"] = "Work is overdue against the one-year completion norm"
-        out["plain"] = (
-            f"This work was sanctioned {days:,} days ago "
-            f"({years:.1f} years) and is {'still not complete' if d.get('incomplete') else 'recorded as completed late'}. "
-            f"The scheme expects works to finish within one year of sanction."
-            if days else out["plain"])
-        out["metric"] = f"{days:,} days since sanction" if days else None
-        out["benchmark"] = f"{d.get('max_days', 365)} days (scheme norm)"
-        out["actions"] = [
-            "Obtain the current physical progress report from the implementing agency.",
-            "Ask the agency to record the reason for delay and a revised completion date.",
-        ]
+        out["headline"] = t("R-TIME-01.headline")
+        if days:
+            out["plain"] = t("R-TIME-01.plain", days=days, years=years,
+                             progress=t("R-TIME-01.incomplete" if d.get("incomplete")
+                                        else "R-TIME-01.completed_late"))
+        out["metric"] = t("R-TIME-01.metric", days=days) if days else None
+        out["benchmark"] = t("R-TIME-01.benchmark", max_days=d.get("max_days", 365))
+        out["actions"] = ts("R-TIME-01.actions")
 
     # ---- compliance: prohibited / non-permissible
     elif rid == "R-PROH-01":
         term = d.get("matched_pattern", "")
-        if d.get("match_type") == "activity":
-            out["headline"] = "Expenditure may not be an admissible MPLADS charge"
-            out["plain"] = (
-                f"The description indicates '{term}'. Routine operation and maintenance "
-                f"is the state government's responsibility and is not normally payable "
-                f"from MPLADS funds. The scope needs confirming before any release.")
-            out["actions"] = ["Confirm from the estimate whether this is new asset creation or routine upkeep."]
-        else:
-            out["headline"] = "Asset may fall in the scheme's non-permissible list"
-            out["plain"] = (
-                f"The work description suggests the asset being created is a "
-                f"'{term}', which is not normally permissible under the scheme. "
-                f"This needs confirming — descriptions often name nearby landmarks, "
-                f"so the actual asset may well be permissible.")
-            out["actions"] = ["Confirm from the sanction file what asset is actually being built."]
-        out["metric"] = f"matched term: '{term}'"
-        out["benchmark"] = "MPLADS non-permissible works list"
+        para = d.get("para")
+        para_ref = t("R-PROH-01.para_ref", para=para) if para else ""
+        kind = "activity" if d.get("match_type") == "activity" else "asset"
+        out["headline"] = t(f"R-PROH-01.{kind}.headline")
+        out["plain"] = t(f"R-PROH-01.{kind}.plain", term=term, para_ref=para_ref)
+        out["actions"] = ts(f"R-PROH-01.{kind}.actions")
+        out["metric"] = t("R-PROH-01.metric", term=term)
+        out["benchmark"] = t("R-PROH-01.benchmark", para=para or "5.2")
 
     # ---- compliance: cost floor / ceiling
     elif rid == "R-COST-01":
         cost, floor, ceil = d.get("cost"), d.get("floor"), d.get("ceiling")
-        if floor is not None:
-            out["headline"] = "Sanctioned below the scheme's minimum work value"
-            out["plain"] = (
-                f"This work is sanctioned at {rupees(cost)}, below the "
-                f"{rupees(floor)} minimum permitted per work. Very small works can "
-                f"also indicate a larger work split into pieces, so the sanction "
-                f"basis is worth checking.")
-            out["metric"] = f"{rupees(cost)} sanctioned"
-            out["benchmark"] = f"{rupees(floor)} minimum per work"
-            out["actions"] = ["Check whether this is part of a larger work split into smaller sanctions."]
+        if d.get("district_summary"):
+            values = dict(works=d.get("works", 0), out_of=d.get("out_of", 0),
+                          share=d.get("share", 0))
+            key = "R-COST-01.summary"
+        elif floor is not None:
+            values = dict(cost=rs(cost), floor=rs(floor))
+            key = "R-COST-01.floor"
         else:
-            out["headline"] = "Sanctioned above the single-work review ceiling"
-            out["plain"] = (f"This work is sanctioned at {rupees(cost)}, above the "
-                            f"{rupees(ceil)} value at which a single work warrants "
-                            f"closer scrutiny.")
-            out["metric"] = f"{rupees(cost)} sanctioned"
-            out["benchmark"] = f"{rupees(ceil)} review ceiling"
-            out["actions"] = ["Verify the detailed estimate and technical sanction for a work of this size."]
+            values = dict(cost=rs(cost), ceiling=rs(ceil))
+            key = "R-COST-01.ceiling"
+        out["headline"] = t(f"{key}.headline")
+        out["plain"] = t(f"{key}.plain", **values)
+        out["metric"] = t(f"{key}.metric", **values)
+        out["benchmark"] = t(f"{key}.benchmark", **values)
+        out["actions"] = ts(f"{key}.actions")
 
     # ---- compliance: idle funds
     elif rid == "R-PILE-01":
-        out["headline"] = "Funds are lying largely unspent"
-        out["plain"] = (
-            f"Only {d.get('cum_util_pct', 0):.0f}% of the "
-            f"{rupees(d.get('released_total'))} released has been spent across "
-            f"{d.get('years')} years. MPLADS funds do not lapse, so unspent money "
-            f"accumulates rather than being returned — this is an efficiency "
-            f"concern, not a rule breach.")
-        out["metric"] = f"{d.get('cum_util_pct', 0):.0f}% of funds utilised"
-        out["benchmark"] = f"{load_rules()['rules']['unspent_pileup']['max_cum_util_pct']:.0f}% threshold"
-        out["actions"] = ["Review the pending works list and identify what is blocking execution."]
+        out["headline"] = t("R-PILE-01.headline")
+        out["plain"] = t("R-PILE-01.plain", years=d.get("years"), pct=d.get("cum_util_pct", 0),
+                         entitlement=rs(d.get("entitlement_total") or d.get("released_total")))
+        out["metric"] = t("R-PILE-01.metric", pct=d.get("cum_util_pct", 0))
+        out["benchmark"] = t("R-PILE-01.benchmark",
+                             threshold=load_rules()["rules"]["unspent_pileup"]["max_cum_util_pct"])
+        out["actions"] = ts("R-PILE-01.actions")
 
     # ---- compliance: spike
     elif rid == "R-SPIKE-01":
-        out["headline"] = "Sudden surge in spending after dormant years"
-        out["plain"] = (
-            f"Utilisation jumped to {d.get('spike_pct', 0):.0f}% in {d.get('spike_fy')} "
-            f"after years averaging {d.get('dormant_avg_pct', 0):.0f}%. Because MPLADS "
-            f"funds never lapse, a late surge can indicate rushed, year-end spending.")
-        out["metric"] = f"{d.get('spike_pct', 0):.0f}% in {d.get('spike_fy')}"
-        out["benchmark"] = f"{d.get('dormant_avg_pct', 0):.0f}% in prior years"
-        out["actions"] = ["Check whether works sanctioned in the surge year followed normal appraisal."]
+        values = dict(spike=d.get("spike_pct", 0), fy=d.get("spike_fy"),
+                      dormant=d.get("dormant_avg_pct", 0))
+        out["headline"] = t("R-SPIKE-01.headline")
+        out["plain"] = t("R-SPIKE-01.plain", **values)
+        out["metric"] = t("R-SPIKE-01.metric", **values)
+        out["benchmark"] = t("R-SPIKE-01.benchmark", **values)
+        out["actions"] = ts("R-SPIKE-01.actions")
 
     # ---- compliance: SC/ST screening proxy
     elif rid == "R-SCST-02":
-        out["headline"] = f"Low share of spending in {d.get('kind', 'SC/ST')}-reserved constituencies"
-        out["plain"] = (
-            f"In {d.get('state')}, {d.get('kind')}-reserved constituencies received "
-            f"{d.get('pct', 0):.1f}% of MPLADS spending, against a {d.get('benchmark_pct')}% "
-            f"scheme benchmark. This is a screening indicator only — the scheme's "
-            f"requirement concerns SC/ST areas, which this dataset does not itemise.")
-        out["metric"] = f"{d.get('pct', 0):.1f}% of state spending"
-        out["benchmark"] = f"{d.get('benchmark_pct')}% scheme benchmark"
-        out["actions"] = ["Pull district-level allocation data to assess actual area-wise compliance."]
+        out["headline"] = t("R-SCST-02.headline", kind=d.get("kind", "SC/ST"))
+        out["plain"] = t("R-SCST-02.plain", state=d.get("state"), kind=d.get("kind"),
+                         pct=d.get("pct", 0), benchmark=d.get("benchmark_pct"))
+        out["metric"] = t("R-SCST-02.metric", pct=d.get("pct", 0))
+        out["benchmark"] = t("R-SCST-02.benchmark", benchmark=d.get("benchmark_pct"))
+        out["actions"] = ts("R-SCST-02.actions")
+
+    # ---- compliance: time to sanction
+    elif rid == "R-SANC-01":
+        if d.get("district_summary"):
+            key, values = "R-SANC-01.summary", dict(works=d.get("works", 0), share=d.get("share", 0))
+        else:
+            key, values = "R-SANC-01.single", dict(days=d.get("days_waiting") or 0)
+        out["headline"] = t(f"{key}.headline")
+        out["plain"] = t(f"{key}.plain", **values)
+        out["metric"] = t(f"{key}.metric", **values)
+        out["benchmark"] = t("R-SANC-01.benchmark")
+        out["actions"] = ts(f"{key}.actions")
+
+    elif rid == "R-SANC-02":
+        out["headline"] = t("R-SANC-02.headline")
+        out["plain"] = t("R-SANC-02.plain", works=d.get("sanctioned_works", 0),
+                         median=d.get("median_days", 0), share=d.get("over_limit_share", 0))
+        out["metric"] = t("R-SANC-02.metric", median=d.get("median_days", 0))
+        out["benchmark"] = t("R-SANC-02.benchmark")
+        out["actions"] = ts("R-SANC-02.actions")
+
+    # ---- compliance: repair and renovation cap
+    elif rid == "R-REPAIR-01":
+        values = dict(fy=d.get("fy"), total=rs(d.get("total")), works=d.get("works"),
+                      cap=rs(d.get("cap")))
+        out["headline"] = t("R-REPAIR-01.headline")
+        if d.get("portal_category_works") is not None:
+            out["plain"] = t("R-REPAIR-01.plain_portal", **values,
+                             classed=d.get("portal_category_works"),
+                             classed_total=rs(d.get("portal_category_total")),
+                             described=d.get("described_only_works"))
+        else:
+            out["plain"] = t("R-REPAIR-01.plain", **values)
+        out["metric"] = t("R-REPAIR-01.metric", **values)
+        out["benchmark"] = t("R-REPAIR-01.benchmark", **values)
+        out["actions"] = ts("R-REPAIR-01.actions")
+
+    # ---- compliance: societies and trusts cap
+    elif rid == "R-TRUST-01":
+        values = dict(fy=d.get("fy"), total=rs(d.get("total")), works=d.get("works"),
+                      cap=rs(d.get("cap")))
+        out["headline"] = t("R-TRUST-01.headline")
+        out["plain"] = t("R-TRUST-01.plain", **values)
+        out["metric"] = t("R-TRUST-01.metric", **values)
+        out["benchmark"] = t("R-TRUST-01.benchmark", **values)
+        out["actions"] = ts("R-TRUST-01.actions")
+
+    # ---- revisions observed on the portal
+    elif rid == "V-REV-01":
+        fields = t("list_separator").join(
+            c.get("field", "") if lang == DEFAULT else text_or(lang, f"field.{c.get('field', '')}",
+                                                                c.get("field", ""))
+            for c in d.get("changes", []))
+        out["headline"] = t("V-REV-01.headline")
+        out["plain"] = t("V-REV-01.plain", fields=fields, seen=str(d.get("observed_at"))[:10])
+        out["metric"] = t("V-REV-01.metric", fields=fields)
+        out["benchmark"] = t("V-REV-01.benchmark")
+        out["actions"] = ts("V-REV-01.actions")
+
+    elif rid == "V-AMT-01":
+        out["headline"] = t("V-AMT-01.headline_up" if (d.get("change") or 0) > 0
+                            else "V-AMT-01.headline_down")
+        out["plain"] = t("V-AMT-01.plain", old=rs(d.get("old_amount")), new=rs(d.get("new_amount")),
+                         pct=d.get("pct_change", 0),
+                         year_end=t("V-AMT-01.year_end") if d.get("near_year_end") else "")
+        out["metric"] = t("V-AMT-01.metric", pct=d.get("pct_change", 0))
+        out["benchmark"] = t("V-AMT-01.benchmark")
+        out["actions"] = ts("V-AMT-01.actions")
+
+    elif rid == "V-IA-01":
+        out["headline"] = t("V-IA-01.headline")
+        out["plain"] = t("V-IA-01.plain", old=d.get("old"), new=d.get("new"))
+        out["actions"] = ts("V-IA-01.actions")
+
+    elif rid == "V-VEN-01":
+        out["headline"] = t("V-VEN-01.headline")
+        out["plain"] = t("V-VEN-01.plain", old=d.get("old"), new=d.get("new"),
+                         how=t("V-VEN-01.with_payment" if d.get("with_new_payment")
+                               else "V-VEN-01.without_payment"))
+        out["actions"] = ts("V-VEN-01.actions")
+
+    elif rid == "V-PAY-01":
+        out["headline"] = t("V-PAY-01.headline")
+        out["plain"] = t("V-PAY-01.plain", old=rs(d.get("old_total_paid")),
+                         new=rs(d.get("new_total_paid")))
+        out["metric"] = t("V-PAY-01.metric", reduction=rs(d.get("reduction")))
+        out["actions"] = ts("V-PAY-01.actions")
+
+    elif rid == "V-LIST-01":
+        out["headline"] = t("V-LIST-01.headline")
+        out["plain"] = t("V-LIST-01.plain", paid=rs(d.get("total_paid")))
+        out["metric"] = t("V-LIST-01.metric", paid=rs(d.get("total_paid")))
+        out["actions"] = ts("V-LIST-01.actions")
+
+    elif rid == "V-FREQ-01":
+        out["headline"] = t("V-FREQ-01.headline")
+        out["plain"] = t("V-FREQ-01.plain", revisions=d.get("revisions"),
+                         average=d.get("peer_average"))
+        out["actions"] = ts("V-FREQ-01.actions")
+
+    # ---- anomaly: several measures at once
+    elif rid == "A-PEER-01":
+        measures = d.get("measures", [])
+        labels = t("A-PEER-01.separator").join(
+            m.get("label", "") if lang == DEFAULT
+            else text_or(lang, f"measure.{m.get('measure')}", m.get("label", ""))
+            for m in measures)
+        out["headline"] = t("A-PEER-01.headline")
+        out["plain"] = t("A-PEER-01.plain", peers=d.get("peers", 0), count=len(measures),
+                         labels=labels)
+        out["metric"] = labels
+        out["benchmark"] = t("A-PEER-01.benchmark")
+        out["actions"] = ts("A-PEER-01.actions")
 
     # ---- anomaly: cost vs peers
     elif rid == "A-COST-01":
-        cost, bench = d.get("cost"), d.get("benchmark")
+        cost, bench = rs(d.get("cost")), rs(d.get("benchmark"))
         pct, peers = d.get("pct_vs_benchmark", 0), d.get("peers", 0)
         if d.get("scale_mismatch"):
-            out["headline"] = "Cost far outside the range for this work type"
-            out["plain"] = (
-                f"This work costs {rupees(cost)} against a typical {rupees(bench)} "
-                f"for the same type of work in this state — about "
-                f"{d.get('ratio_vs_benchmark', 0):,.0f} times higher. A gap this wide "
-                f"usually means the work is a different scale to its peers (for example "
-                f"a whole-ward installation recorded under a single-unit category), "
-                f"so the classification should be checked before reading it as an overrun.")
-            out["actions"] = ["Confirm the work's scope and whether it is categorised correctly."]
+            out["headline"] = t("A-COST-01.scale.headline")
+            out["plain"] = t("A-COST-01.scale.plain", cost=cost, benchmark=bench,
+                             ratio=d.get("ratio_vs_benchmark", 0))
+            out["actions"] = ts("A-COST-01.scale.actions")
         else:
-            out["headline"] = f"Cost is {pct:.0f}% above comparable works"
-            out["plain"] = (
-                f"This work costs {rupees(cost)}. Comparable works of the same type in "
-                f"{d.get('peer_group', '').split('|')[0]} typically cost {rupees(bench)} — "
-                f"this is {pct:.0f}% higher. The comparison uses {peers:,} similar works "
-                f"from the same period.")
-            out["actions"] = [
-                "Compare the estimate against the state Schedule of Rates for this work type.",
-                "Verify measurements and quantities recorded in the measurement book.",
-            ]
-        out["metric"] = f"{rupees(cost)} actual"
-        out["benchmark"] = f"{rupees(bench)} typical ({peers:,} comparable works)"
+            out["headline"] = t("A-COST-01.above.headline", pct=pct)
+            out["plain"] = t("A-COST-01.above.plain", cost=cost, benchmark=bench, pct=pct,
+                             peers=peers, place=d.get("peer_group", "").split("|")[0])
+            out["actions"] = ts("A-COST-01.above.actions")
+        out["metric"] = t("A-COST-01.metric", cost=cost)
+        out["benchmark"] = t("A-COST-01.benchmark", benchmark=bench, peers=peers)
 
     # ---- anomaly: expenditure pattern
     elif rid == "A-EXP-01":
-        out["headline"] = "Annual spending is unusual compared with other constituencies"
-        out["plain"] = (
-            f"Spending of {rupees(d.get('expenditure'))} in {d.get('fy')} sits far "
-            f"outside the normal range for that year across all constituencies.")
-        out["metric"] = f"{rupees(d.get('expenditure'))} in {d.get('fy')}"
-        out["benchmark"] = "national distribution for the same year"
-        out["actions"] = ["Review the year's sanction and release records for this constituency."]
+        values = dict(expenditure=rs(d.get("expenditure")), fy=d.get("fy"))
+        out["headline"] = t("A-EXP-01.headline")
+        out["plain"] = t("A-EXP-01.plain", **values)
+        out["metric"] = t("A-EXP-01.metric", **values)
+        out["benchmark"] = t("A-EXP-01.benchmark")
+        out["actions"] = ts("A-EXP-01.actions")
 
     # ---- entity resolution: near-duplicate
     elif rid == "D-DUP-01" and d.get("portal_record_pair"):
-        out["headline"] = "Listed twice on the portal: recommendation and sanctioned record"
-        out["plain"] = (
-            f"The portal still lists the original recommendation {d.get('pending_work_id')}"
-            f" (stage \"{d.get('pending_stage') or 'not recorded'}\") alongside the "
-            f"sanctioned record {d.get('sanctioned_work_id')}, for the same member and "
-            f"the same recommendation date ({d.get('recommended_date')}). This is how "
-            f"the portal keeps a work that has moved from recommendation to sanction, "
-            f"so it is probably one work rather than a double entry. It is shown for "
-            f"completeness and does not add to the risk score.")
-        out["metric"] = (f"{d.get('semantic_sim', 0) * 100:.0f}% description match, "
-                         f"same member and date")
-        out["benchmark"] = "one record per work expected"
-        out["actions"] = [
-            f"If needed, confirm on the portal that {d.get('pending_work_id')} is the "
-            f"recommendation that became {d.get('sanctioned_work_id')}.",
-        ]
+        values = dict(pending=d.get("pending_work_id"), sanctioned=d.get("sanctioned_work_id"),
+                      stage=d.get("pending_stage") or t("D-DUP-01.pair.stage_unknown"),
+                      date=d.get("recommended_date"),
+                      similarity=d.get("semantic_sim", 0) * 100)
+        out["headline"] = t("D-DUP-01.pair.headline")
+        out["plain"] = t("D-DUP-01.pair.plain", **values)
+        out["metric"] = t("D-DUP-01.pair.metric", **values)
+        out["benchmark"] = t("D-DUP-01.pair.benchmark")
+        out["actions"] = ts("D-DUP-01.pair.actions", **values)
 
     elif rid == "D-DUP-01":
-        same_cost = d.get("same_sanction_amount")
         strong = d.get("evidence_strength") == "strong"
-        out["headline"] = ("Very likely the same work recorded twice" if strong
-                           else "Closely similar to another work nearby")
-        out["plain"] = (
-            f"The description is {d.get('semantic_sim', 0) * 100:.0f}% identical to work "
-            f"{d.get('pair_work_id')} in the same district"
-            + (f", and both are sanctioned for the same amount "
-               f"({rupees(d.get('this_cost'))})" if same_cost else "")
-            + ". Approval checks look at one work at a time, so a repeat entry like "
-              "this is not caught by the normal workflow. The two records should be "
-              "checked to confirm whether they are separate assets.")
-        out["metric"] = f"{d.get('semantic_sim', 0) * 100:.0f}% description match"
-        out["benchmark"] = f"{load_rules()['duplicates']['semantic_threshold'] * 100:.0f}% similarity threshold"
-        out["actions"] = [
-            f"Compare this work's file against work {d.get('pair_work_id')}.",
-            "Confirm the two works are at different locations before further release.",
-        ]
+        values = dict(similarity=d.get("semantic_sim", 0) * 100, pair=d.get("pair_work_id"))
+        out["headline"] = t("D-DUP-01.match.headline_strong" if strong
+                            else "D-DUP-01.match.headline_similar")
+        out["plain"] = t("D-DUP-01.match.plain", **values,
+                         same_amount=t("D-DUP-01.match.same_amount", cost=rs(d.get("this_cost")))
+                         if d.get("same_sanction_amount") else "")
+        out["metric"] = t("D-DUP-01.match.metric", **values)
+        out["benchmark"] = t("D-DUP-01.match.benchmark",
+                             threshold=load_rules()["duplicates"]["semantic_threshold"] * 100)
+        out["actions"] = ts("D-DUP-01.match.actions", **values)
 
     # ---- entity resolution: generic cluster
     elif rid == "D-DUP-02":
-        out["headline"] = "Several works share one vague description"
-        out["plain"] = (
-            f"{d.get('cluster_size')} works in {d.get('district')} are all described "
-            f"only as \"{d.get('normalised_description', '')[:50]}\", together worth "
-            f"{rupees(d.get('total_cost'))}. They are probably distinct assets, but the "
-            f"descriptions are too thin for anyone to verify that from the record.")
-        out["metric"] = f"{d.get('cluster_size')} works, {rupees(d.get('total_cost'))}"
-        out["benchmark"] = "distinct locations expected per work"
-        out["actions"] = ["Ask the agency to record specific locations for each of these works."]
+        values = dict(size=d.get("cluster_size"), district=d.get("district"),
+                      description=d.get("normalised_description", "")[:50],
+                      total=rs(d.get("total_cost")))
+        out["headline"] = t("D-DUP-02.headline")
+        out["plain"] = t("D-DUP-02.plain", **values)
+        out["metric"] = t("D-DUP-02.metric", **values)
+        out["benchmark"] = t("D-DUP-02.benchmark")
+        out["actions"] = ts("D-DUP-02.actions")
 
     # ---- network
     elif rid == "N-NET-01":
-        kind = d.get("actor_type", "agency")
-        out["headline"] = f"Unusual pattern for this {kind}"
+        raw_kind = d.get("actor_type", "agency")
+        kind = text_or(lang, f"N-NET-01.kind.{raw_kind}", str(raw_kind))
         bits = []
         if d.get("districts", 0) > 1:
-            bits.append(f"appears on {d.get('works')} works across "
-                        f"{d.get('districts')} districts")
+            bits.append(t("N-NET-01.spread", works=d.get("works"), districts=d.get("districts")))
         if d.get("overrun_share", 0) > 0:
-            bits.append(f"{d.get('overrun_share', 0) * 100:.0f}% of its works are priced "
-                        f"above comparable works")
-        out["plain"] = (
-            f"This {kind} " + " and ".join(bits) + ". "
-            + ("Its work types (vehicles, books, equipment) are commonly supplied "
-               "nationally, so wide coverage may be entirely normal. "
-               if d.get("likely_national_supplier") else "")
-            + "This is a pattern worth understanding, not an allegation against the firm.")
-        out["metric"] = f"{d.get('works')} works, {d.get('districts')} districts"
-        out["benchmark"] = f"{load_rules()['network']['district_spread_threshold']} districts typical"
-        out["actions"] = ["Review other flagged works involving this agency for a common cause."]
+            bits.append(t("N-NET-01.overrun", share=d.get("overrun_share", 0) * 100))
+        out["headline"] = t("N-NET-01.headline", kind=kind)
+        out["plain"] = t("N-NET-01.plain", kind=kind, bits=t("N-NET-01.join").join(bits),
+                         same_name=(t("N-NET-01.same_name", count=d["same_name_vendor_ids"])
+                                    if d.get("same_name_vendor_ids") else ""),
+                         national=t("N-NET-01.national") if d.get("likely_national_supplier") else "")
+        out["metric"] = t("N-NET-01.metric", works=d.get("works"), districts=d.get("districts"))
+        out["benchmark"] = t("N-NET-01.benchmark",
+                             threshold=load_rules()["network"]["district_spread_threshold"])
+        out["actions"] = ts("N-NET-01.actions")
 
+    # ---- individual payment records
+    elif rid == "P-SEQ-01":
+        values = dict(count=d.get("payments"), amount=rs(d.get("amount")),
+                      sanction=d.get("sanction_date"), earliest=d.get("earliest"))
+        out["headline"] = t("P-SEQ-01.headline")
+        out["plain"] = t("P-SEQ-01.plain", **values)
+        out["metric"] = t("P-SEQ-01.metric", **values)
+        out["benchmark"] = t("P-SEQ-01.benchmark")
+        out["actions"] = ts("P-SEQ-01.actions")
+
+    elif rid == "P-LATE-01":
+        values = dict(count=d.get("late_payments"), amount=rs(d.get("late_amount")),
+                      completed=d.get("completion_date"), days=d.get("max_days"),
+                      min_days=d.get("min_days"), share=d.get("share_of_paid") or 0)
+        out["headline"] = t("P-LATE-01.headline")
+        out["plain"] = t("P-LATE-01.plain", **values)
+        out["metric"] = t("P-LATE-01.metric", **values)
+        out["benchmark"] = t("P-LATE-01.benchmark", **values)
+        out["actions"] = ts("P-LATE-01.actions")
+
+    elif rid == "P-DUP-01":
+        top = d.get("largest") or {}
+        values = dict(sets=d.get("sets"), extra=d.get("extra_records"),
+                      amount=rs(d.get("repeated_amount")), share=d.get("share_of_paid") or 0,
+                      example=rs(top.get("amount")), vendor=top.get("vendor_name") or "",
+                      day=top.get("paid_on") or "", times=top.get("times") or 0)
+        out["headline"] = t("P-DUP-01.headline")
+        out["plain"] = t("P-DUP-01.plain", **values)
+        out["metric"] = t("P-DUP-01.metric", **values)
+        out["benchmark"] = t("P-DUP-01.benchmark")
+        out["actions"] = ts("P-DUP-01.actions")
+
+    elif lang != DEFAULT and locale.has(lang, f"rule.{rid}"):
+        # a rule with no explanation template: at least name it in the reader's language
+        out["headline"] = t(f"rule.{rid}")
+
+    if d.get("data_confidence") == "reduced":
+        reasons = t("confidence.separator").join(confidence_reason(r, lang)
+                                           for r in d.get("data_confidence_reasons") or [])
+        out["plain"] = t("confidence.plain", plain=out["plain"], reasons=reasons).strip()
+        out["actions"] = [t("confidence.action")] + out["actions"]
     if not out["actions"]:
-        out["actions"] = ["Verify the supporting records for this work."]
+        out["actions"] = [t("finding.default_action")]
     return out
+
+
+# ------------------------------------------------ text stored in English
+
+CONFIDENCE_REASONS = tuple(f"confidence.reason.{k}" for k in
+                           ("parity_differs", "unchecked", "failed", "stale", "held_back", "missing"))
+
+
+def confidence_reason(reason: str, lang: str = DEFAULT) -> str:
+    """A stored data-confidence reason (see data_confidence) in `lang`."""
+    return locale.rerender(lang, reason, CONFIDENCE_REASONS)
+
+
+@functools.lru_cache(maxsize=None)
+def _clauses(lang: str) -> dict[str, str]:
+    """{English clause as stored on a finding: the same clause in `lang`}."""
+    out: dict[str, str] = {}
+    lead = text(lang, "clause.lead")
+
+    def walk(node):
+        if isinstance(node, dict):
+            if node.get("id") and node.get("clause") and locale.has(lang, f"clause.rule.{node['id']}"):
+                out[str(node["clause"])] = text(lang, f"clause.rule.{node['id']}")
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    walk(load_rules())
+    for para in (load_guidelines().get("paras") or {}):
+        if locale.has(lang, f"clause.para.{para}"):
+            out[str(cite(para))] = text(lang, "clause.cite", lead=lead, para=para,
+                                        summary=text(lang, f"clause.para.{para}"))
+    out[text(DEFAULT, "clause.marker.cost_ceiling")] = text(lang, "clause.marker.cost_ceiling")
+    return out
+
+
+def clause_text(clause: str | None, lang: str = DEFAULT) -> str | None:
+    """A finding's guideline clause in `lang`; as stored if no translation exists."""
+    if clause is None or locale.normalise(lang) == DEFAULT:
+        return clause
+    return _clauses(locale.normalise(lang)).get(clause, clause)
+
+
+def context_note(findings: list[dict], agency_other_flags: int = 0, lang: str = DEFAULT) -> str:
+    """What a case's own findings cannot say: other cases at the same authority,
+    and reduced confidence in the data behind it."""
+    note = (text(lang, "note.same_authority", count=agency_other_flags)
+            if agency_other_flags > 0 else "")
+    reduced = sorted({r for f in findings or [] if (f.get("details") or {}).get("data_confidence") == "reduced"
+                      for r in (f.get("details") or {}).get("data_confidence_reasons", [])})
+    if reduced:
+        reasons = text(lang, "confidence.separator").join(confidence_reason(r, lang) for r in reduced)
+        note = (text(lang, "note.reduced", reasons=reasons) + " " + note).strip()
+    return note
+
+
+def parse_agency_other_flags(note: str | None) -> int:
+    """The other-cases count a stored English context note carries (0 if none)."""
+    pattern = locale.pattern("note.same_authority")
+    for sentence in re.split(r"(?<=\.) ", note or ""):
+        match = pattern.match(sentence) if pattern else None
+        if match:
+            return int(match.group("count").replace(",", ""))
+    return 0
 
 
 # --------------------------------------------------------------- briefs
 
-#: what each authority is being asked to do about a case
-TIER_STANCE = {
-    "mp": {
-        "label": "Member of Parliament",
-        "lens": "Works you have recommended in your constituency",
-        "opening": "One of the works recommended from your office needs attention.",
-        "closing": ("Your office can close this by asking the district authority for "
-                    "a written explanation. This is a review prompt, not an "
-                    "allegation against you or the agency."),
-    },
-    "district": {
-        "label": "District Authority",
-        "lens": "Ground-level execution and verification",
-        "opening": "This work requires verification before further release.",
-        "closing": ("Record your verification in eSAKSHI so the state and Ministry "
-                    "views update automatically."),
-    },
-    "state": {
-        "label": "State Nodal Authority",
-        "lens": "Patterns repeating across districts",
-        "opening": "This case contributes to a pattern worth reviewing across districts.",
-        "closing": ("Check whether the same work type or agency recurs elsewhere in "
-                    "the state before the next release cycle."),
-    },
-    "ministry": {
-        "label": "Ministry (MoSPI)",
-        "lens": "National trends and policy signals",
-        "opening": "This case feeds the national exception statistics.",
-        "closing": ("The policy question is whether this rule's threshold needs "
-                    "recalibrating, based on how often reviewers mark it a false positive."),
-    },
-}
-
-HUMAN_REVIEW_NOTE = ("This is an AI-generated risk indicator for human review. "
-                     "It is not a determination of fraud or wrongdoing.")
+TIERS = ("mp", "district", "state", "ministry")
 
 
-def build_brief(flag: dict, tier: str, context: dict | None = None) -> dict:
+def tier_stance(tier: str, lang: str = DEFAULT) -> dict:
+    tier = tier if tier in TIERS else "district"
+    return {part: text(lang, f"tier.{tier}.{part}") for part in ("label", "lens", "opening", "closing")}
+
+
+#: what each authority is being asked to do about a case (English)
+TIER_STANCE = {t: tier_stance(t) for t in TIERS}
+
+HUMAN_REVIEW_NOTE = text(DEFAULT, "brief.disclaimer")
+
+
+def build_brief(flag: dict, tier: str, context: dict | None = None,
+                lang: str = DEFAULT) -> dict:
     """Structured, authority-specific explanation of one flagged case.
 
     Everything here is derived from the agents' own output — no invented facts.
     """
+    lang = locale.normalise(lang)
     context = context or {}
     findings = flag.get("findings") or []
-    signals = [humanize(f) for f in findings]
+    signals = [humanize(f, lang) for f in findings]
     # strongest first: severity weight, then a stable order
     order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
-    signals.sort(key=lambda s: order.get(s["severity"], 9))
+    # context shown outside the score never leads a brief
+    signals.sort(key=lambda s: (s.get("context", False), order.get(s["severity"], 9)))
 
-    stance = TIER_STANCE.get(tier, TIER_STANCE["district"])
+    stance = tier_stance(tier, lang)
     primary = signals[0] if signals else None
     total = sum(s["contribution"] for s in signals) or 1
 
@@ -407,7 +563,8 @@ def build_brief(flag: dict, tier: str, context: dict | None = None) -> dict:
     for s in signals:
         s["share_pct"] = round(100 * s["contribution"] / total)
         if s["occurrences"] > 1:
-            s["headline"] = f"{s['headline']} ({s['occurrences']} matches)"
+            s["headline"] = text(lang, "brief.matches", headline=s["headline"],
+                                 count=s["occurrences"])
 
     # deduplicate actions while preserving order
     actions: list[str] = []
@@ -415,45 +572,58 @@ def build_brief(flag: dict, tier: str, context: dict | None = None) -> dict:
         for a in s["actions"]:
             if a not in actions:
                 actions.append(a)
-    if tier == "mp":
-        actions = ["Ask the district authority for a written explanation before "
-                   "recommending the next instalment."] + actions[:2]
-    elif tier == "state":
-        actions = ["Check whether this work type or agency recurs across other "
-                   "districts in the state."] + actions[:2]
-    elif tier == "ministry":
-        actions = ["Track this rule's false-positive rate before changing its "
-                   "threshold."] + actions[:2]
+    if tier in ("mp", "state", "ministry"):
+        actions = [text(lang, f"brief.tier_action.{tier}")] + actions[:2]
     else:
         actions = actions[:4]
     if not actions:
         # a case can reach here with no findings (or an unrecognised tier); the
         # reviewer must still be told what to do rather than shown an empty list
-        actions = ["Verify the supporting records for this work with the "
-                   "implementing agency."]
+        actions = [text(lang, "brief.no_actions")]
 
-    agents_involved = sorted({s["agent_label"] for s in signals})
+    agents_involved = sorted({s["agent_label"] for s in signals if not s.get("context")})
     corroboration = (
-        f"{len(agents_involved)} independent agents each raised a separate issue with "
-        f"this case. Signals that reinforce one another carry more weight than any "
-        f"single check, which is why this case scores highly."
+        text(lang, "brief.corroboration_many", count=len(agents_involved))
         if len(agents_involved) > 1 else
-        f"Raised by one agent ({agents_involved[0]})." if agents_involved else "")
+        text(lang, "brief.corroboration_one", agent=agents_involved[0]) if agents_involved else "")
 
     return {
         "tier": tier,
         "tier_label": stance["label"],
         "lens": stance["lens"],
         "opening": stance["opening"],
-        "primary_risk": primary["headline"] if primary else "Review required",
+        "primary_risk": primary["headline"] if primary else text(lang, "brief.review_required"),
         "primary_plain": primary["plain"] if primary else "",
         "signals": signals,
         "corroboration": corroboration,
         "context_note": context.get("note", ""),
         "actions": actions,
         "closing": stance["closing"],
-        "disclaimer": HUMAN_REVIEW_NOTE,
+        "disclaimer": text(lang, "brief.disclaimer"),
     }
+
+
+def brief_for(flag: dict, tier: str, lang: str = DEFAULT) -> dict:
+    """The brief for a stored case, in `lang`.
+
+    English is the brief the analysis stored. Another language is rebuilt from
+    the stored findings, with the context note recovered from the stored one,
+    so both state the same facts.
+    """
+    stored = (flag.get("tier_briefs") or {}).get(tier)
+    if locale.normalise(lang) == DEFAULT:
+        return stored or build_brief(flag, tier)
+    stored_note = ((flag.get("tier_briefs") or {}).get("district") or stored or {}).get("context_note")
+    note = context_note(flag.get("findings") or [], parse_agency_other_flags(stored_note), lang)
+    return build_brief(flag, tier, {"note": note}, lang)
+
+
+def display_title(flag: dict, lang: str = DEFAULT) -> str | None:
+    """A case's list title in `lang`: a work keeps its own description."""
+    title = flag.get("display_title") or flag.get("entity_label")
+    if flag.get("entity_type") == "work":
+        return title
+    return locale.rerender(lang, title, ("title.district_authority", "title.constituency"))
 
 
 def brief_to_text(brief: dict) -> str:
@@ -464,7 +634,7 @@ def brief_to_text(brief: dict) -> str:
     if brief.get("context_note"):
         parts.append(brief["context_note"])
     if brief["actions"]:
-        parts.append("Suggested next step: " + brief["actions"][0])
+        parts.append(text(DEFAULT, "brief.next_step", action=brief["actions"][0]))
     parts.append(brief["closing"])
     parts.append(HUMAN_REVIEW_NOTE)
     return " ".join(p for p in parts if p)
