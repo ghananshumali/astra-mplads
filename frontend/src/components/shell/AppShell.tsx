@@ -1,9 +1,11 @@
 import {
   Activity,
   Building2,
+  Check,
   ChevronDown,
   Database,
   Landmark,
+  Languages,
   LayoutDashboard,
   Map,
   Network,
@@ -14,11 +16,15 @@ import {
 } from "lucide-react";
 import { NavLink, useLocation } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import type { RefObject } from "react";
 
 import { api } from "../../api/client";
 import type { Freshness, Tier } from "../../api/types";
-import { TIERS } from "../../lib/format";
+import { useI18n } from "../../i18n/context";
+import type { MessageKey } from "../../i18n/context";
+import { LANGUAGES } from "../../i18n/languages";
+import { TIER_ORDER, compact } from "../../lib/format";
 import { liveState, liveTooltip, useNow } from "../../lib/live";
 import { useAuthority } from "../../state/AuthorityContext";
 import { Spinner } from "../ui";
@@ -31,17 +37,93 @@ const TIER_ICON: Record<Tier, typeof Landmark> = {
   mp: UserSquare2,
 };
 
-const NAV = [
-  { to: "/", label: "Overview", icon: LayoutDashboard, end: true },
-  { to: "/cases", label: "Risk cases", icon: ShieldAlert },
-  { to: "/geography", label: "Geography", icon: Map },
-  { to: "/network", label: "Vendor network", icon: Network },
-  { to: "/pipeline", label: "Pipeline", icon: Activity },
-  { to: "/data", label: "Data source", icon: Database },
+const NAV: { to: string; label: MessageKey; icon: typeof Landmark; end?: boolean }[] = [
+  { to: "/", label: "nav.overview", icon: LayoutDashboard, end: true },
+  { to: "/cases", label: "nav.cases", icon: ShieldAlert },
+  { to: "/geography", label: "nav.geography", icon: Map },
+  { to: "/network", label: "nav.network", icon: Network },
+  { to: "/pipeline", label: "nav.pipeline", icon: Activity },
+  { to: "/data", label: "nav.data", icon: Database },
 ];
+
+/** Close a popover on an outside click or Escape. */
+function useDismiss(ref: RefObject<HTMLDivElement | null>, close: () => void) {
+  useEffect(() => {
+    const onDoc = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) close();
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") close();
+    };
+    document.addEventListener("mousedown", onDoc);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDoc);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [ref, close]);
+}
+
+/* ---------------------------------------------------------- language menu */
+function LanguageSwitcher() {
+  const { language, setLanguage, t } = useI18n();
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  const close = useCallback(() => setOpen(false), []);
+  useDismiss(ref, close);
+
+  return (
+    <div className="auth-switch lang-switch" ref={ref}>
+      <button
+        className="lang-trigger"
+        onClick={() => setOpen((o) => !o)}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        aria-label={t("lang.button", { name: language.native })}
+        title={t("lang.menuTitle")}
+      >
+        <Languages size={14} />
+        <span lang={language.code}>{language.native}</span>
+        <ChevronDown size={13} className="dim" />
+      </button>
+
+      {open && (
+        <div className="auth-menu lang-menu fade-in" role="menu">
+          <div className="auth-menu-head">{t("lang.menuTitle")}</div>
+          <div className="lang-list">
+            {LANGUAGES.map((l) => (
+              <button
+                key={l.code}
+                role="menuitemradio"
+                aria-checked={l.code === language.code}
+                className={`auth-option lang-option${l.code === language.code ? " active" : ""}`}
+                onClick={() => {
+                  setLanguage(l.code);
+                  setOpen(false);
+                }}
+              >
+                <span className="grow">
+                  <span className="semibold" lang={l.code} dir={l.dir}>
+                    {l.native}
+                  </span>
+                  {l.english !== l.native && (
+                    <span className="auth-option-lens">{l.english}</span>
+                  )}
+                </span>
+                {l.code === language.code && <Check size={14} />}
+              </button>
+            ))}
+          </div>
+          <div className="auth-menu-foot">{t("lang.draftNote")}</div>
+        </div>
+      )}
+    </div>
+  );
+}
 
 /* --------------------------------------------------------- authority menu */
 function AuthoritySwitcher() {
+  const { t } = useI18n();
   const { tier, setTier, scope, setScope, scopeLabel } = useAuthority();
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
@@ -50,14 +132,8 @@ function AuthoritySwitcher() {
     queryFn: api.facets,
     staleTime: 5 * 60_000,
   });
-
-  useEffect(() => {
-    const onDoc = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
-    };
-    document.addEventListener("mousedown", onDoc);
-    return () => document.removeEventListener("mousedown", onDoc);
-  }, []);
+  const close = useCallback(() => setOpen(false), []);
+  useDismiss(ref, close);
 
   const options =
     tier === "state"
@@ -81,7 +157,7 @@ function AuthoritySwitcher() {
           <Icon size={15} />
         </span>
         <span className="auth-text">
-          <span className="auth-role">{TIERS[tier].label}</span>
+          <span className="auth-role">{t(`tier.${tier}.label`)}</span>
           <span className="auth-scope">{scopeLabel}</span>
         </span>
         <ChevronDown size={14} className="dim" />
@@ -89,22 +165,22 @@ function AuthoritySwitcher() {
 
       {open && (
         <div className="auth-menu fade-in">
-          <div className="auth-menu-head">Signed in as</div>
-          {(Object.keys(TIERS) as Tier[]).map((t) => {
-            const TI = TIER_ICON[t];
+          <div className="auth-menu-head">{t("auth.signedInAs")}</div>
+          {TIER_ORDER.map((tr) => {
+            const TI = TIER_ICON[tr];
             return (
               <button
-                key={t}
-                className={`auth-option${t === tier ? " active" : ""}`}
+                key={tr}
+                className={`auth-option${tr === tier ? " active" : ""}`}
                 onClick={() => {
-                  setTier(t);
-                  if (t === "ministry") setOpen(false);
+                  setTier(tr);
+                  if (tr === "ministry") setOpen(false);
                 }}
               >
                 <TI size={15} />
                 <span className="grow">
-                  <span className="semibold">{TIERS[t].label}</span>
-                  <span className="auth-option-lens">{TIERS[t].lens}</span>
+                  <span className="semibold">{t(`tier.${tr}.label`)}</span>
+                  <span className="auth-option-lens">{t(`tier.${tr}.lens`)}</span>
                 </span>
               </button>
             );
@@ -114,10 +190,10 @@ function AuthoritySwitcher() {
             <div className="auth-scope-pick">
               <label className="field-label">
                 {tier === "state"
-                  ? "Your state"
+                  ? t("auth.yourState")
                   : tier === "district"
-                    ? "Your district"
-                    : "Your constituency"}
+                    ? t("auth.yourDistrict")
+                    : t("auth.yourConstituency")}
               </label>
               <select
                 className="select"
@@ -139,7 +215,7 @@ function AuthoritySwitcher() {
                   );
                 }}
               >
-                <option value="">All ({options.length})</option>
+                <option value="">{t("auth.all", { count: compact(options.length) })}</option>
                 {options.map((o) => (
                   <option key={o} value={o}>
                     {o}
@@ -151,14 +227,11 @@ function AuthoritySwitcher() {
                 style={{ marginTop: 8 }}
                 onClick={() => setOpen(false)}
               >
-                Apply
+                {t("auth.apply")}
               </button>
             </div>
           )}
-          <div className="auth-menu-foot">
-            Demo role switcher. Production roadmap: eSAKSHI SSO with full RBAC
-            and audit logging.
-          </div>
+          <div className="auth-menu-foot">{t("auth.demoNote")}</div>
         </div>
       )}
     </div>
@@ -167,6 +240,7 @@ function AuthoritySwitcher() {
 
 /* ------------------------------------------------------------ data badge */
 function DataBadge() {
+  const { t } = useI18n();
   const { data, isLoading } = useQuery({
     queryKey: ["data-source"],
     queryFn: api.dataSource,
@@ -197,13 +271,11 @@ function DataBadge() {
         <span
           className="head-badge"
           title={
-            llm.configured
-              ? `AI synthesis active · ${llm.model}`
-              : "No GROQ_API_KEY — deterministic synthesis in use"
+            llm.configured ? t("badge.aiActive", { model: llm.model }) : t("badge.noKey")
           }
         >
           <Sparkles size={12} />
-          {llm.configured ? "AI synthesis" : "Deterministic"}
+          {llm.configured ? t("badge.ai") : t("badge.deterministic")}
         </span>
       )}
       {data?.live && freshness ? (
@@ -213,13 +285,16 @@ function DataBadge() {
           className="head-badge"
           title={
             fresh
-              ? `Local corpus holds ${fresh.local_recommended_works.toLocaleString()} recommended works; the live MoSPI portal reported ${fresh.live_recommended_works.toLocaleString()}.`
-              : "Data mode"
+              ? t("badge.coverage", {
+                  local: compact(fresh.local_recommended_works),
+                  live: compact(fresh.live_recommended_works),
+                })
+              : t("badge.dataMode")
           }
         >
           <Database size={12} />
           {mode}
-          {fresh && <b style={{ marginLeft: 4 }}>{fresh.coverage_pct}%</b>}
+          {fresh && <b style={{ marginInlineStart: 4 }}>{fresh.coverage_pct}%</b>}
         </span>
       )}
     </div>
@@ -228,10 +303,11 @@ function DataBadge() {
 
 /** "● Live · checked 20 s ago" — links to the Data source page for detail. */
 function LiveBadge({ f }: { f: Freshness }) {
+  const i18n = useI18n();
   const now = useNow(10_000);
-  const state = liveState(f, now);
+  const state = liveState(f, i18n, now);
   return (
-    <NavLink to="/data" className={`head-badge live-badge ${state.tone}`} title={liveTooltip(f)}>
+    <NavLink to="/data" className={`head-badge live-badge ${state.tone}`} title={liveTooltip(f, i18n)}>
       <span className={`live-dot ${state.tone}`} aria-hidden />
       <b>{state.label}</b>
       <span className="live-badge-detail">· {state.detail}</span>
@@ -241,6 +317,7 @@ function LiveBadge({ f }: { f: Freshness }) {
 
 /* ------------------------------------------------------------------ shell */
 export function AppShell({ children }: { children: React.ReactNode }) {
+  const { t } = useI18n();
   const { pathname } = useLocation();
   const { tier } = useAuthority();
 
@@ -253,16 +330,17 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           </span>
           <span className="brand-text">
             <span className="brand-name">ASTRA</span>
-            <span className="brand-sub">MPLADS Risk Intelligence</span>
+            <span className="brand-sub">{t("brand.sub")}</span>
           </span>
         </div>
         <div className="grow" />
         <DataBadge />
+        <LanguageSwitcher />
         <AuthoritySwitcher />
       </header>
 
       <div className="body">
-        <nav className="side" aria-label="Main">
+        <nav className="side" aria-label={t("nav.main")}>
           {NAV.map((n) => (
             <NavLink
               key={n.to}
@@ -273,12 +351,14 @@ export function AppShell({ children }: { children: React.ReactNode }) {
               }
             >
               <n.icon size={16} />
-              <span>{n.label}</span>
+              <span>{t(n.label)}</span>
             </NavLink>
           ))}
           <div className="side-foot">
-            <div className="side-foot-title">{TIERS[tier].short} view</div>
-            <p>{TIERS[tier].lens}</p>
+            <div className="side-foot-title">
+              {t("shell.view", { tier: t(`tier.${tier}.short`) })}
+            </div>
+            <p>{t(`tier.${tier}.lens`)}</p>
           </div>
         </nav>
 

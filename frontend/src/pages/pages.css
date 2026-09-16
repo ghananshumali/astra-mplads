@@ -13,7 +13,7 @@
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   box-shadow: var(--shadow-xs);
-  text-align: left;
+  text-align: start;
   font: inherit;
   color: inherit;
   cursor: default;
@@ -107,7 +107,7 @@
   background: transparent;
   border-radius: var(--radius);
   cursor: pointer;
-  text-align: left;
+  text-align: start;
   font: inherit;
   color: var(--text-2);
   transition: background var(--dur-fast) var(--ease);
@@ -138,7 +138,7 @@
 .det-count {
   font-size: var(--text-sm);
   font-weight: var(--weight-semibold);
-  text-align: right;
+  text-align: end;
 }
 
 /* ------------------------------------------------------------- work queue */
@@ -155,7 +155,7 @@
   border-bottom: 1px solid var(--border);
   background: transparent;
   cursor: pointer;
-  text-align: left;
+  text-align: start;
   font: inherit;
   transition: background var(--dur-fast) var(--ease);
 }
@@ -280,7 +280,7 @@
 }
 .map-legend {
   position: absolute;
-  left: 12px;
+  inset-inline-start: 12px;
   bottom: 12px;
   background: rgba(255, 255, 255, 0.95);
   border: 1px solid var(--border);

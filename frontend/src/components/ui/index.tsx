@@ -12,6 +12,7 @@ import type { ReactNode } from "react";
 import { useState } from "react";
 
 import type { ReviewStatus } from "../../api/types";
+import { useI18n } from "../../i18n/context";
 import { RISK_META, STATUS_META, riskLevel } from "../../lib/format";
 import "./ui.css";
 
@@ -114,20 +115,24 @@ export function RiskBadge({
 }
 
 export function RiskLabel({ score }: { score: number }) {
-  const meta = RISK_META[riskLevel(score)];
+  const { t } = useI18n();
+  const level = riskLevel(score);
+  const meta = RISK_META[level];
   return (
     <Chip color={meta.color} bg={meta.bg} border={meta.border} dot>
-      {meta.label}
+      {t(`risk.${level}`)}
     </Chip>
   );
 }
 
 /* -------------------------------------------------------- StatusChip */
 export function StatusChip({ status }: { status: ReviewStatus }) {
-  const m = STATUS_META[status] ?? STATUS_META.pending;
+  const { t } = useI18n();
+  const known = status in STATUS_META ? status : "pending";
+  const m = STATUS_META[known];
   return (
     <Chip color={m.color} bg={m.bg} dot>
-      {m.short}
+      {t(`status.${known}.short`)}
     </Chip>
   );
 }
@@ -214,17 +219,17 @@ export function ErrorState({
   error: unknown;
   onRetry?: () => void;
 }) {
-  const msg =
-    error instanceof Error ? error.message : "Something went wrong.";
+  const { t } = useI18n();
+  const msg = error instanceof Error ? error.message : t("error.generic");
   return (
     <Empty
       icon={<AlertTriangle size={20} />}
-      title="Could not load this data"
+      title={t("error.title")}
       hint={msg}
       action={
         onRetry ? (
           <button className="btn btn-sm" onClick={onRetry}>
-            Try again
+            {t("error.retry")}
           </button>
         ) : undefined
       }

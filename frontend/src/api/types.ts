@@ -49,8 +49,17 @@ export interface Finding {
   severity: Severity;
   entity_type: string;
   entity_id: string;
+  /** The agent's own statement, as recorded (English). */
   summary: string;
   details: Record<string, unknown>;
+  /** In a language other than English: the finding explained in that language. */
+  explained?: {
+    headline: string;
+    plain: string;
+    metric: string | null;
+    benchmark: string | null;
+    clause: string | null;
+  };
 }
 
 export interface BriefSignal {
@@ -207,6 +216,15 @@ export interface WorkRecord {
   mp_name: string | null;
   ia_name: string | null;
   vendor_name: string | null;
+  /** Portal id of `vendor_name`; names are not unique. */
+  vendor_id: string | null;
+  /** Agency executing the work, from payment records; empty before a first payment. */
+  implementing_agency: string | null;
+  /** The portal's own class, e.g. "Repair and Renovation". */
+  work_category: string | null;
+  letter_no: string | null;
+  term_start: string | null;
+  term_end: string | null;
   estimated_cost: number | null;
   sanctioned_amount: number | null;
   expenditure: number | null;
@@ -217,6 +235,82 @@ export interface WorkRecord {
   sanction_date: string | null;
   completion_date: string | null;
   era: string | null;
+}
+
+/** Unattended running, from the supervisor (`GET /meta/ops`). */
+export interface OpsStatus {
+  supervisor_running: boolean;
+  started_at: string | null;
+  last_tick_at: string | null;
+  stopped_at: string | null;
+  keep_awake: { requested: boolean; held: boolean } | null;
+  services: Record<
+    string,
+    {
+      running: boolean;
+      healthy?: boolean;
+      pid: number | null;
+      started_at: string | null;
+      restarts_last_hour: number;
+      last_exit_code: number | null;
+      log: string;
+    }
+  > | null;
+  /** Problems being tracked; `notified_at` is set once an alert went out. */
+  conditions: {
+    key: string;
+    title: string;
+    detail: string;
+    severity: string;
+    first_seen: string;
+    notified_at: string | null;
+  }[];
+  last_alert: { title: string; body: string; at: string } | null;
+  backup: {
+    last_ok_at?: string | null;
+    last_error?: string | null;
+    last_error_at?: string | null;
+    last_bytes?: number;
+    kept: number;
+    newest: { name: string; bytes: number; taken_at: string } | null;
+  };
+}
+
+/** One payment record the portal lists, with what its dates say against the work. */
+export interface PaymentRecord {
+  work_id: string;
+  seq: number;
+  paid_on: string | null;
+  amount: number | null;
+  vendor_id: string | null;
+  vendor_name: string | null;
+  implementing_agency: string | null;
+  /** "Payment Success" or "Payment In-Progress". */
+  status: string | null;
+  /** Days after the recorded completion, when paid after it. */
+  days_after_completion: number | null;
+  before_sanction: boolean;
+  /** Dated 25 to 31 March. */
+  year_end_week: boolean;
+  /** Records on the work with the same date, amount and vendor, this one included. */
+  repeats: number;
+}
+
+export interface WorkPayments {
+  work_id: string;
+  payments: PaymentRecord[];
+  summary: {
+    count: number;
+    total: number;
+    sanctioned_amount: number | null;
+    share_of_sanctioned: number | null;
+    vendors: number;
+    in_progress: number;
+    first_paid_on: string | null;
+    last_paid_on: string | null;
+    after_completion: number;
+    repeated: number;
+  };
 }
 
 export interface DataSource {
@@ -295,6 +389,28 @@ export interface Freshness {
   sweep_in_progress: boolean;
   sweep_started_at: string | null;
   last_update: { at: string; area: string; detail: string } | null;
+  /** The rotation that re-reads the area read longest ago. Null until a
+   *  poller has reported its settings. */
+  rolling: {
+    enabled: boolean;
+    /** Running now: poller up, and inside its hours. */
+    active_now: boolean;
+    areas_per_check: number;
+    /** Local hours, e.g. "08:00-20:00", or "always". */
+    hours: string;
+    min_age_hours: number;
+    last_at: string | null;
+  } | null;
+  /** When the risk flags were last recomputed from the stored data. */
+  analysis: {
+    last_at: string | null;
+    in_progress: boolean;
+    started_at: string | null;
+    /** Stored portal changes the current flags do not include yet. */
+    changes_waiting: boolean;
+    every_minutes: number | null;
+  };
+  oldest_shard_fetch: string | null;
   registered_shards: number;
   reconciled_shards: number;
   reconciled_pct: number | null;
@@ -304,8 +420,20 @@ export interface Freshness {
   last_full_reconciliation: string | null;
   hours_since_reconciliation: number | null;
   reconciliation_overdue: boolean;
+  /** The poller's view of the portal, from its circuit breaker. `open` is true
+   *  only while the poller runs and the portal is not answering. */
+  portal?: {
+    open: boolean;
+    next_attempt_at: string | null;
+    failing_since: string | null;
+    last_error: string | null;
+    last_error_at: string | null;
+    checked_at: string | null;
+  } | null;
   stale: {
     shard_id: string;
+    /** A national check, a state-level check, or a registered area. */
+    scope: "national" | "state" | "area";
     place: string | null;
     state: string | null;
     house: "LS" | "RS";
@@ -342,7 +470,18 @@ export interface PipelineMeta {
     reason: string;
     findings?: number;
   }[];
-  rule_coverage: { rule_id: string; title: string; findings: number }[];
+  rule_coverage: {
+    rule_id: string;
+    title: string;
+    findings: number;
+    /** guideline | guideline-screening | heuristic | statistical */
+    basis?: string | null;
+    evaluated?: boolean;
+    /** Why the rule could not be evaluated on this data, when it could not. */
+    stood_down?: string;
+  }[];
+  /** Guideline paragraphs no field in the data lets ASTRA check, with the reason. */
+  unchecked_provisions?: Record<string, string>;
 }
 
 export interface LlmStatus {

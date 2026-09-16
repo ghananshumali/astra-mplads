@@ -6,16 +6,22 @@ import { api } from "../api/client";
 import type {
   DataSource as DataSourcePayload,
   Freshness,
+  OpsStatus,
   Parity,
   ParityTile,
   RecentUpdates,
 } from "../api/types";
 import { Banner, Card, Chip, ErrorState, Skeleton } from "../components/ui";
-import { compact, formatDate, titleCase } from "../lib/format";
-import { ago, clockTime, liveState, useNow } from "../lib/live";
+import { useI18n } from "../i18n/context";
+import type { I18n } from "../i18n/context";
+import { houseName } from "../i18n/labels";
+import { T } from "../i18n/T";
+import { compact, titleCase } from "../lib/format";
+import { analysisHint, failingChecks, liveState, rotationHours, staleLabel, useNow } from "../lib/live";
 import "./pages.css";
 
 export default function DataSource() {
+  const { t, fmt } = useI18n();
   const src = useQuery({
     queryKey: ["data-source"],
     queryFn: api.dataSource,
@@ -28,6 +34,11 @@ export default function DataSource() {
     queryFn: api.freshness,
     enabled: live,
     refetchInterval: 20_000,
+  });
+  const ops = useQuery({
+    queryKey: ["ops"],
+    queryFn: api.ops,
+    refetchInterval: 60_000,
   });
   const updates = useQuery({
     queryKey: ["recent-updates"],
@@ -45,10 +56,8 @@ export default function DataSource() {
     <div className="stack gap-5">
       <header className="page-head">
         <div>
-          <h1 className="page-title">Data source & provenance</h1>
-          <p className="page-sub">
-            Where the analysed corpus comes from, and how current it is
-          </p>
+          <h1 className="page-title">{t("data.title")}</h1>
+          <p className="page-sub">{t("data.sub")}</p>
         </div>
       </header>
 
@@ -64,23 +73,30 @@ export default function DataSource() {
 
           {live && (fresh.data ? <LiveSync f={fresh.data} /> : <Skeleton h={160} />)}
 
+          {ops.data && <Unattended ops={ops.data} />}
+
           {live && fresh.data?.parity && <PortalParity parity={fresh.data.parity} />}
 
           {live && <PortalUpdates data={updates.data} loading={updates.isLoading} />}
 
           {!live && batchFresh && (
             <Banner tone="success" icon={<CheckCircle2 size={15} />}>
-              <b>Live check against mplads.mospi.gov.in</b> — this batch holds{" "}
-              {compact(batchFresh.local_recommended_works)} recommended works; the
-              official portal reported{" "}
-              {compact(batchFresh.live_recommended_works)} when queried at{" "}
-              {formatDate(batchFresh.checked_at)}. That is{" "}
-              <b>{batchFresh.coverage_pct}% coverage</b> ({batchFresh.tenure}).
+              <T
+                k="data.batch.check"
+                values={{
+                  title: <b>{t("data.batch.checkTitle")}</b>,
+                  local: compact(batchFresh.local_recommended_works),
+                  live: compact(batchFresh.live_recommended_works),
+                  date: fmt.date(batchFresh.checked_at),
+                  coverage: <b>{t("data.batch.coverage", { pct: batchFresh.coverage_pct })}</b>,
+                  tenure: batchFresh.tenure,
+                }}
+              />
             </Banner>
           )}
 
           {llm.data && (
-            <Card title="AI synthesis provider" tight>
+            <Card title={t("data.llm.title")} tight>
               <div className="row gap-3" style={{ flexWrap: "wrap" }}>
                 <Chip
                   color={llm.data.configured ? "#0f5233" : "var(--text-2)"}
@@ -88,42 +104,43 @@ export default function DataSource() {
                   dot
                 >
                   <Sparkles size={11} />
-                  {llm.data.configured ? "Configured" : "Not configured"}
+                  {llm.data.configured ? t("data.llm.configured") : t("data.llm.notConfigured")}
                 </Chip>
                 <span className="text-sm muted">
-                  Provider <b>{llm.data.provider}</b> · model{" "}
-                  <b className="mono">{llm.data.model}</b>
-                  {llm.data.key_hint ? ` · key ${llm.data.key_hint}` : ""}
+                  <T
+                    k="data.llm.provider"
+                    values={{
+                      provider: <b>{llm.data.provider}</b>,
+                      model: <b className="mono">{llm.data.model}</b>,
+                    }}
+                  />
+                  {llm.data.key_hint ? ` · ${t("data.llm.key", { hint: llm.data.key_hint })}` : ""}
                 </span>
               </div>
               {!llm.data.configured && (
                 <p className="text-sm dim" style={{ margin: "10px 0 0" }}>
-                  No <code>GROQ_API_KEY</code> is set, so case synthesis uses the
-                  deterministic layer. Add a key to <code>.env</code> and restart
-                  the API to enable AI synthesis. Every other capability is
-                  unaffected.
+                  <T
+                    k="data.llm.noKey"
+                    values={{ key: <code>GROQ_API_KEY</code>, env: <code>.env</code> }}
+                  />
                 </p>
               )}
             </Card>
           )}
 
           <Card
-            title={live ? "Source ledger" : "Source ledger for this batch"}
-            subtitle={
-              live
-                ? "Where each part of the corpus comes from. Work records are read directly from the eSAKSHI portal and kept current by the poller; fund positions before 2023 come from the OpenCity open-data portal"
-                : "Dual-mode ingestion: live official interfaces are attempted under a strict time budget, with the official CSV exports supplying the corpus when live access is slow or partial"
-            }
+            title={live ? t("data.ledger.titleLive") : t("data.ledger.titleBatch")}
+            subtitle={live ? t("data.ledger.subLive") : t("data.ledger.subBatch")}
             tight
           >
             <div className="table-scroll" style={{ maxHeight: live ? "none" : 380 }}>
               <table className="table">
                 <thead>
                   <tr>
-                    <th>Source</th>
-                    <th style={{ width: 88 }}>Mode</th>
-                    <th style={{ width: 92 }}>Rows</th>
-                    <th style={{ width: 108 }}>Status</th>
+                    <th>{t("data.col.source")}</th>
+                    <th style={{ width: 88 }}>{t("data.col.mode")}</th>
+                    <th style={{ width: 92 }}>{t("data.col.rows")}</th>
+                    <th style={{ width: 108 }}>{t("data.col.status")}</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -146,15 +163,13 @@ export default function DataSource() {
           </Card>
 
           <div className="grid-2">
-            <Card title="Work records by data era" tight>
+            <Card title={t("data.eras.works")} tight>
               <EraList data={src.data?.work_eras} />
             </Card>
-            <Card title="Fund-flow records by data era" tight>
+            <Card title={t("data.eras.flows")} tight>
               <EraList data={src.data?.fundflow_eras} />
               <p className="text-xs dim" style={{ margin: "10px 0 0" }}>
-                {live
-                  ? "Pre-2023 rows come from the OpenCity open-data records listed in the ledger; post-2023 rows are aggregated from the eSAKSHI work records. Keeping the eras apart is what makes era-separated baselines possible."
-                  : "Pre-2023 rows come from the live open-data interfaces, which is what makes the era-separated baselines real rather than hypothetical."}
+                {live ? t("data.eras.noteLive") : t("data.eras.noteBatch")}
               </p>
             </Card>
           </div>
@@ -182,17 +197,22 @@ function Kpi({ icon, label, value }: { icon: ReactNode; label: string; value: Re
 }
 
 function BatchKpis({ data }: { data?: DataSourcePayload }) {
+  const { t } = useI18n();
   return (
     <div className="kpi-grid">
       <Kpi
         icon={<Database size={18} />}
-        label="Resolved mode"
+        label={t("data.kpi.mode")}
         value={(data?.mode_resolved ?? "—").toUpperCase()}
       />
-      <Kpi icon={<Database size={18} />} label="Works ingested" value={compact(data?.works ?? 0)} />
       <Kpi
         icon={<Database size={18} />}
-        label="Fund-flow records"
+        label={t("data.kpi.worksIngested")}
+        value={compact(data?.works ?? 0)}
+      />
+      <Kpi
+        icon={<Database size={18} />}
+        label={t("data.kpi.fundflows")}
         value={compact(data?.fundflows ?? 0)}
       />
     </div>
@@ -200,6 +220,7 @@ function BatchKpis({ data }: { data?: DataSourcePayload }) {
 }
 
 function LiveKpis({ data, parity }: { data?: DataSourcePayload; parity?: Parity }) {
+  const { t } = useI18n();
   // The portal's headline figure is Works Recommended, so that is what is shown
   // here; works listed only from the sanctioned report onward are in the
   // parity table below.
@@ -207,20 +228,20 @@ function LiveKpis({ data, parity }: { data?: DataSourcePayload; parity?: Parity 
     parity?.national[house]?.recommended?.stored[0] ?? data?.houses?.[house] ?? 0;
   return (
     <div className="kpi-grid">
-      <Kpi icon={<Radio size={18} />} label="Source · live portal" value="eSAKSHI" />
+      <Kpi icon={<Radio size={18} />} label={t("data.kpi.source")} value="eSAKSHI" />
       <Kpi
         icon={<Database size={18} />}
-        label="Lok Sabha works recommended"
+        label={t("data.kpi.lsWorks")}
         value={compact(recommended("LS"))}
       />
       <Kpi
         icon={<Database size={18} />}
-        label="Rajya Sabha works recommended"
+        label={t("data.kpi.rsWorks")}
         value={compact(recommended("RS"))}
       />
       <Kpi
         icon={<Database size={18} />}
-        label="Fund-flow records"
+        label={t("data.kpi.fundflows")}
         value={compact(data?.fundflows ?? 0)}
       />
     </div>
@@ -235,15 +256,27 @@ const TONE_CHIP = {
 } as const;
 
 function LiveSync({ f }: { f: Freshness }) {
+  const i18n = useI18n();
+  const { t, tn, fmt } = i18n;
   const now = useNow(10_000);
-  const state = liveState(f, now);
+  const state = liveState(f, i18n, now);
+  const failing = failingChecks(f);
   const every = Math.round(f.poll_interval_seconds ?? 60);
-  const nightly = f.reconcile_at && f.reconcile_at !== "off" ? `nightly at ${f.reconcile_at}` : "nightly";
+  const nightly =
+    f.reconcile_at && f.reconcile_at !== "off"
+      ? t("sync.nightlyAt", { time: f.reconcile_at })
+      : t("sync.nightly");
+  const rolling = f.rolling?.enabled ? f.rolling : null;
+  const nOfM = (n: number, m: number) => t("sync.nOfM", { n: compact(n), m: compact(m) });
 
   return (
     <Card
-      title="Live sync with the portal"
-      subtitle={`The poller asks mplads.mospi.gov.in for its counts every ${every} s and re-reads only the areas whose counts moved; every area is also re-read record by record ${nightly}`}
+      title={t("sync.title")}
+      subtitle={
+        rolling
+          ? t("sync.subRotation", { every, hours: rotationHours(rolling.hours, i18n), nightly })
+          : t("sync.sub", { every, nightly })
+      }
       actions={
         <Chip color={TONE_CHIP[state.tone].color} bg={TONE_CHIP[state.tone].bg}>
           <span className={`live-dot ${state.tone}`} aria-hidden />
@@ -254,74 +287,224 @@ function LiveSync({ f }: { f: Freshness }) {
       <div className="stack gap-3">
         {!f.poller_running && (
           <Banner tone="warn">
-            <b>The poller is not running</b>, so changes on the portal are not being
-            picked up and the figures here are as of the last check. Start it with{" "}
-            <code>python -m astra.ingestion.poller</code>, or launch everything with{" "}
-            <code>run_dev.ps1</code>.
+            <T
+              k="sync.notRunning"
+              values={{
+                bold: <b>{t("sync.notRunningBold")}</b>,
+                cmd: <code>python -m astra.ingestion.poller</code>,
+                script: <code>run_dev.ps1</code>,
+              }}
+            />
           </Banner>
         )}
-        {f.stale.length > 0 && (
+        {f.poller_running && f.portal?.open && (
           <Banner tone="warn">
-            <b>
-              {f.stale.length} {f.stale.length === 1 ? "area has" : "areas have"} failed
-              repeatedly and {f.stale.length === 1 ? "is" : "are"} not updating:
-            </b>{" "}
-            {f.stale.map((s) => `${titleCase(s.place)} (${s.house})`).join(", ")}. Their
-            last good records are kept and shown.
+            <b>{t("sync.portalDownBold")}</b>{" "}
+            {t("sync.portalDown", {
+              since: fmt.clock(f.portal.failing_since),
+              next: fmt.clock(f.portal.next_attempt_at),
+            })}
+            {f.portal.last_error && (
+              <div className="text-sm" style={{ marginTop: 4 }}>
+                {t("sync.portalError", { time: fmt.clock(f.portal.last_error_at) })}{" "}
+                <code>{f.portal.last_error}</code>
+              </div>
+            )}
+          </Banner>
+        )}
+        {failing.length > 0 && (
+          <Banner tone="warn">
+            <b>{tn("sync.stale", failing.length)}</b>{" "}
+            {failing.map((s) => staleLabel(s, i18n)).join(", ")}.{" "}
+            {t("sync.staleTail")}
           </Banner>
         )}
         <dl className="kv-grid">
           <Kv
-            label="Poller"
-            value={f.poller_running ? "Running" : "Not running"}
-            hint={f.poller_running ? `since ${clockTime(f.poller_since)}` : undefined}
+            label={t("sync.poller")}
+            value={f.poller_running ? t("sync.running") : t("sync.notRunningShort")}
+            hint={f.poller_running ? t("sync.since", { time: fmt.clock(f.poller_since) }) : undefined}
           />
           <Kv
-            label="Last portal check"
-            value={clockTime(f.last_check_at)}
-            hint={f.last_check_at ? ago(f.last_check_at, now) : "no check yet"}
+            label={t("sync.lastCheck")}
+            value={fmt.clock(f.last_check_at)}
+            hint={f.last_check_at ? fmt.ago(f.last_check_at, now) : t("sync.noCheck")}
           />
           <Kv
-            label="Last update stored"
-            value={f.last_update ? areaLabel(f.last_update.area) : "None yet"}
-            hint={f.last_update ? `${clockTime(f.last_update.at)} · ${ago(f.last_update.at, now)}` : undefined}
+            label={t("sync.lastUpdate")}
+            value={f.last_update ? areaLabel(f.last_update.area, i18n) : t("sync.noneYet")}
+            hint={
+              f.last_update
+                ? `${fmt.clock(f.last_update.at)} · ${fmt.ago(f.last_update.at, now)}`
+                : undefined
+            }
           />
           <Kv
-            label="Last full reconciliation"
-            value={clockTime(f.last_full_reconciliation)}
+            label={t("sync.lastRecon")}
+            value={fmt.clock(f.last_full_reconciliation)}
             hint={
               f.sweep_in_progress
-                ? `another running since ${clockTime(f.sweep_started_at)}`
+                ? t("sync.anotherRunning", { time: fmt.clock(f.sweep_started_at) })
                 : f.reconciliation_overdue
-                  ? "overdue"
-                  : `every area re-read ${nightly}`
+                  ? t("sync.overdue")
+                  : t("sync.everyArea", { nightly })
             }
           />
-          <Kv
-            label="Areas matching the portal on every figure"
-            value={
-              f.parity
-                ? `${compact(f.parity.exact_slices)} of ${compact(f.parity.registered_slices)}`
-                : `${compact(f.reconciled_shards)} of ${compact(f.registered_shards)}`
-            }
-            hint="counts and rupees, all four portal figures"
-          />
-          <Kv
-            label="Quarantined areas"
-            value={compact(f.quarantined)}
-            hint={f.quarantined ? "held back until they pass validation" : "none held back"}
-          />
-          {f.parity && (
+          {f.rolling && (
             <Kv
-              label="Works removed from the portal"
-              value={compact(f.parity.removed_from_portal)}
+              label={t("sync.rotating")}
+              value={
+                !f.rolling.enabled
+                  ? t("sync.off")
+                  : f.rolling.active_now
+                    ? t("sync.running")
+                    : f.poller_running
+                      ? t("sync.paused")
+                      : t("sync.notRunningShort")
+              }
               hint={
-                f.parity.awaiting_removal
-                  ? `${compact(f.parity.awaiting_removal)} no longer listed, confirming`
-                  : "kept in history; restored if listed again"
+                f.rolling.enabled
+                  ? [
+                      f.rolling.active_now
+                        ? null
+                        : t("sync.runsHours", { hours: rotationHours(f.rolling.hours, i18n) }),
+                      t("sync.oldestRead", { ago: fmt.ago(f.oldest_shard_fetch, now) }),
+                    ]
+                      .filter(Boolean)
+                      .join(" · ")
+                  : t("sync.rotationOff")
               }
             />
           )}
+          <Kv
+            label={t("sync.recomputed")}
+            value={f.analysis.in_progress ? t("sync.recomputingNow") : fmt.clock(f.analysis.last_at)}
+            hint={analysisHint(f, i18n, now)}
+          />
+          <Kv
+            label={t("sync.areasMatching")}
+            value={
+              f.parity
+                ? nOfM(f.parity.exact_slices, f.parity.registered_slices)
+                : nOfM(f.reconciled_shards, f.registered_shards)
+            }
+            hint={t("sync.areasMatchingHint")}
+          />
+          <Kv
+            label={t("sync.quarantined")}
+            value={compact(f.quarantined)}
+            hint={f.quarantined ? t("sync.quarantinedHint") : t("sync.noneHeld")}
+          />
+          {f.parity && (
+            <Kv
+              label={t("sync.removed")}
+              value={compact(f.parity.removed_from_portal)}
+              hint={
+                f.parity.awaiting_removal
+                  ? t("sync.confirming", { count: compact(f.parity.awaiting_removal) })
+                  : t("sync.keptHistory")
+              }
+            />
+          )}
+        </dl>
+      </div>
+    </Card>
+  );
+}
+
+/* ------------------------------------------------------- unattended running */
+function Unattended({ ops }: { ops: OpsStatus }) {
+  const { t, tn, fmt } = useI18n();
+  const open = ops.conditions.filter((c) => c.notified_at);
+  const tone = !ops.supervisor_running ? "stopped" : open.length ? "warn" : "live";
+  const services = Object.entries(ops.services ?? {});
+  const backup = ops.backup;
+  return (
+    <Card
+      title={t("ops.title")}
+      subtitle={t("ops.sub")}
+      actions={
+        <Chip color={TONE_CHIP[tone].color} bg={TONE_CHIP[tone].bg}>
+          <span className={`live-dot ${tone}`} aria-hidden />
+          {!ops.supervisor_running
+            ? t("ops.notRunning")
+            : open.length
+              ? tn("ops.problems", open.length)
+              : t("ops.allWell")}
+        </Chip>
+      }
+    >
+      <div className="stack gap-3">
+        {!ops.supervisor_running && (
+          <p className="text-sm muted" style={{ margin: 0 }}>
+            <T
+              k="ops.howTo"
+              values={{
+                cmd: <code>python -m astra.ops.supervisor</code>,
+                script: <code>scripts\install_autostart.ps1</code>,
+              }}
+            />
+          </p>
+        )}
+        {open.map((c) => (
+          <Banner key={c.key} tone="warn">
+            <b>{c.title}.</b> {c.detail}{" "}
+            <span className="dim">{t("ops.since", { since: fmt.ago(c.first_seen) })}</span>
+          </Banner>
+        ))}
+        <dl className="kv-grid">
+          {ops.supervisor_running && (
+            <Kv
+              label={t("ops.processes")}
+              value={
+                services.length
+                  ? services
+                      .map(([name, s]) => {
+                        const label =
+                          name === "api"
+                            ? t("ops.svc.api")
+                            : name === "poller"
+                              ? t("ops.svc.poller")
+                              : name === "web"
+                                ? t("ops.svc.web")
+                                : name;
+                        return s.running && s.healthy !== false
+                          ? t("ops.svcUp", { name: label })
+                          : t("ops.svcDown", { name: label });
+                      })
+                      .join(" · ")
+                  : "—"
+              }
+              hint={
+                services.some(([, s]) => s.restarts_last_hour)
+                  ? tn(
+                      "ops.restarts",
+                      services.reduce((n, [, s]) => n + s.restarts_last_hour, 0),
+                    )
+                  : undefined
+              }
+            />
+          )}
+          <Kv
+            label={t("ops.backup")}
+            value={backup.newest ? fmt.ago(backup.newest.taken_at) : t("ops.noBackup")}
+            hint={
+              backup.newest
+                ? tn("ops.kept", backup.kept, {
+                    size: `${(backup.newest.bytes / 1024 ** 3).toFixed(1)} GB`,
+                  })
+                : undefined
+            }
+          />
+          {backup.last_error &&
+            (!backup.last_ok_at || (backup.last_error_at ?? "") > backup.last_ok_at) && (
+              <Kv label={t("ops.backupFailed")} value={backup.last_error} />
+            )}
+          <Kv
+            label={t("ops.lastAlert")}
+            value={ops.last_alert ? ops.last_alert.title : t("ops.noAlerts")}
+            hint={ops.last_alert ? fmt.ago(ops.last_alert.at) : undefined}
+          />
         </dl>
       </div>
     </Card>
@@ -341,12 +524,7 @@ function Kv({ label, value, hint }: { label: string; value: ReactNode; hint?: st
 }
 
 /* ---------------------------------------------------------- portal parity */
-const TILE_LABEL: Record<ParityTile, string> = {
-  recommended: "Works recommended",
-  sanctioned: "Works sanctioned",
-  completed: "Works completed",
-  expenditure: "Expenditure on works",
-};
+const TILES: ParityTile[] = ["recommended", "sanctioned", "completed", "expenditure"];
 
 function rupeesExact(value: number | null): string {
   if (value === null) return "—";
@@ -354,24 +532,29 @@ function rupeesExact(value: number | null): string {
 }
 
 function PortalParity({ parity }: { parity: Parity }) {
+  const i18n = useI18n();
+  const { t, tOr } = i18n;
   const rows = (["LS", "RS"] as const).flatMap((house) =>
-    (Object.keys(TILE_LABEL) as ParityTile[])
-      .filter((tile) => parity.national[house]?.[tile])
-      .map((tile) => ({ house, tile, fig: parity.national[house]![tile]! })),
+    TILES.filter((tile) => parity.national[house]?.[tile]).map((tile) => ({
+      house,
+      tile,
+      fig: parity.national[house]![tile]!,
+    })),
   );
   const allExact = parity.exception_count === 0 && rows.every((r) => r.fig.exact);
+  const counts = { n: compact(parity.exact_slices), m: compact(parity.registered_slices) };
   return (
     <Card
-      title="Portal parity"
-      subtitle="The portal's own dashboard figures beside ASTRA's, rebuilt from the stored records after every update and checked area by area"
+      title={t("parity.title")}
+      subtitle={t("parity.sub")}
       actions={
         <Chip
           color={allExact ? "#0f5233" : "var(--warn)"}
           bg={allExact ? "var(--success-bg)" : "var(--warn-bg)"}
         >
           {allExact
-            ? `Exact in ${compact(parity.exact_slices)} of ${compact(parity.registered_slices)} areas`
-            : `${compact(parity.exception_count)} of ${compact(parity.registered_slices)} areas differ`}
+            ? t("parity.exact", counts)
+            : t("parity.differ", { n: compact(parity.exception_count), m: counts.m })}
         </Chip>
       }
       tight
@@ -379,16 +562,16 @@ function PortalParity({ parity }: { parity: Parity }) {
       {parity.exceptions.length > 0 && (
         <div style={{ marginBottom: 12 }}>
           <Banner tone="warn">
-            <b>Differences from the portal:</b>{" "}
+            <b>{t("parity.diffs")}</b>{" "}
             {parity.exceptions
               .map(
                 (e) =>
                   `${titleCase(e.place)} (${e.house}): ${e.differences
-                    .map((d) => `${TILE_LABEL[d.tile].toLowerCase()} ${d.measure}`)
+                    .map((d) => `${t(`tile.${d.tile}`)} · ${tOr(`measure.${d.measure}`, d.measure)}`)
                     .join(", ")}`,
               )
               .join("; ")}
-            . Each is re-read automatically.
+            . {t("parity.reread")}
           </Banner>
         </div>
       )}
@@ -396,20 +579,20 @@ function PortalParity({ parity }: { parity: Parity }) {
         <table className="table">
           <thead>
             <tr>
-              <th>Figure</th>
-              <th style={{ width: 96 }}>Portal</th>
-              <th style={{ width: 96 }}>ASTRA</th>
-              <th>Portal ₹</th>
-              <th>ASTRA ₹</th>
-              <th style={{ width: 80 }}>Match</th>
+              <th>{t("parity.col.figure")}</th>
+              <th style={{ width: 96 }}>{t("parity.col.portal")}</th>
+              <th style={{ width: 96 }}>{t("parity.col.astra")}</th>
+              <th>{t("parity.col.portalRs")}</th>
+              <th>{t("parity.col.astraRs")}</th>
+              <th style={{ width: 80 }}>{t("parity.col.match")}</th>
             </tr>
           </thead>
           <tbody>
             {rows.map(({ house, tile, fig }) => (
               <tr key={`${house}-${tile}`} style={{ cursor: "default" }}>
                 <td className="text-sm">
-                  <span className="semibold">{TILE_LABEL[tile]}</span>{" "}
-                  <span className="dim">· {house === "LS" ? "Lok Sabha" : "Rajya Sabha"}</span>
+                  <span className="semibold">{t(`tile.${tile}`)}</span>{" "}
+                  <span className="dim">· {houseName(i18n, house)}</span>
                 </td>
                 <td className="num text-sm">{compact(fig.portal[0])}</td>
                 <td className="num text-sm">{compact(fig.stored[0])}</td>
@@ -424,12 +607,9 @@ function PortalParity({ parity }: { parity: Parity }) {
         </table>
       </div>
       <p className="text-xs dim" style={{ margin: "10px 0 0" }}>
-        Works listed only from the sanctioned report onward are stored and counted
-        under sanctioned, completed and expenditure, exactly as the portal counts
-        them. A work the portal stops listing is removed after a second read
-        confirms it, and kept in history.
+        {t("parity.note")}
         {parity.duplicate_listings > 0 &&
-          ` The portal lists ${compact(parity.duplicate_listings)} work(s) more than once; they are mirrored as listed.`}
+          ` ${t("parity.dupNote", { count: compact(parity.duplicate_listings) })}`}
       </p>
     </Card>
   );
@@ -437,47 +617,39 @@ function PortalParity({ parity }: { parity: Parity }) {
 
 /* ----------------------------------------------------------- change feed */
 /** "KANGRA (LS)" -> "Kangra · Lok Sabha"; "RAJASTHAN (RS)" -> "Rajasthan · Rajya Sabha". */
-function areaLabel(area: string): string {
+function areaLabel(area: string, i18n: I18n): string {
   const m = area.match(/^(.*?)\s*\((LS|RS)\)$/);
   if (!m) return titleCase(area);
-  return `${titleCase(m[1])} · ${m[2] === "RS" ? "Rajya Sabha" : "Lok Sabha"}`;
+  return `${titleCase(m[1])} · ${houseName(i18n, m[2])}`;
 }
 
-const FIELD_LABEL: Record<string, string> = {
-  expenditure: "Expenditure",
-  total_paid: "Total paid",
-  payment_count: "Payments",
-  last_payment_date: "Last payment",
-  payment_status: "Payment status",
-  completion_date: "Completed on",
-  sanction_date: "Sanctioned on",
-  recommended_date: "Recommended on",
-  estimated_cost: "Estimated cost",
-  sanctioned_amount: "Sanctioned amount",
-  status: "Status",
-  vendor_name: "Vendor",
-  ia_name: "Implementing agency",
-  description: "Description",
-  category: "Category",
-  work_type: "Work type",
-  district: "District",
-  fy: "Financial year",
-  listing: "Listed on the portal",
-};
 const MONEY_FIELDS = new Set(["expenditure", "total_paid", "estimated_cost", "sanctioned_amount"]);
 const DATE_FIELDS = new Set(["recommended_date", "sanction_date", "completion_date", "last_payment_date"]);
 
-function fieldValue(field: string, value: string | null): string {
+function fieldValue(field: string, value: string | null, i18n: I18n): string {
   if (value === null || value === "") return "—";
   if (MONEY_FIELDS.has(field)) {
     const n = Number(value);
     return Number.isNaN(n) ? value : `₹${n.toLocaleString("en-IN", { maximumFractionDigits: 0 })}`;
   }
-  if (DATE_FIELDS.has(field)) return formatDate(value);
+  if (DATE_FIELDS.has(field)) return i18n.fmt.date(value);
   return value.length > 60 ? `${value.slice(0, 57)}…` : value;
 }
 
+/** The poller's "2 new, 1 updated (3 field changes)" in the chosen language;
+ *  any other wording is shown as the poller wrote it. */
+function changeSummary(what: string, i18n: I18n): string {
+  const m = /^(\d+) new, (\d+) updated,? \(?(\d+) field changes?\)?$/.exec(what);
+  if (!m) return what;
+  return i18n.tn("updates.what", Number(m[3]), {
+    new: Number(m[1]).toLocaleString("en-IN"),
+    updated: Number(m[2]).toLocaleString("en-IN"),
+  });
+}
+
 function PortalUpdates({ data, loading }: { data?: RecentUpdates; loading: boolean }) {
+  const i18n = useI18n();
+  const { t, tOr, fmt } = i18n;
   const now = useNow(10_000);
   if (loading) return <Skeleton h={180} />;
   const stores = data?.stores ?? [];
@@ -485,19 +657,15 @@ function PortalUpdates({ data, loading }: { data?: RecentUpdates; loading: boole
 
   return (
     <div className="grid-2">
-      <Card
-        title="Latest portal updates"
-        subtitle="Areas re-read because their records changed on the portal, newest first. New works appear here"
-        tight
-      >
+      <Card title={t("updates.title")} subtitle={t("updates.sub")} tight>
         {stores.length ? (
           <div className="table-scroll" style={{ maxHeight: 360 }}>
             <table className="table">
               <thead>
                 <tr>
-                  <th>Area</th>
-                  <th>What changed</th>
-                  <th style={{ width: 92 }}>When</th>
+                  <th>{t("updates.col.area")}</th>
+                  <th>{t("updates.col.what")}</th>
+                  <th style={{ width: 92 }}>{t("updates.col.when")}</th>
                 </tr>
               </thead>
               <tbody>
@@ -511,10 +679,10 @@ function PortalUpdates({ data, loading }: { data?: RecentUpdates; loading: boole
                       style={{ cursor: "default" }}
                       title={parts.filter((p) => p !== what).join(" · ")}
                     >
-                      <td className="semibold text-sm">{areaLabel(s.area)}</td>
-                      <td className="text-xs muted">{what}</td>
-                      <td className="text-xs dim" title={clockTime(s.at)}>
-                        {ago(s.at, now)}
+                      <td className="semibold text-sm">{areaLabel(s.area, i18n)}</td>
+                      <td className="text-xs muted">{changeSummary(what, i18n)}</td>
+                      <td className="text-xs dim" title={fmt.clock(s.at)}>
+                        {fmt.ago(s.at, now)}
                       </td>
                     </tr>
                   );
@@ -523,15 +691,11 @@ function PortalUpdates({ data, loading }: { data?: RecentUpdates; loading: boole
             </table>
           </div>
         ) : (
-          <p className="text-sm dim">No updates stored yet.</p>
+          <p className="text-sm dim">{t("updates.none")}</p>
         )}
       </Card>
 
-      <Card
-        title="Recently updated works"
-        subtitle="Changes to existing works, old and new value exactly as observed on the portal"
-        tight
-      >
+      <Card title={t("updates.works.title")} subtitle={t("updates.works.sub")} tight>
         {changes.length ? (
           <div className="change-list">
             {changes.map((c) => (
@@ -540,13 +704,13 @@ function PortalUpdates({ data, loading }: { data?: RecentUpdates; loading: boole
                   <span className="mono text-xs grow truncate" title={c.work_id}>
                     {c.work_id}
                   </span>
-                  <span className="text-xs dim" title={clockTime(c.observed_at)}>
-                    {ago(c.observed_at, now)}
+                  <span className="text-xs dim" title={fmt.clock(c.observed_at)}>
+                    {fmt.ago(c.observed_at, now)}
                   </span>
                 </div>
                 <div className="text-sm semibold">
                   {titleCase(c.place)}
-                  {c.house === "RS" ? " · Rajya Sabha" : ""}
+                  {c.house === "RS" ? ` · ${houseName(i18n, "RS")}` : ""}
                   {c.mp_name ? <span className="muted"> · {titleCase(c.mp_name)}</span> : null}
                 </div>
                 {c.description && (
@@ -557,12 +721,16 @@ function PortalUpdates({ data, loading }: { data?: RecentUpdates; loading: boole
                 <ul className="change-fields">
                   {c.fields.map((fd) => (
                     <li key={fd.field}>
-                      <span className="change-field">{FIELD_LABEL[fd.field] ?? fd.field}</span>
+                      <span className="change-field">{tOr(`field.${fd.field}`, fd.field)}</span>
                       <span className={fd.old_value === null ? "change-empty" : "change-old"}>
-                        {fieldValue(fd.field, fd.old_value)}
+                        {fieldValue(fd.field, fd.old_value, i18n)}
                       </span>
-                      <ArrowRight size={11} className="dim" aria-label="changed to" />
-                      <span className="change-new">{fieldValue(fd.field, fd.new_value)}</span>
+                      <ArrowRight
+                        size={11}
+                        className="dim flip-rtl"
+                        aria-label={t("updates.changedTo")}
+                      />
+                      <span className="change-new">{fieldValue(fd.field, fd.new_value, i18n)}</span>
                     </li>
                   ))}
                 </ul>
@@ -570,10 +738,7 @@ function PortalUpdates({ data, loading }: { data?: RecentUpdates; loading: boole
             ))}
           </div>
         ) : (
-          <p className="text-sm dim">
-            No edits to existing works observed yet. Newly recommended works appear
-            under Latest portal updates.
-          </p>
+          <p className="text-sm dim">{t("updates.works.none")}</p>
         )}
       </Card>
     </div>
@@ -582,6 +747,7 @@ function PortalUpdates({ data, loading }: { data?: RecentUpdates; loading: boole
 
 /* ---------------------------------------------------------------- ledger */
 function LedgerStatus({ status }: { status: string }) {
+  const { tOr } = useI18n();
   const good = status === "ok" || status === "selected" || status === "exact";
   const attention = status === "attention" || status === "differs";
   return (
@@ -589,14 +755,15 @@ function LedgerStatus({ status }: { status: string }) {
       color={good ? "#0f5233" : attention ? "var(--warn)" : "var(--text-2)"}
       bg={good ? "var(--success-bg)" : attention ? "var(--warn-bg)" : "var(--surface-3)"}
     >
-      {status}
+      {tOr(`ledger.${status}`, status)}
     </Chip>
   );
 }
 
 function EraList({ data }: { data?: Record<string, number> }) {
+  const { t } = useI18n();
   const entries = Object.entries(data ?? {});
-  if (!entries.length) return <p className="text-sm dim">No data.</p>;
+  if (!entries.length) return <p className="text-sm dim">{t("data.noData")}</p>;
   const total = entries.reduce((a, [, v]) => a + v, 0);
   return (
     <div className="stack gap-2">
@@ -608,7 +775,7 @@ function EraList({ data }: { data?: Record<string, number> }) {
           <span className="det-bar grow">
             <span style={{ width: `${(n / total) * 100}%` }} />
           </span>
-          <span className="num text-sm semibold" style={{ width: 66, textAlign: "right" }}>
+          <span className="num text-sm semibold" style={{ width: 66, textAlign: "end" }}>
             {compact(n)}
           </span>
         </div>

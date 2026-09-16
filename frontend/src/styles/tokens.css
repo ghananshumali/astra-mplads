@@ -68,7 +68,8 @@
 
   /* ---------------------------------------------------------- type */
   --font: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
-    "Helvetica Neue", Arial, sans-serif;
+    "Helvetica Neue", Arial, "Nirmala UI", "Noto Sans", "Noto Sans Devanagari",
+    sans-serif;
   --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, "SF Mono",
     Menlo, Consolas, monospace;
 
@@ -203,4 +204,25 @@ code,
     animation-duration: 0.01ms !important;
     transition-duration: 0.01ms !important;
   }
+}
+
+/* ------------------------------------------------------------ languages */
+/* Devanagari carries vowel marks above and below the line; tight line
+   heights clip them. */
+:lang(hi) {
+  line-height: 1.6;
+}
+/* Work codes, amounts and data values stay left-to-right inside a
+   right-to-left language, should one be added. */
+[dir="rtl"] .mono,
+[dir="rtl"] .num,
+[dir="rtl"] code,
+[dir="rtl"] pre {
+  direction: ltr;
+  unicode-bidi: isolate;
+}
+
+/* Direction-bearing icons (previous / next) point the other way in RTL. */
+[dir="rtl"] .flip-rtl {
+  transform: scaleX(-1);
 }

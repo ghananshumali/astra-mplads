@@ -4,6 +4,25 @@
 import { useEffect, useState } from "react";
 
 import type { Freshness } from "../api/types";
+import type { I18n } from "../i18n/context";
+import { houseName } from "../i18n/labels";
+import { titleCase } from "./format";
+
+type StaleCheck = Freshness["stale"][number];
+
+/** "National check — Lok Sabha", "Goa state check (Lok Sabha)", "Kollam (LS)". */
+export function staleLabel(s: StaleCheck, i18n: I18n): string {
+  const house = houseName(i18n, s.house);
+  if (s.scope === "national") return i18n.t("sync.nationalCheck", { house });
+  if (s.scope === "state") return i18n.t("sync.stateCheck", { state: titleCase(s.place), house });
+  return `${titleCase(s.place)} (${s.house})`;
+}
+
+/** Checks to name as failing. While the portal is not answering, the national
+ *  checks are explained by that instead, so they are not listed twice. */
+export function failingChecks(f: Freshness): StaleCheck[] {
+  return f.stale.filter((s) => !(f.portal?.open && s.scope === "national"));
+}
 
 /** Re-render on an interval so "checked 20 s ago" keeps counting between fetches. */
 export function useNow(everyMs = 10_000): number {
@@ -13,34 +32,6 @@ export function useNow(everyMs = 10_000): number {
     return () => window.clearInterval(id);
   }, [everyMs]);
   return now;
-}
-
-/** "just now", "40 s ago", "3 min ago", "2 h ago", "4 d ago". */
-export function ago(iso: string | null | undefined, now = Date.now()): string {
-  if (!iso) return "—";
-  const t = new Date(iso).getTime();
-  if (Number.isNaN(t)) return "—";
-  const s = Math.max(0, Math.floor((now - t) / 1000));
-  if (s < 10) return "just now";
-  if (s < 60) return `${Math.floor(s / 10) * 10} s ago`;
-  const m = Math.floor(s / 60);
-  if (m < 60) return `${m} min ago`;
-  const h = Math.floor(m / 60);
-  if (h < 24) return `${h} h ago`;
-  return `${Math.floor(h / 24)} d ago`;
-}
-
-/** "13 Sep, 11:42" in Indian locale. */
-export function clockTime(iso: string | null | undefined): string {
-  if (!iso) return "—";
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return "—";
-  return d.toLocaleString("en-IN", {
-    day: "2-digit",
-    month: "short",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
 }
 
 export type LiveTone = "live" | "warn" | "stopped";
@@ -57,67 +48,95 @@ export interface LiveState {
  *  (portal unreachable, or a long catch-up after the laptop slept). */
 const STUCK_AFTER_INTERVALS = 5;
 
-export function liveState(f: Freshness, now = Date.now()): LiveState {
-  const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
+export function liveState(f: Freshness, i18n: I18n, now = Date.now()): LiveState {
+  const { t, tn, fmt } = i18n;
   if (!f.poller_running) {
     return {
       tone: "stopped",
-      label: "Updates paused",
+      label: t("live.paused"),
       detail: f.last_check_at
-        ? `last check ${ago(f.last_check_at, now)}`
-        : "poller not started",
+        ? t("live.lastCheck", { ago: fmt.ago(f.last_check_at, now) })
+        : t("live.notStarted"),
     };
   }
+  if (f.portal?.open) {
+    return { tone: "warn", label: t("live.paused"), detail: t("live.portalDown") };
+  }
+  const live = t("live.live");
   if (f.sweep_in_progress) {
-    return { tone: "live", label: "Live", detail: "full check running" };
+    return { tone: "live", label: live, detail: t("live.fullCheck") };
+  }
+  if (f.analysis?.in_progress) {
+    return { tone: "live", label: live, detail: t("live.recomputing") };
   }
   if (f.parity?.exception_count) {
-    return {
-      tone: "warn",
-      label: "Live",
-      detail: `${plural(f.parity.exception_count, "area")} differ from portal`,
-    };
+    return { tone: "warn", label: live, detail: tn("live.differ", f.parity.exception_count) };
   }
-  if (f.stale.length) {
-    return {
-      tone: "warn",
-      label: "Live",
-      detail: `${plural(f.stale.length, "area")} not updating`,
-    };
+  const failing = failingChecks(f);
+  if (failing.length) {
+    return { tone: "warn", label: live, detail: tn("live.notUpdating", failing.length) };
   }
   if (f.reconciliation_overdue) {
-    return { tone: "warn", label: "Live", detail: "nightly check overdue" };
+    return { tone: "warn", label: live, detail: t("live.nightlyOverdue") };
   }
   if (!f.last_check_at) {
-    return { tone: "live", label: "Live", detail: "first check running" };
+    return { tone: "live", label: live, detail: t("live.firstCheck") };
   }
   const intervalMs = (f.poll_interval_seconds ?? 60) * 1000;
   const age = now - new Date(f.last_check_at).getTime();
   if (age > STUCK_AFTER_INTERVALS * intervalMs) {
-    return { tone: "warn", label: "Live", detail: `last check ${ago(f.last_check_at, now)}` };
+    return { tone: "warn", label: live, detail: t("live.lastCheck", { ago: fmt.ago(f.last_check_at, now) }) };
   }
-  return { tone: "live", label: "Live", detail: `checked ${ago(f.last_check_at, now)}` };
+  return { tone: "live", label: live, detail: t("live.checked", { ago: fmt.ago(f.last_check_at, now) }) };
 }
 
 /** Multi-line hover text for the badge. */
-export function liveTooltip(f: Freshness): string {
+export function liveTooltip(f: Freshness, i18n: I18n): string {
+  const { t, fmt } = i18n;
   const every = Math.round(f.poll_interval_seconds ?? 60);
   if (!f.poller_running) {
     return [
-      "The poller is not running, so portal changes are not being picked up.",
-      `Last portal check: ${clockTime(f.last_check_at)}`,
-      "Start it with: python -m astra.ingestion.poller",
+      t("live.tip.notRunning"),
+      t("live.tip.lastCheck", { time: fmt.clock(f.last_check_at) }),
+      t("live.tip.start"),
     ].join("\n");
   }
+  const n = (value: number) => value.toLocaleString("en-IN");
   return [
-    `The eSAKSHI portal is checked every ${every} s; only areas whose counts moved are re-read.`,
-    `Last portal check: ${clockTime(f.last_check_at)}`,
+    f.portal?.open ? t("live.tip.portalDown", { time: fmt.clock(f.portal.next_attempt_at) }) : null,
+    t("live.tip.every", { every }),
+    f.rolling?.enabled ? t("live.tip.rotation", { hours: rotationHours(f.rolling.hours, i18n) }) : null,
+    t("live.tip.lastCheck", { time: fmt.clock(f.last_check_at) }),
     f.last_update
-      ? `Last update stored: ${clockTime(f.last_update.at)} — ${f.last_update.area}`
-      : "No updates stored yet",
-    `Last full reconciliation: ${clockTime(f.last_full_reconciliation)}`,
+      ? t("live.tip.lastUpdate", { time: fmt.clock(f.last_update.at), area: f.last_update.area })
+      : t("live.tip.noUpdates"),
+    t("live.tip.lastRecon", { time: fmt.clock(f.last_full_reconciliation) }),
+    t("live.tip.recomputed", { time: fmt.clock(f.analysis?.last_at) }),
     f.parity
-      ? `${f.parity.exact_slices.toLocaleString("en-IN")} of ${f.parity.registered_slices.toLocaleString("en-IN")} areas match the portal on every figure`
-      : `${f.reconciled_shards.toLocaleString("en-IN")} of ${f.registered_shards.toLocaleString("en-IN")} areas match the portal's own count`,
-  ].join("\n");
+      ? t("live.tip.parity", { n: n(f.parity.exact_slices), m: n(f.parity.registered_slices) })
+      : t("live.tip.count", { n: n(f.reconciled_shards), m: n(f.registered_shards) }),
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+/** "08:00-20:00" -> "from 08:00 to 20:00"; "always" -> "all day". */
+export function rotationHours(hours: string, i18n: I18n): string {
+  const [start, end] = hours.split("-");
+  return end ? i18n.t("live.hoursRange", { start, end }) : i18n.t("live.hoursAlways");
+}
+
+/** What the "Risk flags recomputed" figure needs to say beside its time. */
+export function analysisHint(f: Freshness, i18n: I18n, now = Date.now()): string {
+  const { t, fmt } = i18n;
+  const a = f.analysis;
+  if (a.in_progress) return t("analysis.started", { ago: fmt.ago(a.started_at, now) });
+  if (!a.last_at) return a.changes_waiting ? t("analysis.firstDue") : t("analysis.notYet");
+  if (!a.changes_waiting) return t("analysis.includesAll", { ago: fmt.ago(a.last_at, now) });
+  if (!f.poller_running) return t("analysis.waitPoller");
+  if (!a.every_minutes) return t("analysis.autoOff");
+  const due = new Date(a.last_at).getTime() + a.every_minutes * 60_000;
+  return due <= now
+    ? t("analysis.nextCheck")
+    : t("analysis.includedBy", { time: fmt.clock(new Date(due).toISOString()) });
 }

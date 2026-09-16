@@ -14,17 +14,17 @@ import {
 import { useState } from "react";
 
 import { api } from "../../api/client";
-import type { Finding, PlanAction } from "../../api/types";
+import type { Finding, PlanAction, ReviewStatus } from "../../api/types";
+import { useI18n } from "../../i18n/context";
+import type { MessageKey } from "../../i18n/context";
+import { actionText, agentText, dupMode, ruleTitle, stageLabel } from "../../i18n/labels";
 import {
-  AGENT_META,
+  AGENT_COLOR,
   RISK_META,
   SEVERITY_COLOR,
   STAGE_META,
-  STATUS_META,
-  TIERS,
-  formatDate,
+  isStage,
   riskLevel,
-  rupees,
   titleCase,
 } from "../../lib/format";
 import { useAuthority } from "../../state/AuthorityContext";
@@ -43,6 +43,8 @@ import {
 } from "../ui";
 import "./case.css";
 
+const REVIEW_FLOW: ReviewStatus[] = ["pending", "under_review", "confirmed", "false_positive"];
+
 /* ------------------------------------------------------- agent contribution */
 function AgentTrace({
   signals,
@@ -60,21 +62,23 @@ function AgentTrace({
   }[];
   score: number;
 }) {
-  const meta = RISK_META[riskLevel(score)];
+  const i18n = useI18n();
+  const { t } = i18n;
+  const level = riskLevel(score);
+  const meta = RISK_META[level];
   return (
     <div className="stack gap-3">
       <p className="text-sm muted" style={{ margin: 0 }}>
-        Each agent works independently. The orchestrator combines their findings
-        into one score and one recommendation.
+        {t("case.trace.intro")}
       </p>
       {signals.map((s, i) => (
         <div
           key={`${s.agent}-${i}`}
           className="trace-card"
-          style={{ borderLeftColor: AGENT_META[s.agent]?.color ?? "var(--navy-500)" }}
+          style={{ borderInlineStartColor: AGENT_COLOR[s.agent] ?? "var(--navy-500)" }}
         >
           <div className="row gap-2" style={{ justifyContent: "space-between" }}>
-            <span className="semibold">{s.agent_label}</span>
+            <span className="semibold">{agentText(i18n, s.agent, "label")}</span>
             <Chip
               color={SEVERITY_COLOR[s.severity as keyof typeof SEVERITY_COLOR]}
               bg="var(--surface-3)"
@@ -82,31 +86,26 @@ function AgentTrace({
               +{s.contribution} · {s.share_pct}%
             </Chip>
           </div>
-          <div className="text-xs dim">{AGENT_META[s.agent]?.role}</div>
+          <div className="text-xs dim">{agentText(i18n, s.agent, "role")}</div>
           <div className="trace-headline">{s.headline}</div>
           <div className="trace-metrics">
             <span>
-              <b className="dim">Measured</b> {s.metric ?? "—"}
+              <b className="dim">{t("case.trace.measured")}</b> {s.metric ?? "—"}
             </span>
             <span>
-              <b className="dim">Compared with</b> {s.benchmark ?? "—"}
+              <b className="dim">{t("case.trace.compared")}</b> {s.benchmark ?? "—"}
             </span>
           </div>
         </div>
       ))}
       <div className="trace-arrow">↓</div>
       <div className="trace-synth">
-        <b>Synthesiser / Orchestrator</b>
-        <div className="text-sm">
-          Combines every agent signal into one composite score.
-        </div>
+        <b>{t("case.trace.synth")}</b>
+        <div className="text-sm">{t("case.trace.synthText")}</div>
       </div>
       <div className="trace-arrow">↓</div>
-      <div
-        className="trace-final"
-        style={{ background: meta.color }}
-      >
-        {meta.label} · {score.toFixed(0)}/100 — human review required
+      <div className="trace-final" style={{ background: meta.color }}>
+        {t("case.trace.final", { risk: t(`risk.${level}`), score: score.toFixed(0) })}
       </div>
     </div>
   );
@@ -114,7 +113,9 @@ function AgentTrace({
 
 /* --------------------------------------------------------------- evidence */
 function EvidenceList({ findings }: { findings: Finding[] }) {
-  if (!findings.length) return <Empty title="No findings recorded" />;
+  const i18n = useI18n();
+  const { t } = i18n;
+  if (!findings.length) return <Empty title={t("case.evidence.empty")} />;
   return (
     <div className="stack gap-2">
       {findings.map((f, i) => (
@@ -126,28 +127,27 @@ function EvidenceList({ findings }: { findings: Finding[] }) {
                 className="sev-dot"
                 style={{ background: SEVERITY_COLOR[f.severity] }}
               />
-              <span className="semibold">{f.rule_title}</span>
+              <span className="semibold">{ruleTitle(i18n, f.rule_id, f.rule_title)}</span>
             </span>
           }
-          meta={
-            <Chip bg="var(--surface-3)">
-              {AGENT_META[f.agent]?.short ?? f.agent}
-            </Chip>
-          }
+          meta={<Chip bg="var(--surface-3)">{agentText(i18n, f.agent, "short")}</Chip>}
         >
           <div className="stack gap-3">
-            <p style={{ margin: 0 }}>{f.summary}</p>
-            {f.clause && (
+            <p style={{ margin: 0 }}>{f.explained?.plain ?? f.summary}</p>
+            {(f.explained?.clause ?? f.clause) && (
               <div className="clause">
                 <Scale size={13} />
-                <span>{f.clause}</span>
+                <span>{f.explained?.clause ?? f.clause}</span>
               </div>
             )}
             <div>
-              <div className="field-label">Raw values (audit trail)</div>
-              <pre className="json">
-                {JSON.stringify(f.details, null, 2)}
-              </pre>
+              <div className="field-label">{t("case.evidence.raw")}</div>
+              {f.explained && (
+                <p className="text-sm muted" style={{ margin: "0 0 6px" }}>
+                  <b>{t("case.evidence.original")}</b> <span lang="en">{f.summary}</span>
+                </p>
+              )}
+              <pre className="json">{JSON.stringify(f.details, null, 2)}</pre>
             </div>
           </div>
         </Collapse>
@@ -158,21 +158,19 @@ function EvidenceList({ findings }: { findings: Finding[] }) {
 
 /* ------------------------------------------------------------ action plan */
 function ActionPlan({ plan }: { plan: PlanAction[] }) {
-  if (!plan.length)
-    return <Empty title="No actions available to this authority" />;
-  const stages = [...new Set(plan.map((p) => p.stage))].sort(
-    (a, b) => STAGE_META[a].order - STAGE_META[b].order,
-  );
+  const i18n = useI18n();
+  const { t } = i18n;
+  if (!plan.length) return <Empty title={t("case.plan.empty")} />;
+  const order = (stage: string) => (isStage(stage) ? STAGE_META[stage].order : 9);
+  const color = (stage: string) => (isStage(stage) ? STAGE_META[stage].color : "var(--navy-500)");
+  const stages = [...new Set(plan.map((p) => p.stage))].sort((a, b) => order(a) - order(b));
   let n = 0;
   return (
     <div className="stack gap-4">
       {stages.map((stage) => (
         <div key={stage}>
-          <div
-            className="stage-label"
-            style={{ color: STAGE_META[stage].color }}
-          >
-            {STAGE_META[stage].label}
+          <div className="stage-label" style={{ color: color(stage) }}>
+            {stageLabel(i18n, stage)}
           </div>
           <div className="stack gap-2">
             {plan
@@ -183,15 +181,17 @@ function ActionPlan({ plan }: { plan: PlanAction[] }) {
                   <div
                     key={a.action_id}
                     className="action-card"
-                    style={{ borderLeftColor: STAGE_META[stage].color }}
+                    style={{ borderInlineStartColor: color(stage) }}
                   >
                     <div className="action-title">
                       <span className="action-n">{n}</span>
-                      {a.label}
+                      {actionText(i18n, a.action_id, "label", a.label)}
                     </div>
-                    <div className="text-sm muted">{a.detail}</div>
+                    <div className="text-sm muted">
+                      {actionText(i18n, a.action_id, "detail", a.detail)}
+                    </div>
                     {a.reason && (
-                      <div className="action-why">Why: {a.reason}</div>
+                      <div className="action-why">{t("case.plan.why", { reason: a.reason })}</div>
                     )}
                   </div>
                 );
@@ -211,23 +211,26 @@ export default function CaseDetail({
   flagId: string;
   onClose: () => void;
 }) {
+  const i18n = useI18n();
+  const { t, tOr, fmt } = i18n;
+  const lang = i18n.language.code;
   const { tier } = useAuthority();
   const qc = useQueryClient();
   const [tab, setTab] = useState("why");
   const [note, setNote] = useState("");
 
   const detail = useQuery({
-    queryKey: ["case", flagId, tier],
-    queryFn: () => api.caseDetail(flagId, tier),
+    queryKey: ["case", flagId, tier, lang],
+    queryFn: () => api.caseDetail(flagId, tier, lang),
   });
   const synth = useQuery({
-    queryKey: ["synthesis", flagId, tier],
-    queryFn: () => api.synthesis(flagId, tier),
+    queryKey: ["synthesis", flagId, tier, lang],
+    queryFn: () => api.synthesis(flagId, tier, lang),
     enabled: tab === "ai",
   });
   const allowed = useQuery({
-    queryKey: ["actions", flagId, tier],
-    queryFn: () => api.allowedActions(flagId, tier),
+    queryKey: ["actions", flagId, tier, lang],
+    queryFn: () => api.allowedActions(flagId, tier, lang),
     enabled: tab === "ai",
   });
   const work = useQuery({
@@ -267,17 +270,21 @@ export default function CaseDetail({
 
   const c = detail.data!;
   const brief = c.brief;
-  const meta = RISK_META[riskLevel(c.risk_score)];
+  const level = riskLevel(c.risk_score);
+  const meta = RISK_META[level];
   const dupFindings = c.findings.filter((f) => f.rule_id.startsWith("D-"));
   const netFindings = c.findings.filter((f) => f.agent === "network");
+  const tierLabel = t(`tier.${tier}.label`);
+  const entityLevel: MessageKey =
+    c.entity_type === "agency" ? "entity.agency" : c.entity_type === "work" ? "entity.work" : "entity.constituency";
 
   const tabs = [
-    { value: "why", label: "Why flagged" },
-    { value: "ai", label: "AI synthesis" },
-    { value: "trace", label: "Agent trace" },
-    { value: "evidence", label: "Evidence", count: c.findings.length },
-    { value: "record", label: "Work record" },
-    { value: "duplicates", label: "Duplicates", count: dupFindings.length },
+    { value: "why", label: t("case.tab.why") },
+    { value: "ai", label: t("case.tab.ai") },
+    { value: "trace", label: t("case.tab.trace") },
+    { value: "evidence", label: t("case.tab.evidence"), count: c.findings.length },
+    { value: "record", label: t("case.tab.record") },
+    { value: "duplicates", label: t("case.tab.duplicates"), count: dupFindings.length },
   ];
 
   return (
@@ -297,13 +304,13 @@ export default function CaseDetail({
               {[c.district, c.state].filter(Boolean).join(", ") || "—"}
             </div>
           </div>
-          <button className="btn btn-ghost btn-sm" onClick={onClose} title="Close">
+          <button className="btn btn-ghost btn-sm" onClick={onClose} title={t("case.close")}>
             <X size={16} />
           </button>
         </div>
         <div className="viewing-as">
           <Eye size={12} />
-          Viewing as <b>{TIERS[tier].label}</b> — {brief?.lens ?? TIERS[tier].lens}
+          {t("case.viewingAs", { tier: tierLabel, lens: t(`tier.${tier}.lens`) })}
         </div>
       </Card>
 
@@ -317,7 +324,7 @@ export default function CaseDetail({
             style={{ background: meta.bg, borderColor: meta.border }}
           >
             <div className="primary-label" style={{ color: meta.color }}>
-              Primary risk
+              {t("case.primaryRisk")}
             </div>
             <div className="primary-headline">{brief.primary_risk}</div>
             <p className="primary-plain">{brief.primary_plain}</p>
@@ -325,18 +332,16 @@ export default function CaseDetail({
 
           {brief.signals.length > 1 && (
             <div className="stack gap-2">
-              <div className="section-label">Supporting signals</div>
+              <div className="section-label">{t("case.supporting")}</div>
               {brief.signals.slice(1).map((s, i) => (
                 <div
                   key={i}
                   className="signal-card"
-                  style={{ borderLeftColor: SEVERITY_COLOR[s.severity] }}
+                  style={{ borderInlineStartColor: SEVERITY_COLOR[s.severity] }}
                 >
                   <div className="row gap-2">
                     <span className="semibold grow">{s.headline}</span>
-                    <Chip bg="var(--surface-3)">
-                      {AGENT_META[s.agent]?.short}
-                    </Chip>
+                    <Chip bg="var(--surface-3)">{agentText(i18n, s.agent, "short")}</Chip>
                   </div>
                   <p className="text-sm muted" style={{ margin: "4px 0 0" }}>
                     {s.plain}
@@ -350,7 +355,7 @@ export default function CaseDetail({
             <Banner tone="info">{brief.context_note}</Banner>
           )}
 
-          <Card title="Recommended next steps" subtitle={brief.tier_label} tight>
+          <Card title={t("case.nextSteps")} subtitle={tierLabel} tight>
             <ol className="steps">
               {brief.actions.map((a, i) => (
                 <li key={i}>{a}</li>
@@ -378,7 +383,7 @@ export default function CaseDetail({
           {synth.isLoading ? (
             <Card>
               <div className="row gap-2 muted">
-                <Spinner /> Synthesising for {TIERS[tier].label}…
+                <Spinner /> {t("case.ai.loading", { tier: tierLabel })}
               </div>
             </Card>
           ) : synth.isError ? (
@@ -388,22 +393,22 @@ export default function CaseDetail({
               <div className="row gap-2" style={{ flexWrap: "wrap" }}>
                 {synth.data.source === "groq" ? (
                   <Chip color="#0f5233" bg="var(--success-bg)" dot>
-                    <Sparkles size={11} /> AI synthesis · {synth.data.model}
+                    <Sparkles size={11} /> {t("case.ai.chip", { model: synth.data.model ?? "" })}
                   </Chip>
                 ) : (
                   <Chip color="var(--text-2)" bg="var(--surface-3)" dot>
-                    Deterministic synthesis
+                    {t("case.ai.deterministic")}
                   </Chip>
                 )}
                 {synth.data.latency_ms ? (
-                  <span className="text-xs dim">{synth.data.latency_ms} ms</span>
+                  <span className="text-xs dim">{t("case.ai.latency", { ms: synth.data.latency_ms })}</span>
                 ) : null}
               </div>
 
               {synth.data.source === "deterministic" && (
                 <Banner tone="neutral">
-                  {fallbackMessage(synth.data.fallback_reason)} The analysis
-                  below is complete — only the wording differs.
+                  {tOr(`fallback.${synth.data.fallback_reason}`, t("fallback.default"))}{" "}
+                  {t("case.ai.fallbackTail")}
                 </Banner>
               )}
 
@@ -412,8 +417,10 @@ export default function CaseDetail({
                 style={{ background: meta.bg, borderColor: meta.border }}
               >
                 <div className="primary-label" style={{ color: meta.color }}>
-                  Key risk · {synth.data.risk_level} ·{" "}
-                  {synth.data.risk_score.toFixed(0)}/100
+                  {t("case.ai.keyRisk", {
+                    risk: t(`risk.${riskLevel(synth.data.risk_score)}`),
+                    score: synth.data.risk_score.toFixed(0),
+                  })}
                 </div>
                 <div className="primary-headline">
                   {synth.data.key_risk_summary}
@@ -422,10 +429,7 @@ export default function CaseDetail({
               </div>
 
               {synth.data.authority_specific_summary && (
-                <Card
-                  title={`What this means for ${synth.data.tier_label}`}
-                  tight
-                >
+                <Card title={t("case.ai.meansFor", { tier: tierLabel })} tight>
                   <p style={{ margin: 0 }}>
                     {synth.data.authority_specific_summary}
                   </p>
@@ -433,15 +437,15 @@ export default function CaseDetail({
               )}
 
               <Card
-                title="Recommended action plan"
-                subtitle={`Constrained to actions permitted for ${synth.data.tier_label}`}
+                title={t("case.ai.plan")}
+                subtitle={t("case.ai.planSub", { tier: tierLabel })}
                 tight
               >
                 <ActionPlan plan={synth.data.action_plan} />
                 {synth.data.plan_rationale && (
                   <>
                     <div className="section-label" style={{ marginTop: 16 }}>
-                      Why these actions
+                      {t("case.ai.whyActions")}
                     </div>
                     <p className="text-sm muted" style={{ margin: 0 }}>
                       {synth.data.plan_rationale}
@@ -451,7 +455,7 @@ export default function CaseDetail({
               </Card>
 
               {synth.data.limitations_or_missing_evidence.length > 0 && (
-                <Collapse title="Limitations and missing evidence">
+                <Collapse title={t("case.ai.limitations")}>
                   <ul className="bullets">
                     {synth.data.limitations_or_missing_evidence.map((l, i) => (
                       <li key={i}>{l}</li>
@@ -462,7 +466,7 @@ export default function CaseDetail({
 
               {allowed.data && (
                 <Collapse
-                  title="Permitted actions for this authority"
+                  title={t("case.ai.permitted")}
                   meta={
                     <Chip bg="var(--surface-3)">
                       {allowed.data.allowed_actions.length}
@@ -470,17 +474,13 @@ export default function CaseDetail({
                   }
                 >
                   <p className="text-sm dim" style={{ marginTop: 0 }}>
-                    Computed deterministically from role, risk level and the
-                    evidence found — with no model involvement. The AI may only
-                    select and sequence from this list.
+                    {t("case.ai.permittedNote")}
                   </p>
                   <ul className="bullets">
                     {allowed.data.allowed_actions.map((a) => (
                       <li key={a.action_id}>
-                        <b>{a.label}</b>{" "}
-                        <span className="dim">
-                          — {STAGE_META[a.stage]?.label}
-                        </span>
+                        <b>{actionText(i18n, a.action_id, "label", a.label)}</b>{" "}
+                        <span className="dim">— {stageLabel(i18n, a.stage)}</span>
                       </li>
                     ))}
                   </ul>
@@ -489,16 +489,12 @@ export default function CaseDetail({
 
               {synth.data.rejected_actions.length > 0 && (
                 <Banner tone="warn">
-                  {synth.data.rejected_actions.length} suggested action(s) fell
-                  outside this authority's permissions and were removed by the
-                  constraint engine.
+                  {t("case.ai.rejected", { count: synth.data.rejected_actions.length })}
                 </Banner>
               )}
               {synth.data.unverified_numbers.length > 0 && (
                 <Banner tone="warn">
-                  Figures that could not be matched to the underlying evidence:{" "}
-                  <b>{synth.data.unverified_numbers.join(", ")}</b>. Treat these
-                  as unverified.
+                  {t("case.ai.unverified", { figures: synth.data.unverified_numbers.join(", ") })}
                 </Banner>
               )}
 
@@ -538,77 +534,106 @@ export default function CaseDetail({
         <Card tight>
           {c.entity_type !== "work" ? (
             <Banner tone="neutral">
-              This case is a <b>{c.entity_type}-level</b> finding rather than a
-              single work record.
+              {t("case.record.notWork", { level: t(entityLevel) })}
             </Banner>
           ) : work.isLoading ? (
             <Skeleton h={160} />
           ) : work.isError || !work.data ? (
-            <Empty title="Work record unavailable" />
+            <Empty title={t("case.record.unavailable")} />
           ) : (
             <div className="stack gap-4">
               <div>
-                <div className="field-label">Full description</div>
+                <div className="field-label">{t("case.record.description")}</div>
                 <p style={{ margin: 0 }}>{work.data.description ?? "—"}</p>
               </div>
               <div className="record-grid">
-                <Field label="Work code" value={work.data.work_id} mono />
-                <Field label="Work type" value={work.data.category} />
+                <Field label={t("record.workCode")} value={work.data.work_id} mono />
+                <Field label={t("record.workType")} value={work.data.category} />
                 <Field
-                  label="Location"
-                  value={[work.data.district, work.data.state]
-                    .filter(Boolean)
-                    .join(", ")}
+                  label={t("record.portalCategory")}
+                  value={work.data.work_category ?? t("record.notRecorded")}
                 />
-                <Field label="Constituency" value={work.data.constituency} />
-                <Field label="MP" value={titleCase(work.data.mp_name)} />
                 <Field
-                  label="Implementing agency"
+                  label={t("record.location")}
+                  value={[work.data.district, work.data.state].filter(Boolean).join(", ")}
+                />
+                <Field label={t("record.constituency")} value={work.data.constituency} />
+                <Field label={t("record.mp")} value={titleCase(work.data.mp_name)} />
+                <Field
+                  label={t("record.districtAuthority")}
                   value={titleCase(work.data.ia_name)}
                 />
                 <Field
-                  label="Vendor paid"
+                  label={t("record.implementingAgency")}
+                  value={
+                    work.data.implementing_agency
+                      ? work.data.implementing_agency
+                      : t("record.noPayment")
+                  }
+                />
+                <Field
+                  label={t("record.vendor")}
                   value={
                     work.data.vendor_name
-                      ? titleCase(work.data.vendor_name)
-                      : "No payment recorded"
+                      ? titleCase(work.data.vendor_name) +
+                        (work.data.vendor_id
+                          ? ` · ${t("record.vendorId", { id: work.data.vendor_id })}`
+                          : "")
+                      : t("record.noPayment")
                   }
                 />
-                <Field label="Workflow stage" value={work.data.status} />
                 <Field
-                  label="Sanctioned"
+                  label={t("record.letter")}
+                  value={work.data.letter_no ?? t("record.notRecorded")}
+                  mono
+                />
+                <Field
+                  label={t("record.term")}
+                  value={
+                    work.data.term_start && work.data.term_end
+                      ? t("record.termRange", {
+                          start: fmt.date(work.data.term_start),
+                          end: fmt.date(work.data.term_end),
+                        })
+                      : t("record.notRecorded")
+                  }
+                />
+                <Field label={t("record.stage")} value={work.data.status} />
+                <Field
+                  label={t("record.sanctioned")}
                   value={
                     work.data.sanctioned_amount
-                      ? rupees(work.data.sanctioned_amount)
-                      : "Not yet sanctioned"
+                      ? fmt.rupees(work.data.sanctioned_amount)
+                      : t("record.notSanctioned")
                   }
                 />
                 <Field
-                  label="Recommended cost"
-                  value={rupees(work.data.estimated_cost)}
+                  label={t("record.recommendedCost")}
+                  value={fmt.rupees(work.data.estimated_cost)}
                 />
                 <Field
-                  label="Paid to date"
+                  label={t("record.paid")}
                   value={
                     work.data.total_paid
-                      ? rupees(work.data.total_paid)
-                      : "None recorded"
+                      ? fmt.rupees(work.data.total_paid)
+                      : t("record.noneRecorded")
                   }
                 />
                 <Field
-                  label="Sanctioned on"
-                  value={formatDate(work.data.sanction_date)}
+                  label={t("record.sanctionedOn")}
+                  value={fmt.date(work.data.sanction_date)}
                 />
                 <Field
-                  label="Completed on"
+                  label={t("record.completedOn")}
                   value={
                     work.data.completion_date
-                      ? formatDate(work.data.completion_date)
-                      : "Not recorded"
+                      ? fmt.date(work.data.completion_date)
+                      : t("record.notRecorded")
                   }
                 />
-                <Field label="Data era" value={work.data.era} mono />
+                <Field label={t("record.era")} value={work.data.era} mono />
               </div>
+              <PaymentTimeline workId={work.data.work_id} />
             </div>
           )}
         </Card>
@@ -620,15 +645,13 @@ export default function CaseDetail({
           {dupFindings.length === 0 ? (
             <Empty
               icon={<Copy size={20} />}
-              title="No duplicate-risk evidence"
-              hint="The entity-resolution agent did not find a matching record for this case."
+              title={t("case.dup.empty")}
+              hint={t("case.dup.emptyHint")}
             />
           ) : (
             <div className="stack gap-4">
               <p className="text-sm muted" style={{ margin: 0 }}>
-                Approval checks review one work at a time, so the same work
-                entered twice is not caught by the normal workflow. These are
-                candidates for verification, not confirmed duplicates.
+                {t("case.dup.intro")}
               </p>
               {dupFindings.map((f, i) => {
                 const d = f.details as Record<string, unknown>;
@@ -636,30 +659,33 @@ export default function CaseDetail({
                   return (
                     <div key={i} className="dup-card">
                       <div className="semibold">
-                        {String(d.cluster_size)} works share one low-detail
-                        description in {String(d.district)}
+                        {t("case.dup.cluster", {
+                          count: String(d.cluster_size),
+                          district: String(d.district),
+                        })}
                       </div>
                       <code className="json">
                         {String(d.normalised_description ?? "")}
                       </code>
                       <div className="text-sm muted">
-                        Total {rupees(Number(d.total_cost))}
+                        {t("case.dup.total", { amount: fmt.rupees(Number(d.total_cost)) })}
                       </div>
                     </div>
                   );
                 }
+                const strength = String(d.evidence_strength ?? "");
                 return (
                   <div key={i} className="dup-card">
                     <div className="dup-compare">
                       <div>
-                        <div className="field-label">This work</div>
+                        <div className="field-label">{t("case.dup.this")}</div>
                         <code className="mono text-xs">{c.entity_id}</code>
                         <p className="dup-text">
                           {String(d.this_description ?? "—")}
                         </p>
                       </div>
                       <div>
-                        <div className="field-label">Matched work</div>
+                        <div className="field-label">{t("case.dup.matched")}</div>
                         <code className="mono text-xs">
                           {String(d.pair_work_id ?? "—")}
                         </code>
@@ -670,26 +696,24 @@ export default function CaseDetail({
                     </div>
                     <div className="dup-stats">
                       <Stat
-                        label="Description match"
+                        label={t("case.dup.match")}
                         value={`${Math.round(Number(d.semantic_sim ?? 0) * 100)}%`}
                       />
                       <Stat
-                        label="Same amount"
-                        value={d.same_sanction_amount ? "Yes" : "No"}
+                        label={t("case.dup.sameAmount")}
+                        value={d.same_sanction_amount ? t("case.dup.yes") : t("case.dup.no")}
                       />
                       <Stat
-                        label="Evidence"
-                        value={titleCase(String(d.evidence_strength ?? "—"))}
+                        label={t("case.dup.evidence")}
+                        value={strength ? tOr(`strength.${strength}`, titleCase(strength)) : "—"}
                       />
                     </div>
                     <div className="text-sm muted">
-                      <b>Pattern:</b> {String(d.duplication_mode ?? "—")}
+                      <b>{t("case.dup.pattern")}</b>{" "}
+                      {d.duplication_mode ? dupMode(i18n, String(d.duplication_mode)) : "—"}
                     </div>
                     {d.geo_km === null && (
-                      <div className="text-xs dim">
-                        Proximity is assessed at district level — this eSAKSHI
-                        export carries no asset coordinates.
-                      </div>
+                      <div className="text-xs dim">{t("case.dup.proximity")}</div>
                     )}
                   </div>
                 );
@@ -700,7 +724,7 @@ export default function CaseDetail({
       )}
 
       {netFindings.length > 0 && tab === "record" && (
-        <Card title="Agency network signal" tight>
+        <Card title={t("case.network.title")} tight>
           {netFindings.map((f, i) => (
             <p key={i} className="text-sm" style={{ margin: 0 }}>
               <Building2 size={13} /> {f.summary}
@@ -711,8 +735,98 @@ export default function CaseDetail({
 
       <div className="review-notice">
         <AlertTriangle size={13} />
-        {c.disclaimer}
+        {lang === "en" ? c.disclaimer : t("case.disclaimer")}
       </div>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------ payments */
+function PaymentTimeline({ workId }: { workId: string }) {
+  const { t, tn, fmt } = useI18n();
+  const payments = useQuery({
+    queryKey: ["payments", workId],
+    queryFn: () => api.payments(workId),
+    retry: false,
+  });
+  if (payments.isLoading) return <Skeleton h={120} />;
+  if (payments.isError || !payments.data) return null;
+  const { summary, payments: rows } = payments.data;
+  return (
+    <div className="stack gap-2">
+      <div className="field-label">{t("pay.title")}</div>
+      {rows.length === 0 ? (
+        <p className="text-sm dim" style={{ margin: 0 }}>
+          {t("pay.none")}
+        </p>
+      ) : (
+        <>
+          <p className="text-sm muted" style={{ margin: 0 }}>
+            {tn("pay.summary", summary.count, {
+              total: fmt.rupees(summary.total),
+              vendors: summary.vendors,
+              first: fmt.date(summary.first_paid_on),
+              last: fmt.date(summary.last_paid_on),
+            })}
+            {summary.share_of_sanctioned !== null &&
+              " " +
+                t("pay.share", {
+                  share: Math.round(summary.share_of_sanctioned * 100),
+                  sanctioned: fmt.rupees(summary.sanctioned_amount),
+                })}
+          </p>
+          <div className="table-scroll" style={{ maxHeight: 320 }}>
+            <table className="table">
+              <thead>
+                <tr>
+                  <th style={{ width: 110 }}>{t("pay.col.date")}</th>
+                  <th style={{ width: 110 }}>{t("pay.col.amount")}</th>
+                  <th>{t("pay.col.vendor")}</th>
+                  <th style={{ width: 110 }}>{t("pay.col.status")}</th>
+                  <th>{t("pay.col.notes")}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((p) => (
+                  <tr key={p.seq}>
+                    <td className="text-xs">{fmt.date(p.paid_on)}</td>
+                    <td className="text-xs num">{fmt.rupees(p.amount)}</td>
+                    <td className="text-xs">
+                      {titleCase(p.vendor_name)}
+                      {p.vendor_id && <span className="dim"> · {p.vendor_id}</span>}
+                    </td>
+                    <td className="text-xs muted">
+                      {p.status === "Payment In-Progress"
+                        ? t("pay.status.inProgress")
+                        : p.status === "Payment Success"
+                          ? t("pay.status.success")
+                          : (p.status ?? "—")}
+                    </td>
+                    <td>
+                      <span className="row gap-1" style={{ flexWrap: "wrap" }}>
+                        {p.before_sanction && (
+                          <Chip color="var(--risk-high)">{t("pay.mark.beforeSanction")}</Chip>
+                        )}
+                        {p.days_after_completion !== null && (
+                          <Chip color="var(--risk-medium)">
+                            {tn("pay.mark.afterCompletion", p.days_after_completion)}
+                          </Chip>
+                        )}
+                        {p.repeats > 1 && (
+                          <Chip color="var(--risk-medium)">
+                            {tn("pay.mark.repeated", p.repeats)}
+                          </Chip>
+                        )}
+                        {p.year_end_week && <Chip>{t("pay.mark.yearEnd")}</Chip>}
+                      </span>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </>
+      )}
     </div>
   );
 }
@@ -752,32 +866,27 @@ function ReviewPanel({
   pending,
   error,
 }: {
-  status: keyof typeof STATUS_META;
+  status: ReviewStatus;
   note: string;
   setNote: (v: string) => void;
   onAction: (a: "confirmed" | "false_positive" | "under_review") => void;
   pending: boolean;
   error: unknown;
 }) {
-  const flow: (keyof typeof STATUS_META)[] = [
-    "pending",
-    "under_review",
-    "confirmed",
-    "false_positive",
-  ];
+  const { t } = useI18n();
   return (
-    <Card title="Human review decision" tight>
+    <Card title={t("review.title")} tight>
       <div className="flow">
-        {flow.map((s, i) => (
+        {REVIEW_FLOW.map((s, i) => (
           <span key={s} className={`flow-step${s === status ? " on" : ""}`}>
-            {STATUS_META[s].label}
-            {i < flow.length - 1 && <span className="flow-arrow">→</span>}
+            {t(`status.${s}.label`)}
+            {i < REVIEW_FLOW.length - 1 && <span className="flow-arrow">→</span>}
           </span>
         ))}
       </div>
       <input
         className="input"
-        placeholder="Reviewer note (optional) — record what you verified…"
+        placeholder={t("review.note")}
         value={note}
         onChange={(e) => setNote(e.target.value)}
         style={{ marginBottom: 10 }}
@@ -788,52 +897,32 @@ function ReviewPanel({
           disabled={pending}
           onClick={() => onAction("under_review")}
         >
-          <Eye size={13} /> Mark under review
+          <Eye size={13} /> {t("review.markUnderReview")}
         </button>
         <button
           className="btn btn-sm btn-danger"
           disabled={pending}
           onClick={() => onAction("confirmed")}
         >
-          <ArrowUpCircle size={13} /> Escalate
+          <ArrowUpCircle size={13} /> {t("review.escalate")}
         </button>
         <button
           className="btn btn-sm btn-success"
           disabled={pending}
           onClick={() => onAction("false_positive")}
         >
-          <CheckCircle2 size={13} /> Close as false positive
+          <CheckCircle2 size={13} /> {t("review.closeFalsePositive")}
         </button>
         {pending && <Spinner size={14} />}
       </div>
       {error ? (
         <div className="text-sm" style={{ color: "var(--danger)", marginTop: 8 }}>
-          Could not record the decision. {(error as Error).message}
+          {t("review.error", { message: (error as Error).message })}
         </div>
       ) : null}
       <p className="text-xs dim" style={{ margin: "10px 0 0" }}>
-        The authority decides the outcome — ASTRA only prioritises what to look
-        at. False-positive decisions feed threshold recalibration.
+        {t("review.footer")}
       </p>
     </Card>
   );
-}
-
-function fallbackMessage(reason: string | null): string {
-  switch (reason) {
-    case "no_api_key":
-      return "No AI provider key is configured, so the deterministic layer produced this.";
-    case "llm_disabled":
-      return "AI synthesis is switched off.";
-    case "timeout":
-      return "The AI service did not respond in time.";
-    case "rate_limited":
-      return "The AI service rate limit was reached.";
-    case "unauthorized":
-      return "The AI service rejected the configured key.";
-    case "language_guardrail":
-      return "The AI response failed a safety check and was discarded.";
-    default:
-      return "The AI service was unavailable.";
-  }
 }
