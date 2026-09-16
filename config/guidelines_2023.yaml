@@ -1,0 +1,137 @@
+# MPLADS Guidelines, 1 April 2023 (second edition, 14 March 2023)
+#
+# The provisions ASTRA's rules rely on, by paragraph number. Summaries are
+# paraphrased, not quoted; read the official text for exact wording:
+#   https://www.mplads.gov.in/MPLADS/UploadedFiles/MPLADSGuidelinesApril2023.pdf
+# Checked against that document on 13 Sep 2026. These guidelines supersede all
+# earlier ones (para 1.1), including the June 2016 edition that some mirrors
+# still serve under a 2023 file name.
+#
+# Every rule in rules.yaml names the paragraph it rests on (`para`) and says
+# whether it enforces a guideline, screens for one it cannot check directly,
+# or is ASTRA's own risk heuristic (`basis`). A heuristic never claims to be a
+# scheme rule.
+
+source:
+  title: "Members of Parliament Local Area Development Scheme: Guidelines"
+  issued_by: "Ministry of Statistics and Programme Implementation, Government of India"
+  effective: "2023-04-01"
+  edition: "Second edition, 14 March 2023"
+  url: "https://www.mplads.gov.in/MPLADS/UploadedFiles/MPLADSGuidelinesApril2023.pdf"
+  checked_on: "2026-09-13"
+
+paras:
+  "2.7":
+    topic: entitlement
+    summary: "Each MP's allocation is Rs 5 crore a year from 2011-12."
+    amounts: {annual_entitlement: 50000000}
+  "3.1.2.1":
+    topic: works outside the usual region
+    summary: "Works an elected MP recommends outside their usual region are capped at Rs 25 lakh a year, except for calamities."
+    amounts: {yearly_cap: 2500000}
+  "3.2.3":
+    topic: estimate above the MP's amount
+    summary: "If the estimate exceeds the amount the MP indicated, the work is sanctioned only after the MP consents to and allocates the full estimated cost."
+  "3.2.4":
+    topic: time to sanction
+    summary: "The Implementing District Authority issues sanction or rejection within 45 days of receiving a recommendation."
+    days: 45
+  "3.2.5":
+    topic: sanctions within entitlement
+    summary: "The total estimated cost of an MP's sanctioned works in a year should not exceed the entitlement up to that year, including interest and redistribution."
+  "3.2.6":
+    topic: model code of conduct
+    summary: "The period of a model code of conduct in force for the district is excluded when reckoning these time limits."
+  "3.2.9":
+    topic: minimum work value
+    summary: "A single work should normally be sanctioned for at least Rs 2.5 lakh; a smaller amount is allowed if the district authority records its reasons in the sanction letter."
+    amounts: {normal_minimum: 250000}
+  "3.2.10":
+    topic: implementing agency
+    summary: "The Implementing District Authority selects the agency that executes each work, following the state government's rules."
+  "3.2.12":
+    topic: completion time
+    summary: "The sanction letter sets a completion time that should generally not exceed one year; longer periods need justification recorded in the sanction letter, for example for difficult or hilly terrain."
+    days: 365
+  "3.2.13":
+    topic: estimation and vendor selection
+    summary: "Implementing agencies estimate works on the schedule of rates and select vendors through open, transparent bidding."
+  "3.2.15":
+    topic: no change after sanction
+    summary: "An MP may change or cancel a work or its site before sanction; once the work is sanctioned, no change is allowed."
+  "3.2.19":
+    topic: stoppage or abandonment
+    summary: "Stopping or abandoning a work in progress is referred to the State Nodal Authority with justification."
+  "4.4.2":
+    topic: third-party inspection
+    summary: "Each year all works of Rs 25 lakh or more, half of the works between Rs 15 and 25 lakh, and a sample of the rest are inspected by a third party."
+    amounts: {all_inspected_from: 2500000, half_inspected_from: 1500000}
+  "5.1.9":
+    topic: repair and renovation
+    summary: "Repair and renovation of immovable assets is permitted, up to Rs 50 lakh a year per MP for all such works together, after a reasonable gap since construction or the last repair."
+    amounts: {yearly_cap: 5000000}
+  "5.2.1": {topic: not permissible, summary: "Operation and maintenance of any kind."}
+  "5.2.2": {topic: not permissible, summary: "Residential buildings, for government, public sector or otherwise."}
+  "5.2.3": {topic: not permissible, summary: "Works involving commercial or private establishments."}
+  "5.2.4": {topic: not permissible, summary: "Naming an asset after any person, living or dead."}
+  "5.2.5": {topic: not permissible, summary: "Grants and loans."}
+  "5.2.6": {topic: not permissible, summary: "Contributions to central or state relief funds."}
+  "5.2.7": {topic: not permissible, summary: "Land acquisition or compensation for land."}
+  "5.2.8": {topic: not permissible, summary: "Reimbursement for completed or partly completed works or purchases, or completing abandoned projects."}
+  "5.2.9": {topic: not permissible, summary: "Assets for individual or family benefit, except aids for persons with disabilities under 5.1.6."}
+  "5.2.10": {topic: not permissible, summary: "Pooling MPLADS funds with CSR funds."}
+  "5.2.11": {topic: not permissible, summary: "Works of a religious nature, within places of worship, or on land owned by a religious group."}
+  "5.2.12": {topic: not permissible, summary: "Swagat dwars or welcome gates."}
+  "5.2.13": {topic: not permissible, summary: "Works in unauthorised colonies."}
+  "5.2.14": {topic: not permissible, summary: "Recurring expenditure of any kind."}
+  "5.4.1":
+    topic: SC/ST areas
+    summary: "Each year an MP recommends works worth at least 15% of the year's entitlement for areas inhabited by Scheduled Castes and at least 7.5% for areas inhabited by Scheduled Tribes."
+    percent: {sc: 15.0, st: 7.5}
+  "5.4.2":
+    topic: SC/ST substitution
+    summary: "Where a Lok Sabha constituency has too few Scheduled Tribe residents, that share may go to Scheduled Caste areas, and vice versa."
+  "6.2.6.2":
+    topic: societies and trusts
+    summary: "An MP may recommend up to Rs 50 lakh a year to all registered societies and trusts together, and at most Rs 1 crore to any one society or trust in a term."
+    amounts: {yearly_cap: 5000000, per_body_term_cap: 10000000}
+  "6.3.4":
+    topic: cooperative societies
+    summary: "The Rs 50 lakh a year ceiling for societies and trusts applies equally to cooperative societies."
+  "8.1":
+    topic: calamity of severe nature (national)
+    summary: "Any MP may consent up to Rs 1 crore a year for rehabilitation in areas hit by a calamity of severe nature declared by the Government of India."
+    amounts: {yearly_cap: 10000000}
+  "8.2":
+    topic: calamity of severe nature (state)
+    summary: "For a severe calamity declared only by a state, that state's MPs may consent up to Rs 25 lakh a year."
+    amounts: {yearly_cap: 2500000}
+  "8.12.1":
+    topic: calamity works completion
+    summary: "Rehabilitation works are completed within 18 months of approval."
+    days: 548
+  "10.1":
+    topic: fund flow
+    summary: "Funds stay in the Central Nodal Account and are credited directly to vendors when payment demands are raised; there are no separate releases."
+  "10.2.3":
+    topic: non-lapsable
+    summary: "Funds in the Central Nodal Account are not surrendered at year end and remain available in later years."
+  "10.4.3":
+    topic: part-year allocation
+    summary: "An MP's allocation for a year depends on months served: nil under 3 months, half for 3 to 9 months, full above 9 months."
+  "10.4.4":
+    topic: carry-forward
+    summary: "An MP's unspent allocation is carried forward to the next year."
+  "10.6.1":
+    topic: former MPs
+    summary: "Sanctioned works of a former MP are completed within 18 months of the MP leaving office, and the account is closed within 21 months."
+    days: 548
+  "10.7.1":
+    topic: payments
+    summary: "All payments go directly to vendors from the Central Nodal Account in real time, once authorised by the implementing agency."
+  "11.2":
+    topic: accounts on completion
+    summary: "On completion of a work the implementing agency or authority quickly finalises its accounts and furnishes a utilisation certificate."
+  "11.4.1":
+    topic: utilisation certificates
+    summary: "Implementing authorities furnish a utilisation certificate whenever a payment is made to a vendor."

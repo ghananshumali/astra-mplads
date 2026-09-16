@@ -97,11 +97,11 @@ def file_is_free(path: Path) -> bool:
 # ----------------------------------------------------------------------- build
 def build() -> dict:
     from astra import db
-    from astra.ingestion import live, offline
+    from astra.ingestion import live
     from astra.ingestion.esakshi_api import EsakshiClient, SourceError
     from astra.ingestion.poller import Poller
     from astra.ingestion.router import _conform
-    from astra.pipeline import run_pipeline
+    from astra.pipeline import live_fundflows, run_pipeline
     from astra.schemas import FundFlow
 
     import pandas as pd
@@ -160,16 +160,10 @@ def build() -> dict:
         f"({dict(works['house'].value_counts())})")
 
     # --------------------------------------------------------- 3. fund flows
-    flows = offline.build_fundflows(works)
-    if not flows.empty:
-        houses = (works.assign(_c=works["constituency"].fillna(""))
-                  .drop_duplicates(["state", "_c", "mp_name"])
-                  .set_index(["state", "_c", "mp_name"])["house"])
-        flows["house"] = [houses.get((s, c or "", m))
-                          for s, c, m in zip(flows["state"],
-                                             flows["constituency"].fillna(""),
-                                             flows["mp_name"])]
-        flows["source"] = "esakshi_api"
+    # The same derivation the analysis repeats before every later run.
+    flows = live_fundflows(works)
+    if flows is None:
+        flows = pd.DataFrame()
     history, _prov = live.fetch_ckan_fundflows()
     parts = [f for f in (_conform(flows, FundFlow), _conform(history, FundFlow))
              if not f.empty]

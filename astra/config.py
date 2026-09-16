@@ -36,6 +36,25 @@ def load_rules() -> dict:
         return yaml.safe_load(fh)
 
 
+GUIDELINES_PATH = PROJECT_ROOT / "config" / "guidelines_2023.yaml"
+
+
+@functools.lru_cache(maxsize=1)
+def load_guidelines() -> dict:
+    """The index of MPLADS Guidelines 2023 paragraphs the rules cite."""
+    with open(GUIDELINES_PATH, "r", encoding="utf-8") as fh:
+        return yaml.safe_load(fh)
+
+
+def cite(para: str | None, lead: str = "MPLADS Guidelines 2023") -> str | None:
+    """"MPLADS Guidelines 2023, para 5.2.11: works of a religious nature..." """
+    if not para:
+        return None
+    entry = (load_guidelines().get("paras") or {}).get(str(para)) or {}
+    summary = entry.get("summary")
+    return f"{lead}, para {para}: {summary}" if summary else f"{lead}, para {para}"
+
+
 def era_of(date_str: str | None) -> str:
     """Tag a record with its data regime relative to the eSAKSHI cutover.
 

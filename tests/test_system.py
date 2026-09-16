@@ -170,7 +170,7 @@ def test_orchestrator(works: pd.DataFrame, flows: pd.DataFrame) -> None:
     took = time.time() - t
 
     check("flags produced", len(flags) > 0, f"{len(flags):,} flags in {took:.0f}s")
-    check("router trace recorded", len(orch.route_trace) == 4,
+    check("router trace recorded", len(orch.route_trace) == len(orch.agents),
           ", ".join(f"{t['agent']}={t.get('findings', 'skipped')}"
                     for t in orch.route_trace))
     check("rule coverage includes zero-match rules",
@@ -302,8 +302,9 @@ def test_explanations() -> None:
     check("signals report a measurement and a benchmark",
           all(s["metric"] and s["benchmark"] for s in sig),
           f"{len(sig)} signals checked")
-    check("signal risk contributions are positive",
-          all(s["contribution"] > 0 for s in sig))
+    check("signal risk contributions are positive, except context shown outside the score",
+          all(s["contribution"] > 0 or s.get("context") for s in sig)
+          and all(s["contribution"] == 0 for s in sig if s.get("context")))
     check("humanize() is total over every emitted rule",
           all(humanize(fd)["headline"] for f in flags for fd in f["findings"]))
 
