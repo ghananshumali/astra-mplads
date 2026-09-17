@@ -68,9 +68,22 @@ and 63 from a plain pair. So every text match is read against the record:
      are one work or two. Ids, dates, letter numbers, stages, vendors and small
      amount differences never clear a pair: they differ between two copies of
      one work as easily as between two works.
+  4. **Photos** (`astra.ingestion.photos` fingerprints the portal's photos of
+     held works; the analysis context carries them as `photos`): one image file,
+     byte for byte, recorded for two works raises them at
+     `photo_match_severity`, and for three or more works of a batch at
+     `photo_shared_severity`. Photos that only look alike (fingerprints within
+     `photo_max_bits`, different files) stay held and say so, for a person to
+     compare: many uploads are phone photos of a printed site photo under the
+     same camera stamp, and two different sites photographed that way came
+     within one bit on one fingerprint in the first real sample. Different
+     photos leave a pair held too: a second photo can always be taken. Every
+     run records the pairs and batches it held (`last_groups`, stored as
+     `duplicate_groups`) for the next check.
 """
 from __future__ import annotations
 
+import hashlib
 import math
 import re
 from collections import Counter, defaultdict
@@ -79,6 +92,7 @@ import numpy as np
 import pandas as pd
 
 from ..config import load_rules
+from ..photo_hash import bits_apart, same_photo
 from ..schemas import Finding
 from .base import BaseAgent
 
@@ -218,16 +232,62 @@ def _text(row, col):
     return None if value is None or (not isinstance(value, str) and pd.isna(value)) else value
 
 
+def _group(kind: str, work_ids: list[str]) -> dict:
+    ids = sorted(dict.fromkeys(work_ids))
+    digest = hashlib.sha1("|".join(ids).encode()).hexdigest()[:12]
+    return {"group_id": f"{kind}:{digest}", "kind": kind, "work_ids": ids}
+
+
+def _photo_verdict(a_id: str, b_id: str, photos: dict, cfg: dict) -> dict:
+    """What the photo checks of two works say about them.
+
+    `same_file` when a photo of one is byte for byte a photo of the other (one
+    upload recorded twice); `look_alike` when a photo of each is within
+    `photo_max_bits` on both fingerprints but no file is shared, which only a
+    person can settle; `different_photos` when both have photos and none
+    match; otherwise why there is nothing to compare: `not_run`,
+    `not_completed`, `no_photo` (including works with only documents),
+    `failed`. Documents are never compared: one order or certificate
+    legitimately covers several works.
+    """
+    pa, pb = photos.get(a_id), photos.get(b_id)
+    if not pa or not pb:
+        return {"result": "not_run"}
+    candidates = [(p, q) for p in pa.get("photos", []) for q in pb.get("photos", [])]
+    for p, q in candidates:
+        if p.get("sha256") and p["sha256"] == q.get("sha256"):
+            return {"result": "same_file", "files": {a_id: p["file_name"], b_id: q["file_name"]}}
+    for p, q in candidates:
+        if same_photo(p, q, cfg["photo_max_bits"]):
+            return {"result": "look_alike", "files": {a_id: p["file_name"], b_id: q["file_name"]},
+                    "bits": max(bits_apart(p["dhash"], q["dhash"]), bits_apart(p["vhash"], q["vhash"]))}
+    if pa.get("photos") and pb.get("photos"):
+        return {"result": "different_photos"}
+    for status in ("failed", "not_completed"):
+        if status in (pa["status"], pb["status"]):
+            return {"result": status}
+    return {"result": "no_photo"}
+
+
+#: Photo-check results that raise a pair: only one file shared. Photos that
+#: look alike stay held, because different sites photographed the same way
+#: fingerprint alike.
+SHARED_EVIDENCE = ("same_file",)
+
+
 class EntityResolutionAgent(BaseAgent):
     name = "entity_resolution"
     needs_works = {"work_id", "description"}
     needs_flows = set()
 
     def __init__(self) -> None:
-        #: The analysis context; its `payments` name who was paid for each work.
+        #: The analysis context; its `payments` name who was paid for each work,
+        #: and its `photos` the fingerprints a photo check recorded.
         self.context: dict = {}
         #: How the last run's text matches were decided (recorded in the run's trace).
         self.last_stats: dict = {}
+        #: The pairs and batches the last run held.
+        self.last_groups: list[dict] = []
 
     def run(self, works: pd.DataFrame, flows: pd.DataFrame) -> list[Finding]:
         cfg = load_rules()["duplicates"]
@@ -380,23 +440,38 @@ class EntityResolutionAgent(BaseAgent):
                 continue
             held.append(c)
 
+        # Photo fingerprints a photo check recorded for held works, if any.
+        photos = self.context.get("photos") or {}
+        groups: list[dict] = []
         members_of: dict[tuple, list] = defaultdict(list)
         for label, key in zip(df.index, keys):
             if key in batched:
                 members_of[key].append(label)
         for key, pairs in batched.items():
-            out += self._batch_findings(df.loc[members_of[key]], pairs, payees, vendors, cfg,
-                                        fuzz, stats, held)
+            rows = df.loc[members_of[key]]
+            groups.append(_group("batch", rows["work_id"].astype(str).tolist()))
+            out += self._batch_findings(rows, pairs, payees, vendors, cfg, fuzz, stats, held,
+                                        photos)
 
         matches: Counter = Counter()
         for c in held:
             matches[str(c["ra"]["work_id"])] += 1
             matches[str(c["rb"]["work_id"])] += 1
         for c in held:
+            groups.append(_group("pair", [str(c["ra"]["work_id"]), str(c["rb"]["work_id"])]))
+            verdict = _photo_verdict(str(c["ra"]["work_id"]), str(c["rb"]["work_id"]), photos, cfg)
+            stats[f"held_pairs_photo_{verdict['result']}"] += 1
+            if verdict["result"] in SHARED_EVIDENCE:
+                stats[f"pairs_raised_{verdict['result']}"] += 1
+                out += self._photo_match_findings(c, verdict, per_work, matches, vendors, cfg,
+                                                  cfg["photo_match_severity"])
+                continue
             stats["held_pairs"] += 1
-            out += self._held_findings(c, per_work, matches, vendors, cfg)
+            out += self._held_findings(c, per_work, matches, vendors, cfg, verdict)
 
         out += self._generic_clusters(df, boilerplate, cfg)
+        #: The held groups, for the photo check to look at (`duplicate_groups`).
+        self.last_groups = groups
         self.last_stats = dict(sorted(stats.items()))
         return out
 
@@ -487,18 +562,58 @@ class EntityResolutionAgent(BaseAgent):
         return out
 
     @staticmethod
+    def _pair_details(c: dict, this, other, matches: Counter, payees: dict) -> dict:
+        """What a finding about two matched works records about both."""
+        wid, oid = str(this["work_id"]), str(other["work_id"])
+        this_cost, other_cost = _amount(this), _amount(other)
+        return {
+            "pair_work_id": oid,
+            "semantic_sim": round(min(c["score"], 1.0), 3),
+            "fuzzy_score": c["fz"],
+            "geo_km": round(c["geo_km"], 2) if c["geo_km"] is not None else None,
+            "duplication_mode": EntityResolutionAgent._mode(c),
+            "shared_identifiers": sorted(c["shared"])[:8],
+            "same_sanction_amount": bool(this_cost is not None and this_cost == other_cost),
+            "this_cost": this_cost,
+            "other_cost": other_cost,
+            "this_description": str(this["description"])[:180],
+            "other_description": str(other["description"])[:180],
+            "other_mp": other.get("mp_name"),
+            "this_payees": payees.get(wid, [])[:4],
+            "other_payees": payees.get(oid, [])[:4],
+            "this_status": _text(this, "status"),
+            "other_status": _text(other, "status"),
+            "this_letter": _text(this, "letter_no"),
+            "other_letter": _text(other, "letter_no"),
+            "total_matches": int(matches.get(wid, 0)),
+            "in_batch": bool(c.get("in_batch")),
+            "shared_payee": c.get("shared_payee"),
+        }
+
+    @staticmethod
     def _held_findings(c: dict, per_work: dict, matches: Counter, payees: dict,
-                       cfg: dict) -> list[Finding]:
+                       cfg: dict, verdict: dict | None = None) -> list[Finding]:
         out = []
-        mode = EntityResolutionAgent._mode(c)
         shared = c["shared"]
+        verdict = verdict or {"result": "not_run"}
+        photo_check = verdict["result"]
+        photo_note = {
+            "look_alike": " Their photos on the portal look alike but are not the same file: "
+                          "compare them by eye, since different sites photographed the same "
+                          "way can look alike.",
+            "different_photos": " Their photos on the portal are different pictures, which "
+                                "suggests two sites without proving it.",
+            "no_photo": " The portal has no photo for at least one of them yet.",
+            "not_completed": " At least one of them is not completed, so it has no photo yet.",
+            "failed": " The portal did not return their photos at the last check.",
+        }.get(photo_check, "")
         for this, other in ((c["ra"], c["rb"]), (c["rb"], c["ra"])):
-            wid, oid = str(this["work_id"]), str(other["work_id"])
+            wid = str(this["work_id"])
             if per_work.get(wid, 0) >= cfg["max_findings_per_work"]:
                 continue
             per_work[wid] = per_work.get(wid, 0) + 1
-            this_cost, other_cost = _amount(this), _amount(other)
-            same_cost = this_cost is not None and this_cost == other_cost
+            details = EntityResolutionAgent._pair_details(c, this, other, matches, payees)
+            this_cost = details["this_cost"]
             out.append(Finding(
                 agent="entity_resolution",
                 rule_id=cfg["id"],
@@ -507,50 +622,76 @@ class EntityResolutionAgent(BaseAgent):
                 entity_type="work",
                 entity_id=wid,
                 summary=(
-                    f"Matches work {oid} in {this.get('district') or this.get('state')}: "
+                    f"Matches work {details['pair_work_id']} in "
+                    f"{this.get('district') or this.get('state')}: "
                     f"descriptions {min(c['score'], 1.0):.0%} alike, sharing "
                     f"{len(shared)} specific identifiers ({', '.join(sorted(shared)[:4])})"
-                    + (f", both sanctioned at Rs {this_cost:,.0f}" if same_cost else "")
+                    + (f", both sanctioned at Rs {this_cost:,.0f}"
+                       if details["same_sanction_amount"] else "")
                     + (f", both paid to {c['shared_payee']}" if c.get("shared_payee") else "")
                     + ". No recorded detail separates them (numbers or place names in the "
                     "descriptions, amount, panchayat or municipality paid), so the pair is "
                     "held outside the risk score until evidence such as the works' photos "
-                    f"shows whether they are one work or two; likely mode: {mode}"
+                    f"shows whether they are one work or two; likely mode: "
+                    f"{details['duplication_mode']}.{photo_note}"
                 ),
-                details={
-                    "pair_work_id": oid,
-                    "held": True,
-                    "semantic_sim": round(min(c["score"], 1.0), 3),
-                    "fuzzy_score": c["fz"],
-                    "geo_km": round(c["geo_km"], 2) if c["geo_km"] is not None else None,
-                    "duplication_mode": mode,
-                    "shared_identifiers": sorted(shared)[:8],
-                    "evidence_strength": "held",
-                    "same_sanction_amount": bool(same_cost),
-                    "this_cost": this_cost,
-                    "other_cost": other_cost,
-                    "this_description": str(this["description"])[:180],
-                    "other_description": str(other["description"])[:180],
-                    "other_mp": other.get("mp_name"),
-                    "this_payees": payees.get(wid, [])[:4],
-                    "other_payees": payees.get(oid, [])[:4],
-                    "this_status": _text(this, "status"),
-                    "other_status": _text(other, "status"),
-                    "this_letter": _text(this, "letter_no"),
-                    "other_letter": _text(other, "letter_no"),
-                    "total_matches": int(matches.get(wid, 0)),
-                    "in_batch": bool(c.get("in_batch")),
-                    "shared_payee": c.get("shared_payee"),
-                    "photo_check": "not_run",
-                },
+                details={**details, "held": True, "evidence_strength": "held",
+                         "photo_check": photo_check,
+                         **({"this_file": verdict["files"].get(wid),
+                             "other_file": verdict["files"].get(details["pair_work_id"]),
+                             "photo_bits": verdict.get("bits")}
+                            if photo_check == "look_alike" else {})},
+            ))
+        return out
+
+    @staticmethod
+    def _photo_match_findings(c: dict, verdict: dict, per_work: dict, matches: Counter,
+                              payees: dict, cfg: dict, severity: str,
+                              cluster: list[str] | None = None) -> list[Finding]:
+        """Two works with one photo file on the portal: no longer held, and
+        scored at `severity`."""
+        out = []
+        for this, other in ((c["ra"], c["rb"]), (c["rb"], c["ra"])):
+            wid, oid = str(this["work_id"]), str(other["work_id"])
+            if per_work.get(wid, 0) >= cfg["max_findings_per_work"]:
+                continue
+            per_work[wid] = per_work.get(wid, 0) + 1
+            details = EntityResolutionAgent._pair_details(c, this, other, matches, payees)
+            others = [w for w in (cluster or []) if w not in (wid, oid)]
+            out.append(Finding(
+                agent="entity_resolution",
+                rule_id=cfg["id"],
+                rule_title=cfg["title"],
+                severity=severity,
+                entity_type="work",
+                entity_id=wid,
+                summary=(
+                    f"The photo recorded on the portal for this work ({verdict['files'].get(wid)}) "
+                    f"is the same image file, byte for byte, as the one recorded for work {oid} "
+                    f"({verdict['files'].get(oid)})"
+                    + (f" and {len(others)} other work(s) ({', '.join(others[:3])})" if others else "")
+                    + f"; their descriptions are {min(c['score'], 1.0):.0%} alike. Works "
+                    "recorded as separate assets should not share a site photo: one work may be "
+                    "recorded twice, or a wrong photo uploaded. For review; likely mode: "
+                    f"{details['duplication_mode']}."
+                ),
+                details={**details, "held": False, "photo_match": True, "match_kind": "photo",
+                         "evidence_strength": "same photo file", "photo_check": verdict["result"],
+                         "this_file": verdict["files"].get(wid),
+                         "other_file": verdict["files"].get(oid),
+                         "photo_cluster": cluster or [wid, oid]},
             ))
         return out
 
     @staticmethod
     def _batch_findings(rows: pd.DataFrame, pairs: list[dict], payees: dict, vendors: dict,
-                        cfg: dict, fuzz, stats: Counter, held: list[dict]) -> list[Finding]:
-        """One held finding per work of a batch, and held pairs for works of the
-        batch paid to the same gram panchayat."""
+                        cfg: dict, fuzz, stats: Counter, held: list[dict],
+                        photos: dict | None = None) -> list[Finding]:
+        """One held finding per work of a batch; findings for works of the batch
+        sharing one photo file; and held pairs for works of the batch paid to the
+        same gram panchayat. Works whose photos only look alike are listed on the
+        batch for a person to compare, not raised."""
+        photos = photos or {}
         rows = rows.sort_values("work_id")
         records = rows.to_dict("records")
         ids = [str(r["work_id"]) for r in records]
@@ -560,6 +701,56 @@ class EntityResolutionAgent(BaseAgent):
                    if _text(r, "letter_no") and str(r.get("letter_no")).strip()}
         paid_to = {p for wid in ids for p in vendors.get(wid, [])}
         shared = sorted(pairs[0]["shared"])[:8]
+        out: list[Finding] = []
+
+        # works of the batch sharing one photo file, grouped
+        checked = [pos for pos, wid in enumerate(ids) if wid in photos]
+        evidenced = [pos for pos in checked if photos[ids[pos]].get("photos")]
+        parent = {pos: pos for pos in evidenced}
+        found_pair: dict[tuple[int, int], dict] = {}
+        look_alike: list[tuple[int, int]] = []
+
+        def root(p):
+            while parent[p] != p:
+                parent[p] = parent[parent[p]]
+                p = parent[p]
+            return p
+
+        for x, a in enumerate(evidenced):
+            for b in evidenced[x + 1:]:
+                verdict = _photo_verdict(ids[a], ids[b], photos, cfg)
+                if verdict["result"] in SHARED_EVIDENCE:
+                    found_pair[(a, b)] = verdict
+                    parent[root(b)] = root(a)
+                elif verdict["result"] == "look_alike":
+                    look_alike.append((a, b))
+        clusters: dict[int, list[int]] = defaultdict(list)
+        for pos in evidenced:
+            clusters[root(pos)].append(pos)
+        clusters = {k: v for k, v in clusters.items() if len(v) >= 2}
+        cluster_of = {pos: k for k, members_ in clusters.items() for pos in members_}
+        # a look-alike inside a group already raised adds nothing
+        look_alike = [(a, b) for a, b in look_alike
+                      if not (a in cluster_of and cluster_of.get(a) == cluster_of.get(b))]
+        if look_alike:
+            stats["look_alike_pairs_within_batches"] += len(look_alike)
+        matched = Counter()
+        for members_ in clusters.values():
+            cluster_ids = [ids[p] for p in members_]
+            severity = (cfg["photo_match_severity"] if len(members_) == 2
+                        else cfg["photo_shared_severity"])
+            stats["shared_photo_groups_within_batches"] += 1
+            for a in members_:
+                # a partner it matched directly (every member of a group has one)
+                b, verdict = next((q, found_pair[(min(a, q), max(a, q))]) for q in members_
+                                  if q != a and (min(a, q), max(a, q)) in found_pair)
+                c = {"ra": pd.Series(records[a]), "rb": pd.Series(records[b]), "sem": 1.0,
+                     "score": 1.0, "fz": 100.0, "shared": set(shared), "geo_km": None,
+                     "cross_era": False, "in_batch": True}
+                # one finding on `a` naming the group; `b` gets its own in its turn
+                out += [f for f in EntityResolutionAgent._photo_match_findings(
+                    c, verdict, {ids[b]: cfg["max_findings_per_work"]}, matched, vendors, cfg,
+                    severity, cluster_ids) if f.entity_id == ids[a]]
 
         # works paid to the same gram panchayat: the one place the record names
         villages: list[tuple[str, list[int]]] = []
@@ -580,6 +771,8 @@ class EntityResolutionAgent(BaseAgent):
                     ca, cb = amounts[a], amounts[b]
                     if ca and cb and abs(ca - cb) / max(ca, cb) * 100 >= cfg["amount_differs_pct"]:
                         continue
+                    if a in cluster_of and cluster_of.get(a) == cluster_of.get(b):
+                        continue          # already raised: one photo file for both
                     stats["held_pairs_within_batches"] += 1
                     held.append({"ra": pd.Series(records[a]), "rb": pd.Series(records[b]),
                                  "sem": 1.0, "score": 1.0, "fz": 100.0, "shared": set(shared),
@@ -598,7 +791,12 @@ class EntityResolutionAgent(BaseAgent):
         mp = first.get("mp_name")
         stats["batches"] += 1
         stats["works_in_batches"] += len(ids)
-        out = []
+        photo_summary = {"checked": len(checked),
+                         "with_photos": sum(1 for p in checked if photos[ids[p]].get("photos")),
+                         "with_documents": sum(1 for p in checked if photos[ids[p]].get("documents")),
+                         "shared_groups": len(clusters),
+                         "look_alike_pairs": len(look_alike),
+                         "look_alike": [[ids[a], ids[b]] for a, b in look_alike[:20]]}
         for pos, wid in enumerate(ids):
             this = records[pos]
             mine = next((g for g in groups if wid in g["work_ids"]), None)
@@ -641,7 +839,8 @@ class EntityResolutionAgent(BaseAgent):
                     "evidence_strength": "batch",
                     "this_description": str(this["description"])[:180],
                     "this_cost": amounts[pos],
-                    "photo_check": "not_run",
+                    "photo_check": "checked" if checked else "not_run",
+                    "photo_summary": photo_summary,
                 },
             ))
         return out

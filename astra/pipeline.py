@@ -78,6 +78,7 @@ def _context() -> dict:
         "payments": db.read_df("payments"),
         "retired": db.read_df("retired_works"),
         "area_health": db.area_health(),
+        "photos": db.photo_evidence(),
     }
 
 
@@ -110,6 +111,10 @@ def run_pipeline(verbose: bool = True, *, refresh_flows: bool = True) -> dict:
     orch = Orchestrator()
     flags = orch.run(works, flows, context)
     n = db.save_flags(flags)
+    # The duplicate matches held this run: what the photo check looks at next.
+    resolver = next((a for a in orch.agents if a.name == "entity_resolution"), None)
+    if resolver is not None:
+        db.replace_duplicate_groups(getattr(resolver, "last_groups", []))
     finished_at = datetime.now(timezone.utc).isoformat()
     db.set_state("last_analysis_at", finished_at)
     db.set_state("analysis_covers_changes_at", changes_seen)

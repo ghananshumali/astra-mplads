@@ -391,6 +391,15 @@ duplicates:
   amount_differs_pct: 10                # amounts this far apart are two works
   typo_similarity: 85                   # a word this close to one in the other description is the same word
   same_body_similarity: 90              # payee names this close are the same panchayat or municipality
+  # Photo evidence (astra/ingestion/photos.py fingerprints the portal's photos of
+  # held works). One image file, byte for byte, recorded for two works raises
+  # them. Photos that only look alike stay held for a person to compare: many
+  # uploads are phone photos of a printed site photo under the same camera
+  # stamp, and different sites photographed that way fingerprint alike.
+  # Different pictures leave them held too, since a second photo can always be taken.
+  photo_max_bits: 6                     # of 64, on both row and column hashes: photos this close look alike
+  photo_match_severity: critical        # two works share one photo file
+  photo_shared_severity: high           # one photo file recorded for three or more works of a batch
   # MPLADS descriptions are templated ("Construction of CC road from X to Y"),
   # so text similarity alone is not evidence of duplication. A pair must also
   # share several RARE tokens (place names, ward numbers, landmarks). Tokens

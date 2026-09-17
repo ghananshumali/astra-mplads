@@ -202,7 +202,26 @@ difference between a demo and a system an authority could trust:
   score, until evidence such as the works' photos decides. Ids, dates, letter
   numbers, stages and vendors never clear a pair. Measured on copies of the live
   database the same day: alerts 5,791 → 611, and no work newly became an alert.
-  The photo comparison itself is not built yet.
+- **Photos settle what the record cannot.** `python -m astra.ingestion.photos
+  --limit N` looks only at works the last analysis held, reads the portal's
+  internal number for completed works from the raw response cache, fetches
+  their photos one request at a time and keeps only a fingerprint (64-bit row
+  and column difference hashes, and the file's SHA-256), never the image. The
+  next analysis raises two works sharing one photo file byte for byte (critical)
+  and one photo file recorded for three or more works of a batch (high). Photos
+  that only look alike stay held and are shown for a person to compare: many
+  uploads are phone photos of a printed site photo under the same camera stamp,
+  and two such photos of different sites came within 1 bit on one fingerprint.
+  Different photos leave a pair held too, since a second photo can always be
+  taken. The files carry no GPS metadata; a GPS stamp drawn into some pictures
+  is not read, so there is no location check. It refuses while a poller holds
+  the database.
+  Documents are not compared: in a 106-work sample on 17 Sep 2026 most completed
+  works had a PDF and no photo, and a PDF shared by two works turned out to be a
+  collector's fund-withdrawal order listing four works in different villages,
+  so one paper legitimately covers several works. Only 26 of 94 completed works
+  in that sample had a photo, so most held matches stay held until a person
+  looks.
 - **Cost anomalies need a materiality floor.** 17% of peer groups are degenerate
   (costs concentrated at one value, MAD = 0), so those use a percentile rule.
   A flag also requires ≥30% and ≥₹1 lakh above benchmark.

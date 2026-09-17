@@ -368,14 +368,30 @@ def humanize(finding: dict, lang: str = DEFAULT) -> dict:
             out["actions"].append(t("D-DUP-01.batch.same_payee", payee=group.get("payee"),
                                     works=", ".join(group.get("work_ids") or [])))
 
+    elif rid == "D-DUP-01" and d.get("photo_match"):
+        cluster = d.get("photo_cluster") or []
+        values = dict(pair=d.get("pair_work_id"), works=max(len(cluster), 2),
+                      similarity=d.get("semantic_sim", 0) * 100)
+        out["headline"] = t("D-DUP-01.photo.headline")
+        out["plain"] = t("D-DUP-01.photo.plain", **values,
+                         others=t("D-DUP-01.photo.others", count=len(cluster) - 2)
+                         if len(cluster) > 2 else "")
+        out["metric"] = t("D-DUP-01.photo.metric", **values)
+        out["benchmark"] = t("D-DUP-01.photo.benchmark")
+        out["actions"] = ts("D-DUP-01.photo.actions", **values)
+
     elif rid == "D-DUP-01" and d.get("held"):
         values = dict(similarity=d.get("semantic_sim", 0) * 100, pair=d.get("pair_work_id"))
+        photo = d.get("photo_check")
         out["headline"] = t("D-DUP-01.held.headline")
         out["plain"] = t("D-DUP-01.held.plain", **values,
                          same_amount=t("D-DUP-01.match.same_amount", cost=rs(d.get("this_cost")))
                          if d.get("same_sanction_amount") else "",
                          same_payee=t("D-DUP-01.held.same_payee", payee=d.get("shared_payee"))
-                         if d.get("shared_payee") else "")
+                         if d.get("shared_payee") else "",
+                         photo=t(f"D-DUP-01.held.photo_{photo}")
+                         if photo in ("look_alike", "different_photos", "no_photo", "not_completed",
+                                      "failed") else "")
         out["metric"] = t("D-DUP-01.held.metric", **values)
         out["benchmark"] = t("D-DUP-01.held.benchmark")
         out["actions"] = ts("D-DUP-01.held.actions", **values)

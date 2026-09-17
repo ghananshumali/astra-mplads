@@ -781,6 +781,24 @@ function DuplicatesPanel({ findings, entityId }: { findings: Finding[]; entityId
   const first = findings.map((f) => f.details as Details).find((d) => d.this_description);
   const totalMatches = Math.max(0, ...pairs.map((f) => Number((f.details as Details).total_matches ?? 0)));
   const stage = (s: unknown) => (s ? stageLabel(i18n, String(s)) : "—");
+  const photoLabel = (check: unknown) => {
+    switch (check) {
+      case "same_file":
+        return t("case.dup.photo.sameFile");
+      case "look_alike":
+        return t("case.dup.photo.lookAlike");
+      case "different_photos":
+        return t("case.dup.photo.different");
+      case "no_photo":
+        return t("case.dup.photo.none");
+      case "not_completed":
+        return t("case.dup.photo.notCompleted");
+      case "failed":
+        return t("case.dup.photo.failed");
+      default:
+        return t("case.dup.photo.notRun");
+    }
+  };
   // payee names as the portal records them: "GP Kapisda B" must not become "Gp Kapisda b"
   const names = (list: unknown) => (Array.isArray(list) && list.length ? list.join(", ") : "—");
   const nowrap = { whiteSpace: "nowrap" as const };
@@ -818,8 +836,30 @@ function DuplicatesPanel({ findings, entityId }: { findings: Finding[]; entityId
               <Stat label={t("case.dup.batch.total")} value={fmt.rupees(Number(d.batch_total))} />
               <Stat label={t("case.dup.batch.letters")} value={String(d.batch_letters ?? "—")} />
               <Stat label={t("case.dup.batch.payees")} value={String(d.batch_payees ?? "—")} />
-              <Stat label={t("case.dup.photoCheck")} value={t("case.dup.photo.notRun")} />
+              <Stat
+                label={t("case.dup.photoCheck")}
+                value={
+                  Number((d.photo_summary as Details | undefined)?.checked ?? 0) > 0
+                    ? t("case.dup.photo.batch", {
+                        checked: String((d.photo_summary as Details).checked),
+                        count: String(d.batch_size),
+                        same: String((d.photo_summary as Details).shared_groups ?? 0),
+                        alike: String((d.photo_summary as Details).look_alike_pairs ?? 0),
+                      })
+                    : t("case.dup.photo.notRun")
+                }
+              />
             </div>
+            {Array.isArray((d.photo_summary as Details | undefined)?.look_alike) &&
+              ((d.photo_summary as Details).look_alike as string[][]).length > 0 && (
+                <Banner tone="warn">
+                  {t("case.dup.photo.batchLookAlike", {
+                    pairs: ((d.photo_summary as Details).look_alike as string[][])
+                      .map((p) => p.join(" ↔ "))
+                      .join(", "),
+                  })}
+                </Banner>
+              )}
             <p className="text-sm muted" style={{ margin: 0 }}>
               {t("case.dup.batch.held")}
             </p>
@@ -923,21 +963,33 @@ function DuplicatesPanel({ findings, entityId }: { findings: Finding[]; entityId
                       <td className="text-xs muted">{stage(d.other_status)}</td>
                       <td className="text-xs num">{Math.round(Number(d.semantic_sim ?? 0) * 100)}%</td>
                       <td className="text-xs">
-                        <Chip>
-                          {d.held
-                            ? t("case.dup.status.held")
-                            : strength
-                              ? tOr(`strength.${strength}`, titleCase(strength))
-                              : "—"}
-                        </Chip>
+                        {d.photo_match ? (
+                          <Chip color="var(--risk-high)">{photoLabel(d.photo_check)}</Chip>
+                        ) : (
+                          <Chip>
+                            {d.held
+                              ? t("case.dup.status.held")
+                              : strength
+                                ? tOr(`strength.${strength}`, titleCase(strength))
+                                : "—"}
+                          </Chip>
+                        )}
                         <div className="dim">
                           {d.duplication_mode ? dupMode(i18n, String(d.duplication_mode)) : ""}
                         </div>
-                        {Boolean(d.held) && (
-                          <div className="dim">
-                            {t("case.dup.photoCheck")}: {t("case.dup.photo.notRun")}
-                          </div>
-                        )}
+                        {Boolean(d.held || d.photo_match) &&
+                          (d.photo_check === "look_alike" ? (
+                            <div>
+                              <Chip color="var(--risk-medium)">{photoLabel(d.photo_check)}</Chip>
+                              <div className="dim mono">
+                                {String(d.this_file ?? "")} / {String(d.other_file ?? "")}
+                              </div>
+                            </div>
+                          ) : (
+                            <div className="dim">
+                              {t("case.dup.photoCheck")}: {photoLabel(d.photo_check)}
+                            </div>
+                          ))}
                       </td>
                     </tr>
                   );

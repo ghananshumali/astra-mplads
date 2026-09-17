@@ -127,6 +127,19 @@ CREATE TABLE IF NOT EXISTS payments (
     vendor_id TEXT, vendor_name TEXT, implementing_agency TEXT, status TEXT,
     PRIMARY KEY (work_id, seq)
 );
+CREATE TABLE IF NOT EXISTS duplicate_groups (
+    group_id TEXT, kind TEXT, work_id TEXT, PRIMARY KEY (group_id, work_id)
+);
+CREATE TABLE IF NOT EXISTS photo_checks (
+    work_id TEXT PRIMARY KEY, portal_work_id TEXT, status TEXT, attachments INTEGER,
+    photos INTEGER, documents INTEGER, checked_at TEXT, error TEXT
+);
+CREATE TABLE IF NOT EXISTS work_attachments (
+    work_id TEXT, attach_id TEXT, file_name TEXT, kind TEXT, width INTEGER, height INTEGER,
+    bytes INTEGER, sha256 TEXT, dhash TEXT, vhash TEXT, fetched_at TEXT,
+    PRIMARY KEY (work_id, attach_id)
+);
+CREATE INDEX IF NOT EXISTS ix_dupgroups_work ON duplicate_groups(work_id);
 CREATE INDEX IF NOT EXISTS ix_flags_state ON flags(state);
 CREATE INDEX IF NOT EXISTS ix_flags_status ON flags(review_status);
 CREATE INDEX IF NOT EXISTS ix_flags_district ON flags(district);
@@ -426,6 +439,100 @@ def work_payments(work_id: str) -> list[dict]:
         return [dict(r) for r in con.execute(
             f"SELECT {', '.join(PAYMENT_COLUMNS)} FROM payments WHERE work_id = ? "
             f"ORDER BY paid_on, seq", (work_id,))]
+
+
+# ------------------------------------------------------------ photo evidence
+def replace_duplicate_groups(groups: list[dict]) -> int:
+    """The duplicate matches the last analysis held, as groups of works.
+
+    Rewritten by every analysis run: a pair or batch the record no longer holds
+    drops out, and the photo check (`astra.ingestion.photos`) only looks at
+    works that are held now.
+    """
+    init_db()
+    rows = [(g["group_id"], g["kind"], wid) for g in groups for wid in dict.fromkeys(g["work_ids"])]
+    with connect() as con:
+        con.execute("DELETE FROM duplicate_groups")
+        con.executemany("INSERT OR IGNORE INTO duplicate_groups (group_id, kind, work_id) "
+                        "VALUES (?, ?, ?)", rows)
+    return len(rows)
+
+
+def save_photo_check(work_id: str, *, portal_work_id: str | None, status: str,
+                     attachments: int = 0, found: list[dict] | None = None,
+                     error: str | None = None, checked_at: str | None = None) -> None:
+    """One work's photo check, in one transaction: its fingerprints are replaced
+    by what this check found (`found`: photos and documents, each with `kind`)."""
+    init_db()
+    checked_at = checked_at or datetime.now(timezone.utc).isoformat()
+    found = found or []
+    with connect() as con:
+        con.execute("DELETE FROM work_attachments WHERE work_id = ?", (work_id,))
+        con.executemany(
+            "INSERT INTO work_attachments (work_id, attach_id, file_name, kind, width, height, "
+            "bytes, sha256, dhash, vhash, fetched_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [(work_id, str(a["attach_id"]), a.get("file_name"), a["kind"], a.get("width"),
+              a.get("height"), a.get("bytes"), a.get("sha256"), a.get("dhash"), a.get("vhash"),
+              checked_at) for a in found])
+        con.execute(
+            "INSERT OR REPLACE INTO photo_checks (work_id, portal_work_id, status, attachments, "
+            "photos, documents, checked_at, error) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (work_id, portal_work_id, status, attachments,
+             sum(1 for a in found if a["kind"] == "photo"),
+             sum(1 for a in found if a["kind"] == "document"), checked_at, error))
+
+
+def photo_evidence() -> dict[str, dict]:
+    """work id -> {status, checked_at, photos: [...], documents: [...]} for every
+    work a photo check has looked at; each attachment has attach_id, file_name,
+    sha256, and for photos dhash and vhash."""
+    init_db()
+    out: dict[str, dict] = {}
+    with connect() as con:
+        for r in con.execute("SELECT work_id, status, checked_at FROM photo_checks"):
+            out[r["work_id"]] = {"status": r["status"], "checked_at": r["checked_at"],
+                                 "photos": [], "documents": []}
+        for r in con.execute("SELECT work_id, attach_id, file_name, kind, sha256, dhash, vhash "
+                             "FROM work_attachments"):
+            if r["work_id"] in out:
+                item = {"attach_id": r["attach_id"], "file_name": r["file_name"], "sha256": r["sha256"]}
+                if r["kind"] == "photo":
+                    out[r["work_id"]]["photos"].append({**item, "dhash": r["dhash"], "vhash": r["vhash"]})
+                else:
+                    out[r["work_id"]]["documents"].append(item)
+    return out
+
+
+def due_photo_checks(*, recheck_before: str, limit: int | None = None) -> list[str]:
+    """Held works that have no photo check yet, then those whose last check found
+    no photo or failed before `recheck_before`. Pairs before batches: a pair is
+    two works to settle, a batch may be hundreds."""
+    init_db()
+    with connect() as con:
+        rows = con.execute(
+            "SELECT g.work_id, MIN(CASE g.kind WHEN 'pair' THEN 0 ELSE 1 END) AS k, "
+            "MIN(g.group_id) AS gid, p.status, p.checked_at "
+            "FROM duplicate_groups g LEFT JOIN photo_checks p ON p.work_id = g.work_id "
+            "WHERE p.work_id IS NULL OR (p.status IN ('documents', 'no_photo', 'not_completed', 'failed') "
+            "AND p.checked_at < ?) "
+            "GROUP BY g.work_id ORDER BY (p.work_id IS NOT NULL), k, gid, g.work_id",
+            (recheck_before,)).fetchall()
+    ids = [r["work_id"] for r in rows]
+    return ids[:limit] if limit else ids
+
+
+def photo_check_summary() -> dict:
+    """Counts for the photo check: held works, and what their checks found."""
+    init_db()
+    with connect() as con:
+        held = con.execute("SELECT COUNT(DISTINCT work_id) FROM duplicate_groups").fetchone()[0]
+        statuses = dict(con.execute(
+            "SELECT p.status, COUNT(*) FROM photo_checks p JOIN "
+            "(SELECT DISTINCT work_id FROM duplicate_groups) g ON g.work_id = p.work_id "
+            "GROUP BY p.status").fetchall())
+        kinds = dict(con.execute("SELECT kind, COUNT(*) FROM work_attachments GROUP BY kind").fetchall())
+    return {"held_works": held, "checked": sum(statuses.values()), "by_status": statuses,
+            "photos": kinds.get("photo", 0), "documents": kinds.get("document", 0)}
 
 
 def work_versions(work_id: str) -> list[dict]:
