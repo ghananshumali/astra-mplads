@@ -6,8 +6,8 @@
  * blank. Fewer moving parts is the right trade for a map that has to work on
  * whatever machine a live demonstration runs on.
  *
- * Data integrity: markers sit at STATE CENTROIDS and are sized by high-risk
- * case count. The eSAKSHI exports carry no per-work coordinates, so no
+ * Data integrity: markers sit at STATE CENTROIDS and are sized by the count of
+ * medium- and high-risk cases (score 40 or above). The eSAKSHI exports carry no per-work coordinates, so no
  * work-level position is shown or implied anywhere in this component.
  */
 import L from "leaflet";
@@ -63,7 +63,7 @@ export function RiskMap({ rows, onSelectState, height = 460 }: RiskMapProps) {
       maxBounds: L.latLngBounds(INDIA_BOUNDS).pad(0.25),
     });
 
-    // Esri's light-grey canvas is muted, so the red risk bubbles carry the
+    // Esri's light-grey canvas is muted, so the risk bubbles carry the
     // colour. Both sources below are keyless: CARTO's raster endpoint now
     // returns "API KEY REQUIRED" watermarked tiles, which is why it is not used.
     const base = L.tileLayer(
@@ -139,14 +139,13 @@ export function RiskMap({ rows, onSelectState, height = 460 }: RiskMapProps) {
       .filter(Boolean) as { row: StateRow; lat: number; lon: number }[];
     if (!points.length) return;
 
-    const maxHigh = Math.max(...points.map((p) => p.row.high_risk), 1);
+    const maxAlerts = Math.max(...points.map((p) => p.row.alerts), 1);
 
     for (const p of points) {
       // area-proportional radius so a bubble twice the area means twice the count
-      const share = p.row.high_risk / maxHigh;
+      const share = p.row.alerts / maxAlerts;
       const radius = 6 + Math.sqrt(share) * 22;
-      const hasHigh = p.row.high_risk > 0;
-      const color = hasHigh ? RISK_META.high.color : RISK_META.low.color;
+      const color = p.row.alerts > 0 ? RISK_META.medium.color : RISK_META.low.color;
 
       const marker = L.circleMarker([p.lat, p.lon], {
         radius,
@@ -159,7 +158,7 @@ export function RiskMap({ rows, onSelectState, height = 460 }: RiskMapProps) {
 
       marker.bindTooltip(
         `<b>${esc(p.row.state)}</b><br>` +
-          esc(t("map.tooltip", { high: compact(p.row.high_risk), total: compact(p.row.flags) })),
+          esc(t("map.tooltip", { alerts: compact(p.row.alerts), total: compact(p.row.flags) })),
         { direction: "top", offset: [0, -radius] },
       );
 
@@ -167,6 +166,7 @@ export function RiskMap({ rows, onSelectState, height = 460 }: RiskMapProps) {
         `<div class="map-pop">
            <div class="map-pop-title">${esc(p.row.state)}</div>
            <dl>
+             <dt>${esc(t("map.alerts"))}</dt><dd class="med">${compact(p.row.alerts)}</dd>
              <dt>${esc(t("map.high"))}</dt><dd class="hi">${compact(p.row.high_risk)}</dd>
              <dt>${esc(t("map.all"))}</dt><dd>${compact(p.row.flags)}</dd>
              <dt>${esc(t("map.avg"))}</dt><dd>${p.row.avg_risk}</dd>

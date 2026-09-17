@@ -197,6 +197,7 @@ export interface DistrictRow {
   district: string;
   flags: number;
   high_risk: number;
+  alerts: number;
   avg_risk: number;
 }
 

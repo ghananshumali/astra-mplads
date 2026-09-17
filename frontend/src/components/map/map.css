@@ -84,6 +84,7 @@
   color: var(--text);
 }
 .map-pop dd.hi { color: var(--risk-high); }
+.map-pop dd.med { color: var(--risk-medium); }
 .map-pop-btn {
   width: 100%;
   padding: 5px 9px;
@@ -155,8 +156,8 @@
 }
 .map-legend-dot {
   border-radius: 50%;
-  border: 2px solid var(--risk-high);
-  background: rgba(179, 38, 30, 0.32);
+  border: 2px solid var(--risk-medium);
+  background: rgba(178, 106, 0, 0.32);
   flex: none;
 }
 .map-legend-dot.sm { width: 9px; height: 9px; }
