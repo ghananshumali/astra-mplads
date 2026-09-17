@@ -375,7 +375,12 @@ def ops_meta():
         "stopped_at": None if running else supervisor.get("stopped_at"),
         "keep_awake": supervisor.get("keep_awake") if running else None,
         "services": supervisor.get("services") if running else None,
-        "conditions": [{"key": k, **v} for k, v in (ops.get("alerts") or {}).items()],
+        # Only the running supervisor clears a condition, so a stopped one's
+        # conditions are history: on 17 Sep 2026 a "portal not answering" stayed
+        # on the site long after the portal was answering again. Its last alert
+        # is still reported, as history.
+        "conditions": [{"key": k, **v} for k, v in (ops.get("alerts") or {}).items()]
+        if running else [],
         "last_alert": ops.get("alerts_last_sent"),
         "backup": {**(ops.get("backup") or {}), "kept": len(copies),
                    "newest": copies[0] if copies else None},

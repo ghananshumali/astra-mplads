@@ -345,7 +345,7 @@ What the poller does, and the settings that change it (environment variables):
 
 | When | What | Setting |
 |---|---|---|
-| Every minute | Checks the portal's counts and re-reads only the areas whose counts moved | `ASTRA_POLL_INTERVAL` (seconds) |
+| Every minute | Checks the portal's counts and re-reads only the areas whose counts moved. A state counts as checked only once its constituencies have been asked, so a check cut short (the poller stopped, the network gone) is finished by the next one; and a Lok Sabha state whose figures no longer add up to its constituencies' is asked again, once. The Data source page compares ASTRA's totals with the portal's own national figures from the last check | `ASTRA_POLL_INTERVAL` (seconds) |
 | Every minute, 08:00–20:00 | In a quiet minute, also re-reads the one area read longest ago (five requests), so edits that change no figure arrive within hours | `ASTRA_ROLLING_AREAS` (`0` = off), `ASTRA_ROLLING_HOURS` (`HH:MM-HH:MM`, `always`, `off`) |
 | Nightly, 03:00 | Re-reads every area record by record | `ASTRA_RECONCILE_AT` |
 | Every minute, 21:00–07:00 | In a quiet minute, checks the portal photos of up to 10 held duplicate matches, at most 300 a night that need the portal (works not yet completed need no request); when the night's checks stop, the risk flags are recomputed to include them. Pauses 30 minutes if the attachment service stops answering | `ASTRA_PHOTO_HOURS` (`HH:MM-HH:MM`, `always`, `off`), `ASTRA_PHOTOS_PER_NIGHT` (`0` = off), `ASTRA_PHOTOS_PER_CHECK` |

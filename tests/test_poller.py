@@ -158,26 +158,55 @@ class FakePortal:
                                       for r in real["expenditure"])),
         }
 
-    def watermark(self, combo: str) -> Watermark:
+    def _figures_at(self, shard_id: str) -> tuple[dict, dict]:
+        """(counts, totals) by tile name for any level, before simulated faults.
+
+        A constituency's come from its reports. A state's and the national are
+        the sums of the level below, as the portal's are, to the paisa; a test
+        that moves `n` at an upper level directly moves the recommended count
+        there by the same amount.
+        """
         from astra.ingestion.esakshi_api import TILE_KEYS
+        house, state, const = shard_id.split(":")
+        if const != "0":
+            if shard_id in self.shard_tiles:
+                figures = self.figures(self.shard_tiles[shard_id])
+                return ({TILE_KEYS[t]: n for t, (n, _) in figures.items() if n is not None},
+                        {TILE_KEYS[t]: total for t, (_, total) in figures.items()})
+            count = self.n.get(shard_id, 0)
+            # The portal's total is the sum of the amounts it lists. A fake that
+            # invented one would fail the parity check for the wrong reason.
+            listed = [r for r in self._report(shard_id)["recommended"]
+                      if r.get("WORK_RECOMMENDATION_DTL_ID") is not None][:count]
+            return ({"Works Recommended": count},
+                    {"Works Recommended": float(sum(r.get("RECOMMENDED_AMOUNT") or 0
+                                                    for r in listed))})
+        if state != "0":
+            below = [f"{house}:{state}:{c['ID']}" for c in self.CONSTITUENCIES.get(int(state), [])]
+        else:
+            below = [f"{house}:{s['STATE_ID']}:0" for s in self.STATES]
+        counts: dict = {}
+        totals: dict = {}
+        for child in below:
+            c_counts, c_totals = self._figures_at(child)
+            for name, n in c_counts.items():
+                counts[name] = counts.get(name, 0) + (n or 0)
+            for name, total in c_totals.items():
+                totals[name] = totals.get(name, 0.0) + (total or 0.0)
+        moved_here = self.n.get(shard_id, 0) - sum(self.n.get(child, 0) for child in below)
+        counts["Works Recommended"] = counts.get("Works Recommended", 0) + moved_here
+        return counts, totals
+
+    def watermark(self, combo: str) -> Watermark:
         shard_id = self._shard_id(combo)
         self.calls.append(("watermark", shard_id))
         if shard_id in self.fail_shards:
             raise SourceError("HTTP 500", path="/getTilesData", status=500)
         wm = Watermark(combo=combo, fetched_at="now")
-        if shard_id in self.shard_tiles:
-            figures = self.figures(self.shard_tiles[shard_id])
-            wm.counts = {TILE_KEYS[t]: n for t, (n, _) in figures.items() if n is not None}
-            wm.totals = {TILE_KEYS[t]: total for t, (_, total) in figures.items()}
-        else:
-            count = 0 if shard_id in self.zero_shards else self.n.get(shard_id, 0)
-            wm.counts = {"Works Recommended": count}
-            # The portal's total is the sum of the amounts it lists. A fake that
-            # invented one would fail the parity check for the wrong reason.
-            listed = [r for r in self._report(shard_id)["recommended"]
-                      if r.get("WORK_RECOMMENDATION_DTL_ID") is not None][:count]
-            wm.totals = {"Works Recommended": float(sum(
-                r.get("RECOMMENDED_AMOUNT") or 0 for r in listed))}
+        wm.counts, wm.totals = self._figures_at(shard_id)
+        if shard_id in self.zero_shards:
+            wm.counts = {**wm.counts, "Works Recommended": 0}
+            wm.totals = {**wm.totals, "Works Recommended": 0.0}
         wm.counts.update(self.claimed_counts.get(shard_id, {}))
         wm.suspicious_zero = shard_id in self.zero_shards
         return wm
@@ -861,6 +890,22 @@ def test_data_source_live(tiles) -> None:
         check("national figures carry portal and stored side by side, per tile",
               set(ls) == {"recommended", "sanctioned", "completed", "expenditure"}
               and all(slot["exact"] for slot in ls.values()), json.dumps(ls)[:160])
+        recommended = ls.get("recommended") or {}
+        check("the portal side is the portal's own national figure, with the areas' sum beside it",
+              recommended.get("portal", [None])[0] == portal.n["2:0:0"]
+              and recommended.get("areas", [None])[0] == recommended["stored"][0]
+              and parity.get("national_checked_at", {}).get("LS"),
+              json.dumps(recommended)[:160])
+        live = json.loads(db.get_state("national_figures_2"))
+        live["figures"]["recommended"][0] += 2
+        db.set_state("national_figures_2", json.dumps(live))
+        behind = client.get("/meta/freshness").json()["parity"]
+        slot = behind["national"]["LS"]["recommended"]
+        check("so ASTRA behind the portal nationally shows as a difference, "
+              "even with every area exact on its own last read",
+              slot["exact"] is False and slot["portal"][0] == slot["stored"][0] + 2
+              and behind["exact_slices"] == behind["registered_slices"],
+              json.dumps(slot)[:160])
         with db.connect() as con:
             con.execute("UPDATE shard_parity SET exact = 0, differences_json = ? "
                         "WHERE shard_id = '2:36:500'",
@@ -1621,6 +1666,109 @@ def test_portal_pause(tiles) -> None:
           and state.get("place") == "UTTAR PRADESH", json.dumps(state)[:160])
 
 
+class _HoldingPortal(FakePortal):
+    """The fake portal behind a breaker that holds back the checks of some slices."""
+
+    def __init__(self, tiles):
+        super().__init__(tiles)
+        self.hold: set[str] = set()
+
+    def watermark(self, combo):
+        if self._shard_id(combo) in self.hold:
+            raise CircuitOpen("circuit open for another 30s; serving cached data")
+        return super().watermark(combo)
+
+
+def test_walk_cut_short(tiles) -> None:
+    print("\n[17] a walk cut short is walked again, and a lost change is found")
+    portal = _HoldingPortal(tiles)
+    poller = fresh_poller(portal)
+    poller.heartbeat()
+
+    def signature(shard_id: str) -> str | None:
+        return (db.get_watermark(shard_id) or {}).get("signature_json")
+
+    state_before, national_before = signature("2:33:0"), signature("2:0:0")
+    portal.bump("2:33:418")
+    portal.hold = {"2:33:418", "2:33:419"}
+    cut = poller.heartbeat()
+    check("constituency checks the breaker held back fetch nothing", cut.dirty == (),
+          str(cut.dirty))
+    check("and leave their state unrecorded, and the national figure too",
+          signature("2:33:0") == state_before and signature("2:0:0") == national_before)
+    portal.hold.clear()
+    resumed = poller.heartbeat()
+    check("so the next check walks the state again and reads the change",
+          resumed.dirty == ("2:33:418",) and resumed.stored > 0,
+          f"dirty={resumed.dirty} stored={resumed.stored}")
+    check("and only then records both levels as seen",
+          signature("2:33:0") != state_before and signature("2:0:0") != national_before)
+    quiet = poller.heartbeat()
+    check("after which a quiet minute is one request again", quiet.requests == 1,
+          f"requests={quiet.requests}")
+
+    print("      a change an earlier walk lost")
+    portal.bump("2:33:419")
+    # What a walk cut short used to leave behind: the state and the national
+    # figure recorded as seen, the constituency never asked.
+    for sid, combo in (("2:33:0", pmod.shard_combo(33, 0, house=HOUSE_LS)),
+                       ("2:0:0", pmod.shard_combo(house=HOUSE_LS))):
+        _moved, sig, count = poller._probe(sid, combo)
+        poller._record_probe(sid, sig, count, validate.IDLE)
+    check("goes unseen while nothing else moves", poller.heartbeat().dirty == ())
+    portal.bump("2:12:105")
+    found = poller.heartbeat()
+    check("until a change elsewhere: the state that no longer adds up is walked, "
+          "and the lost change read",
+          set(found.dirty) == {"2:12:105", "2:33:419"}, str(found.dirty))
+    portal.bump("2:12:105")
+    after = poller.heartbeat()
+    check("once it adds up, that state is not walked again",
+          after.dirty == ("2:12:105",) and after.constituencies_probed == 1,
+          f"dirty={after.dirty} constituencies={after.constituencies_probed}")
+
+    print("      a state whose own figures never add up")
+    portal.claimed_counts["2:33:0"] = {"Works Recommended": 999}
+    portal.bump("2:12:105")
+    poller.heartbeat()
+    portal.bump("2:12:105")
+    once = poller.heartbeat()
+    check("is asked again once", once.constituencies_probed == 3,
+          f"constituencies={once.constituencies_probed}")
+    portal.bump("2:12:105")
+    again = poller.heartbeat()
+    check("but not every minute after", again.constituencies_probed == 1,
+          f"constituencies={again.constituencies_probed}")
+    portal.claimed_counts.clear()
+    poller.heartbeat()
+
+    print("      an area owed a read")
+    barabanki = next(s for s in poller.registry() if s.shard_id == "2:33:419")
+    portal.truncate_shards.add("2:33:419")
+    poller.fetch_shard(barabanki)
+    portal.bump("2:33:418")
+    poller.heartbeat()
+    check("stays owed when a walk finds it unmoved",
+          (db.get_watermark("2:33:419") or {}).get("lifecycle") in pmod.PENDING
+          and barabanki in poller.pending_shards(),
+          str((db.get_watermark("2:33:419") or {}).get("lifecycle")))
+    portal.truncate_shards.clear()
+    poller.heartbeat()
+    check("until it is read", (db.get_watermark("2:33:419") or {}).get("lifecycle")
+          not in pmod.PENDING, str((db.get_watermark("2:33:419") or {}).get("lifecycle")))
+
+    print("      the website hears the portal is back at once")
+    answering = _BreakerPortal(tiles)
+    answering.breaker = CircuitBreaker()
+    fresh = pmod.Poller(client=answering, houses=(HOUSE_LS,), verbose=False)
+    db.set_state("portal_status", json.dumps({"open": True, "last_error": "ConnectionError"}))
+    goa = next(s for s in fresh.registry() if s.shard_id == "2:12:105")
+    fresh.fetch_shard(goa)
+    check("from the first read that succeeds, not at the end of the check",
+          json.loads(db.get_state("portal_status") or "{}").get("open") is False,
+          db.get_state("portal_status"))
+
+
 class _FakePhotoPortal:
     """The two attachment calls, scripted: a work number maps to its files."""
 
@@ -1825,7 +1973,8 @@ def main() -> int:
                    test_data_source_live, test_duplicate_listings,
                    test_removal_lifecycle, test_move_between_slices,
                    test_later_report_only, test_rotation,
-                   test_analysis_refresh, test_portal_pause, test_photo_checks):
+                   test_analysis_refresh, test_portal_pause, test_photo_checks,
+                   test_walk_cut_short):
             db.init_db(force=True)
             with db.connect() as con:
                 for table in ("works", "shards", "shard_watermarks",

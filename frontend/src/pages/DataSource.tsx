@@ -573,6 +573,7 @@ function PortalParity({ parity }: { parity: Parity }) {
   );
   const allExact = parity.exception_count === 0 && rows.every((r) => r.fig.exact);
   const counts = { n: compact(parity.exact_slices), m: compact(parity.registered_slices) };
+  const checkedAt = parity.national_checked_at?.LS ?? parity.national_checked_at?.RS;
   return (
     <Card
       title={t("parity.title")}
@@ -584,7 +585,9 @@ function PortalParity({ parity }: { parity: Parity }) {
         >
           {allExact
             ? t("parity.exact", counts)
-            : t("parity.differ", { n: compact(parity.exception_count), m: counts.m })}
+            : parity.exception_count
+              ? t("parity.differ", { n: compact(parity.exception_count), m: counts.m })
+              : t("parity.nationalDiffers")}
         </Chip>
       }
       tight
@@ -637,6 +640,7 @@ function PortalParity({ parity }: { parity: Parity }) {
         </table>
       </div>
       <p className="text-xs dim" style={{ margin: "10px 0 0" }}>
+        {checkedAt && `${t("parity.liveNote", { time: i18n.fmt.clock(checkedAt) })} `}
         {t("parity.note")}
         {parity.duplicate_listings > 0 &&
           ` ${t("parity.dupNote", { count: compact(parity.duplicate_listings) })}`}

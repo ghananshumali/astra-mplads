@@ -756,6 +756,29 @@ def parity_summary() -> dict:
                     slot[side][1] = round(slot[side][1], 2)
             if tile == "expenditure":
                 slot["portal"][0] = slot["stored"][0] = None
+    # The portal's own national figures as last read, when the poller has read
+    # them. The areas' figures summed agree with ASTRA's by construction, since
+    # each area's were read with its records; an area never re-read keeps its
+    # old figures on both sides, which is how a missed change hid on 17 Sep 2026.
+    # So the "portal" side is the portal's national figure, and the area sum is
+    # kept beside it.
+    national_at: dict[str, str] = {}
+    for house_id, house in ((2, "LS"), (1, "RS")):
+        try:
+            live = json.loads(get_state(f"national_figures_{house_id}") or "null")
+        except ValueError:
+            live = None
+        if not isinstance(live, dict) or house not in national:
+            continue
+        national_at[house] = live.get("at")
+        for tile, slot in national[house].items():
+            figure = (live.get("figures") or {}).get(tile)
+            if not figure:
+                continue
+            slot["areas"] = slot["portal"]
+            slot["portal"] = [None if tile == "expenditure" else figure[0], figure[1]]
+    for tiles in national.values():
+        for slot in tiles.values():
             count_ok = slot["portal"][0] is None or slot["portal"][0] == slot["stored"][0]
             total_ok = (slot["portal"][1] is None
                         or abs(slot["portal"][1] - slot["stored"][1]) <= max(1.0, len(rows)))
@@ -764,6 +787,7 @@ def parity_summary() -> dict:
             "exact_slices": sum(1 for r in rows if r["exact"]),
             "exceptions": exceptions[:25], "exception_count": len(exceptions),
             "duplicate_listings": duplicates, "national": national,
+            "national_checked_at": national_at,
             "awaiting_removal": missing["n"], "oldest_missing_since": missing["oldest"],
             "removed_from_portal": retired["n"], "latest_removal": retired["latest"]}
 
@@ -828,6 +852,20 @@ def get_watermark(shard_id: str) -> dict | None:
         row = con.execute("SELECT * FROM shard_watermarks WHERE shard_id = ?",
                           (shard_id,)).fetchone()
         return dict(row) if row else None
+
+
+def get_watermarks(shard_ids: list[str]) -> dict[str, dict]:
+    """Stored watermarks for many shards in one read, by shard id."""
+    init_db()
+    out: dict[str, dict] = {}
+    with connect() as con:
+        for i in range(0, len(shard_ids), 500):
+            chunk = shard_ids[i:i + 500]
+            marks = ", ".join("?" * len(chunk))
+            for row in con.execute(
+                    f"SELECT * FROM shard_watermarks WHERE shard_id IN ({marks})", chunk):
+                out[row["shard_id"]] = dict(row)
+    return out
 
 
 def save_watermark(shard_id: str, *, signature: object = None,

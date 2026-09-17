@@ -348,8 +348,11 @@ export interface DataSource {
 /** One portal tile figure, portal and stored side by side: [count, rupees].
  *  A null count means the portal does not report one (expenditure). */
 export interface ParityFigure {
+  /** The portal's national figure as last read (the areas' sum until the poller has read it). */
   portal: [number | null, number | null];
   stored: [number | null, number | null];
+  /** The areas' own portal figures summed, each as last read with its records. */
+  areas?: [number | null, number | null];
   exact: boolean;
 }
 
@@ -371,6 +374,8 @@ export interface Parity {
   }[];
   duplicate_listings: number;
   national: Partial<Record<"LS" | "RS", Partial<Record<ParityTile, ParityFigure>>>>;
+  /** When the poller last read each house's national figures. */
+  national_checked_at?: Partial<Record<"LS" | "RS", string | null>>;
   awaiting_removal: number;
   oldest_missing_since: string | null;
   removed_from_portal: number;
