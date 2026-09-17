@@ -65,6 +65,17 @@ which reads the whole corpus. `refresh_analysis()` re-runs it when stored data
 has actually changed, at most every `ANALYSIS_EVERY` and after a completed
 nightly sweep, so the flags follow the portal within hours rather than waiting
 for someone to re-run the pipeline by hand.
+
+At night, photos
+----------------
+A duplicate match nothing recorded separates is held until evidence decides,
+and the portal's photos of completed works are that evidence
+(`astra.ingestion.photos`). Checking them needs the database's one writer, so
+`photo_checks()` does it here: only in `PHOTO_HOURS`, when offices are not
+editing and the rotation is idle, a few held works a minute and at most
+`PHOTOS_PER_NIGHT` a night that need the portal, standing down in any minute
+busy with a change or while the portal is failing. When the night's checks stop
+they count as a change the analysis reads, so one re-run picks them all up.
 """
 from __future__ import annotations
 
@@ -75,6 +86,7 @@ import random
 import signal
 import sys
 import time
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -136,6 +148,20 @@ ROLLING_MIN_AGE = timedelta(hours=float(os.environ.get("ASTRA_ROLLING_MIN_AGE_H"
 #: over the full corpus takes about two minutes, and the heartbeat waits for
 #: it exactly as it waits for the nightly sweep.
 ANALYSIS_EVERY = timedelta(minutes=float(os.environ.get("ASTRA_ANALYSIS_EVERY_MIN", "180")))
+#: Local hours the photo check of held duplicate matches runs: "HH:MM-HH:MM"
+#: (may wrap past midnight), "always", or "off". Clear of the rotation's hours.
+PHOTO_HOURS = os.environ.get("ASTRA_PHOTO_HOURS", "21:00-07:00")
+#: Held works a night's photo check may ask the portal about, at two to four
+#: requests each; 0 turns it off. A work not yet completed needs no request and
+#: is not counted.
+PHOTOS_PER_NIGHT = int(os.environ.get("ASTRA_PHOTOS_PER_NIGHT", "300"))
+#: Of those, at most this many a minute, so a check never holds up the loop.
+PHOTOS_PER_CHECK = int(os.environ.get("ASTRA_PHOTOS_PER_CHECK", "10"))
+#: Works not yet completed recorded a minute (no request, one row each).
+PHOTOS_UNASKED_PER_CHECK = 200
+#: The portal's internal work numbers come from the cached completed reports
+#: (about 4 s to read); they are reused for this long.
+PHOTO_IDS_EVERY = timedelta(hours=1)
 
 ALERTS_PATH = PROCESSED_DIR / "ingest_alerts.json"
 STATUS_PATH = PROCESSED_DIR / "poller_status.json"
@@ -274,6 +300,12 @@ class Poller:
         self.houses = houses
         self.verbose = verbose
         self._stop = False
+        #: The photo check's own portal client, made on first use; its circuit
+        #: breaker is separate, so a failing attachment service cannot pause
+        #: the watch on the portal's figures.
+        self.photo_client = None
+        self._photo_ids: dict[str, str] | None = None
+        self._photo_ids_at: datetime | None = None
 
     # ------------------------------------------------------------- plumbing
     def log(self, message: str) -> None:
@@ -685,6 +717,116 @@ class Poller:
         report.rolled = report.rolled + tuple(done)
         return done
 
+    # ------------------------------------------------------------ photos
+    @staticmethod
+    def photo_night(local: datetime, hours: tuple[int, int]) -> str:
+        """The night a moment belongs to, named by the date its hours opened:
+        with 21:00-07:00, both 23:00 on the 17th and 03:00 on the 18th are the
+        night of the 17th."""
+        return (local - timedelta(minutes=hours[0])).date().isoformat()
+
+    def _portal_ids(self, now: datetime) -> dict[str, str]:
+        from . import photos
+        if (self._photo_ids is None or self._photo_ids_at is None
+                or now - self._photo_ids_at >= PHOTO_IDS_EVERY):
+            self._photo_ids = photos.portal_work_ids()
+            self._photo_ids_at = now
+        return self._photo_ids
+
+    def photo_results_ready(self) -> bool:
+        """Once the night's photo checks stop, those recorded since the flags
+        last included them count as a change the analysis reads. One re-run
+        then picks up the whole night, rather than one run per few minutes of
+        checking. Returns whether it marked them."""
+        if not db.get_state("photo_results_pending"):
+            return False
+        db.set_state("data_changed_at", _now())
+        db.set_state("photo_results_pending", "")
+        self.log("photo checks recorded; the risk flags include them at the next analysis")
+        return True
+
+    def photo_checks(self, report: CycleReport | None = None,
+                     now: datetime | None = None) -> Counter:
+        """Check the portal's photos of held duplicate matches, a few a minute, at night.
+
+        Inside `PHOTO_HOURS` only, at most `PHOTOS_PER_CHECK` works a minute and
+        `PHOTOS_PER_NIGHT` a night that ask the portal (works not yet completed
+        are recorded without a request, `PHOTOS_UNASKED_PER_CHECK` a minute).
+        It stands down in a minute busy with a change, while the poller's
+        breaker is open, and until `RETRY_GAP` after the attachment service
+        stopped answering. Returns what the checks found.
+        """
+        from . import photos
+
+        tally: Counter = Counter()
+        hours = parse_hours(PHOTO_HOURS)
+        if PHOTOS_PER_NIGHT <= 0 or hours is None:
+            return tally
+        local = now if now is not None else datetime.now().astimezone()
+        if local.tzinfo is None:
+            local = local.astimezone()
+        utc_now = local.astimezone(timezone.utc)
+        if not in_hours(local, hours):
+            self.photo_results_ready()
+            return tally
+        if report is not None and (report.houses_moved or report.dirty or report.quarantined):
+            return tally
+        breaker = getattr(self.client, "breaker", None)
+        if breaker is not None and breaker.is_open:
+            return tally
+        paused = _parse_ts(db.get_state("photo_paused_until"))
+        if paused is not None and utc_now < paused:
+            return tally
+
+        night = self.photo_night(local, hours)
+        try:
+            tonight = json.loads(db.get_state("photo_night") or "{}")
+        except ValueError:
+            tonight = {}
+        asked_before = int(tonight.get("asked") or 0) if tonight.get("night") == night else 0
+        room = min(PHOTOS_PER_CHECK, PHOTOS_PER_NIGHT - asked_before)
+        due = db.due_photo_checks(recheck_before=photos.recheck_before(utc_now)) if room > 0 else []
+        if not due:
+            self.photo_results_ready()          # the night's work is done
+            return tally
+
+        ids = self._portal_ids(utc_now)
+        batch, asking, unasked = [], 0, 0
+        for work_id in due:
+            if work_id in ids:
+                if asking >= room:
+                    continue
+                asking += 1
+            else:
+                if unasked >= PHOTOS_UNASKED_PER_CHECK:
+                    continue
+                unasked += 1
+            batch.append(work_id)
+            if asking >= room and unasked >= PHOTOS_UNASKED_PER_CHECK:
+                break
+
+        if self.photo_client is None:
+            self.photo_client = photos.PhotoClient()
+        tally = photos.check_works(batch, client=self.photo_client, ids=ids, log=self.log,
+                                   progress_every=0, should_stop=lambda: self._stop)
+        asked = sum(tally[s] for s in photos.ASKED)
+        recorded = asked + tally["not_completed"]
+        db.set_state("photo_night", json.dumps({"night": night, "asked": asked_before + asked}))
+        if recorded:
+            db.set_state("last_photo_check_at", _now())
+            if not db.get_state("photo_results_pending"):
+                db.set_state("photo_results_pending", _now())
+            found = ", ".join(f"{k.replace('_', ' ')} {v}" for k, v in sorted(tally.items())
+                              if k not in ("stopped_early", "photos_fingerprinted"))
+            self.log(f"photo check: {recorded} held work(s) ({found}); "
+                     f"{asked_before + asked} of {PHOTOS_PER_NIGHT} tonight")
+        if tally["stopped_early"]:
+            db.set_state("photo_paused_until", (utc_now + RETRY_GAP).isoformat())
+            self.log(f"photo checks paused for {RETRY_GAP.total_seconds() / 60:.0f} min")
+        elif asked and db.get_state("photo_paused_until"):
+            db.set_state("photo_paused_until", "")      # answering again
+        return tally
+
     # ------------------------------------------------------------ one cycle
     def heartbeat(self) -> CycleReport:
         """One minute's work: ask nationally, descend only if something moved."""
@@ -922,9 +1064,10 @@ class Poller:
         """Are the risk flags behind the stored data, and is a re-run allowed?
 
         Only a change the analysis reads counts: new, edited, removed or
-        restored works, or a change in which reports list them. A re-read that
-        found nothing never triggers a run. Decided from the database, so a
-        restart does not forget a change the flags have not caught up with.
+        restored works, a change in which reports list them, or a night's photo
+        checks of held matches (`photo_results_ready`). A re-read that found
+        nothing never triggers a run. Decided from the database, so a restart
+        does not forget a change the flags have not caught up with.
         """
         if ANALYSIS_EVERY <= timedelta(0):
             return False
@@ -1010,6 +1153,8 @@ class Poller:
              "rolling": {"areas_per_check": ROLLING_AREAS, "hours": ROLLING_HOURS,
                          "min_age_hours": ROLLING_MIN_AGE.total_seconds() / 3600},
              "analysis_every_minutes": ANALYSIS_EVERY.total_seconds() / 60,
+             "photos": {"hours": PHOTO_HOURS, "per_night": PHOTOS_PER_NIGHT,
+                        "per_check": PHOTOS_PER_CHECK},
              "last_reconcile_at": db.get_state("last_reconcile_at"),
              "last_registry_at": db.get_state("last_registry_at"),
              "houses": list(self.houses),
@@ -1030,9 +1175,11 @@ class Poller:
         self.log(f"watching every {POLL_INTERVAL:.0f}s; nightly sweep at "
                  f"{RECONCILE_AT}; houses {self.houses}; rotation "
                  f"{ROLLING_AREAS} area(s) a check, {ROLLING_HOURS}; analysis "
-                 f"at most every {ANALYSIS_EVERY.total_seconds() / 60:.0f} min")
+                 f"at most every {ANALYSIS_EVERY.total_seconds() / 60:.0f} min; photo checks "
+                 f"{PHOTOS_PER_NIGHT} held works a night, {PHOTOS_PER_CHECK} a check, {PHOTO_HOURS}")
         while not self._stop:
             cycle_start = time.monotonic()
+            report = None
             try:
                 report = self.heartbeat()
                 if report.houses_moved or report.dirty:
@@ -1049,8 +1196,9 @@ class Poller:
                 except SourceError as exc:
                     self.log(f"registry refresh failed: {exc}")
 
-            swept = False
+            swept = sweep_ran = False
             if self.reconcile_due():
+                sweep_ran = True
                 last = db.get_state("last_reconcile_at")
                 self.log("nightly sweep is due "
                          + (f"(last completed {last})" if last else "(never completed)"))
@@ -1058,6 +1206,13 @@ class Poller:
                     swept = bool(self.reconcile_all().get("recorded_as_complete"))
                 except Exception as exc:
                     self.log(f"reconciliation error: {type(exc).__name__}: {exc}")
+
+            # A sweep takes the minute and more; the photos wait for the next one.
+            if not self._stop and not sweep_ran and report is not None:
+                try:
+                    self.photo_checks(report)
+                except Exception as exc:
+                    self.log(f"photo check error: {type(exc).__name__}: {exc}")
 
             if not self._stop and self.analysis_due(after_sweep=swept):
                 self.refresh_analysis("after the nightly sweep" if swept

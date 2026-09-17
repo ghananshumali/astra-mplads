@@ -649,76 +649,7 @@ export default function CaseDetail({
               hint={t("case.dup.emptyHint")}
             />
           ) : (
-            <div className="stack gap-4">
-              <p className="text-sm muted" style={{ margin: 0 }}>
-                {t("case.dup.intro")}
-              </p>
-              {dupFindings.map((f, i) => {
-                const d = f.details as Record<string, unknown>;
-                if (f.rule_id === "D-DUP-02") {
-                  return (
-                    <div key={i} className="dup-card">
-                      <div className="semibold">
-                        {t("case.dup.cluster", {
-                          count: String(d.cluster_size),
-                          district: String(d.district),
-                        })}
-                      </div>
-                      <code className="json">
-                        {String(d.normalised_description ?? "")}
-                      </code>
-                      <div className="text-sm muted">
-                        {t("case.dup.total", { amount: fmt.rupees(Number(d.total_cost)) })}
-                      </div>
-                    </div>
-                  );
-                }
-                const strength = String(d.evidence_strength ?? "");
-                return (
-                  <div key={i} className="dup-card">
-                    <div className="dup-compare">
-                      <div>
-                        <div className="field-label">{t("case.dup.this")}</div>
-                        <code className="mono text-xs">{c.entity_id}</code>
-                        <p className="dup-text">
-                          {String(d.this_description ?? "—")}
-                        </p>
-                      </div>
-                      <div>
-                        <div className="field-label">{t("case.dup.matched")}</div>
-                        <code className="mono text-xs">
-                          {String(d.pair_work_id ?? "—")}
-                        </code>
-                        <p className="dup-text">
-                          {String(d.other_description ?? "—")}
-                        </p>
-                      </div>
-                    </div>
-                    <div className="dup-stats">
-                      <Stat
-                        label={t("case.dup.match")}
-                        value={`${Math.round(Number(d.semantic_sim ?? 0) * 100)}%`}
-                      />
-                      <Stat
-                        label={t("case.dup.sameAmount")}
-                        value={d.same_sanction_amount ? t("case.dup.yes") : t("case.dup.no")}
-                      />
-                      <Stat
-                        label={t("case.dup.evidence")}
-                        value={strength ? tOr(`strength.${strength}`, titleCase(strength)) : "—"}
-                      />
-                    </div>
-                    <div className="text-sm muted">
-                      <b>{t("case.dup.pattern")}</b>{" "}
-                      {d.duplication_mode ? dupMode(i18n, String(d.duplication_mode)) : "—"}
-                    </div>
-                    {d.geo_km === null && (
-                      <div className="text-xs dim">{t("case.dup.proximity")}</div>
-                    )}
-                  </div>
-                );
-              })}
-            </div>
+            <DuplicatesPanel findings={dupFindings} entityId={c.entity_id} />
           )}
         </Card>
       )}
@@ -827,6 +758,269 @@ function PaymentTimeline({ workId }: { workId: string }) {
           </div>
         </>
       )}
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------- duplicates */
+type Details = Record<string, unknown>;
+type BatchMember = {
+  work_id: string;
+  amount: number | null;
+  payees: string[];
+  status: string | null;
+  letter_no: string | null;
+};
+
+function DuplicatesPanel({ findings, entityId }: { findings: Finding[]; entityId: string }) {
+  const i18n = useI18n();
+  const { t, tOr, fmt } = i18n;
+  const batches = findings.filter((f) => f.rule_id === "D-DUP-01" && (f.details as Details).batch);
+  const pairs = findings.filter((f) => f.rule_id === "D-DUP-01" && (f.details as Details).pair_work_id);
+  const clusters = findings.filter((f) => f.rule_id === "D-DUP-02");
+  const first = findings.map((f) => f.details as Details).find((d) => d.this_description);
+  const totalMatches = Math.max(0, ...pairs.map((f) => Number((f.details as Details).total_matches ?? 0)));
+  const stage = (s: unknown) => (s ? stageLabel(i18n, String(s)) : "—");
+  const photoLabel = (check: unknown) => {
+    switch (check) {
+      case "same_file":
+        return t("case.dup.photo.sameFile");
+      case "look_alike":
+        return t("case.dup.photo.lookAlike");
+      case "different_photos":
+        return t("case.dup.photo.different");
+      case "no_photo":
+        return t("case.dup.photo.none");
+      case "not_completed":
+        return t("case.dup.photo.notCompleted");
+      case "failed":
+        return t("case.dup.photo.failed");
+      default:
+        return t("case.dup.photo.notRun");
+    }
+  };
+  // payee names as the portal records them: "GP Kapisda B" must not become "Gp Kapisda b"
+  const names = (list: unknown) => (Array.isArray(list) && list.length ? list.join(", ") : "—");
+  const nowrap = { whiteSpace: "nowrap" as const };
+
+  return (
+    <div className="stack gap-4">
+      <p className="text-sm muted" style={{ margin: 0 }}>
+        {t("case.dup.intro")}
+      </p>
+      {first && (
+        <div>
+          <div className="field-label">{t("case.dup.this")}</div>
+          <code className="mono text-xs">{entityId}</code>
+          {first.this_cost != null && (
+            <span className="text-xs muted"> · {fmt.rupees(Number(first.this_cost))}</span>
+          )}
+          <p className="dup-text">{String(first.this_description)}</p>
+        </div>
+      )}
+
+      {batches.map((f, i) => {
+        const d = f.details as Details;
+        // this work first, then the rest of the batch in portal order
+        const members = [...((d.members as BatchMember[]) ?? [])].sort(
+          (a, b) => Number(b.work_id === entityId) - Number(a.work_id === entityId),
+        );
+        const groups = (d.same_payee_groups as { payee: string; work_ids: string[] }[]) ?? [];
+        const flagged = new Set(groups.flatMap((g) => g.work_ids));
+        return (
+          <div key={`b${i}`} className="dup-card">
+            <div className="semibold">
+              {t("case.dup.batch.title", { count: String(d.batch_size), mp: String(d.batch_mp ?? "") })}
+            </div>
+            <div className="dup-stats">
+              <Stat label={t("case.dup.batch.total")} value={fmt.rupees(Number(d.batch_total))} />
+              <Stat label={t("case.dup.batch.letters")} value={String(d.batch_letters ?? "—")} />
+              <Stat label={t("case.dup.batch.payees")} value={String(d.batch_payees ?? "—")} />
+              <Stat
+                label={t("case.dup.photoCheck")}
+                value={
+                  Number((d.photo_summary as Details | undefined)?.checked ?? 0) > 0
+                    ? t("case.dup.photo.batch", {
+                        checked: String((d.photo_summary as Details).checked),
+                        count: String(d.batch_size),
+                        same: String((d.photo_summary as Details).shared_groups ?? 0),
+                        alike: String((d.photo_summary as Details).look_alike_pairs ?? 0),
+                      })
+                    : t("case.dup.photo.notRun")
+                }
+              />
+            </div>
+            {Array.isArray((d.photo_summary as Details | undefined)?.look_alike) &&
+              ((d.photo_summary as Details).look_alike as string[][]).length > 0 && (
+                <Banner tone="warn">
+                  {t("case.dup.photo.batchLookAlike", {
+                    pairs: ((d.photo_summary as Details).look_alike as string[][])
+                      .map((p) => p.join(" ↔ "))
+                      .join(", "),
+                  })}
+                </Banner>
+              )}
+            <p className="text-sm muted" style={{ margin: 0 }}>
+              {t("case.dup.batch.held")}
+            </p>
+            {groups.map((g) => (
+              <Banner key={g.payee} tone="warn">
+                {t("case.dup.batch.samePayee", { count: String(g.work_ids.length), payee: g.payee })}
+              </Banner>
+            ))}
+            <div className="table-scroll" style={{ maxHeight: 320 }}>
+              <table className="table">
+                <thead>
+                  <tr>
+                    <th>{t("case.dup.col.work")}</th>
+                    <th style={{ width: 110 }}>{t("case.dup.col.amount")}</th>
+                    <th>{t("case.dup.col.paidTo")}</th>
+                    <th style={{ width: 140 }}>{t("case.dup.col.stage")}</th>
+                    <th>{t("case.dup.col.letter")}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {members.map((m) => (
+                    <tr key={m.work_id} className={m.work_id === entityId ? "semibold" : undefined}>
+                      <td className="text-xs mono" style={nowrap}>
+                        {m.work_id}
+                        {m.work_id === entityId && <div className="dim">{t("case.dup.this")}</div>}
+                      </td>
+                      <td className="text-xs num">{m.amount != null ? fmt.rupees(m.amount) : "—"}</td>
+                      <td className="text-xs">
+                        {names(m.payees)}{" "}
+                        {flagged.has(m.work_id) && (
+                          <Chip color="var(--risk-medium)">{t("case.dup.samePayeeChip")}</Chip>
+                        )}
+                      </td>
+                      <td className="text-xs muted">{stage(m.status)}</td>
+                      <td className="text-xs mono muted" style={nowrap}>
+                        {m.letter_no ?? "—"}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            {Number(d.members_shown) < Number(d.batch_size) && (
+              <div className="text-xs dim">
+                {t("case.dup.batch.shown", { shown: String(d.members_shown), count: String(d.batch_size) })}
+              </div>
+            )}
+          </div>
+        );
+      })}
+
+      {pairs.length > 0 && (
+        <div className="dup-card">
+          <div className="semibold">{t("case.dup.pairs.title")}</div>
+          {pairs.some((f) => (f.details as Details).held) && (
+            <p className="text-sm muted" style={{ margin: 0 }}>
+              {t("case.dup.held")}
+            </p>
+          )}
+          <div className="table-scroll">
+            <table className="table">
+              <thead>
+                <tr>
+                  <th>{t("case.dup.col.work")}</th>
+                  <th style={{ width: 110 }}>{t("case.dup.col.amount")}</th>
+                  <th>{t("case.dup.col.paidTo")}</th>
+                  <th style={{ width: 130 }}>{t("case.dup.col.stage")}</th>
+                  <th style={{ width: 90 }}>{t("case.dup.match")}</th>
+                  <th>{t("case.dup.col.status")}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {pairs.map((f, i) => {
+                  const d = f.details as Details;
+                  const strength = String(d.evidence_strength ?? "");
+                  return (
+                    <tr key={`p${i}`}>
+                      <td className="text-xs">
+                        <code className="mono" style={nowrap}>
+                          {String(d.pair_work_id)}
+                        </code>
+                        {/* the matched description only where it differs from this work's */}
+                        {String(d.other_description ?? "").trim().toLowerCase() !==
+                          String(d.this_description ?? "").trim().toLowerCase() && (
+                          <div className="muted">{String(d.other_description ?? "")}</div>
+                        )}
+                      </td>
+                      <td className="text-xs num">
+                        {d.other_cost != null ? fmt.rupees(Number(d.other_cost)) : "—"}
+                      </td>
+                      <td className="text-xs">
+                        {names(d.other_payees)}
+                        {Boolean(d.shared_payee) && (
+                          <div>
+                            <Chip color="var(--risk-medium)">
+                              {t("case.dup.bothPaid", { payee: String(d.shared_payee) })}
+                            </Chip>
+                          </div>
+                        )}
+                      </td>
+                      <td className="text-xs muted">{stage(d.other_status)}</td>
+                      <td className="text-xs num">{Math.round(Number(d.semantic_sim ?? 0) * 100)}%</td>
+                      <td className="text-xs">
+                        {d.photo_match ? (
+                          <Chip color="var(--risk-high)">{photoLabel(d.photo_check)}</Chip>
+                        ) : (
+                          <Chip>
+                            {d.held
+                              ? t("case.dup.status.held")
+                              : strength
+                                ? tOr(`strength.${strength}`, titleCase(strength))
+                                : "—"}
+                          </Chip>
+                        )}
+                        <div className="dim">
+                          {d.duplication_mode ? dupMode(i18n, String(d.duplication_mode)) : ""}
+                        </div>
+                        {Boolean(d.held || d.photo_match) &&
+                          (d.photo_check === "look_alike" ? (
+                            <div>
+                              <Chip color="var(--risk-medium)">{photoLabel(d.photo_check)}</Chip>
+                              <div className="dim mono">
+                                {String(d.this_file ?? "")} / {String(d.other_file ?? "")}
+                              </div>
+                            </div>
+                          ) : (
+                            <div className="dim">
+                              {t("case.dup.photoCheck")}: {photoLabel(d.photo_check)}
+                            </div>
+                          ))}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+          {totalMatches > pairs.length && (
+            <div className="text-xs dim">
+              {t("case.dup.more", { shown: String(pairs.length), count: String(totalMatches) })}
+            </div>
+          )}
+        </div>
+      )}
+
+      {clusters.map((f, i) => {
+        const d = f.details as Details;
+        return (
+          <div key={`c${i}`} className="dup-card">
+            <div className="semibold">
+              {t("case.dup.cluster", { count: String(d.cluster_size), district: String(d.district) })}
+            </div>
+            <code className="json">{String(d.normalised_description ?? "")}</code>
+            <div className="text-sm muted">
+              {t("case.dup.total", { amount: fmt.rupees(Number(d.total_cost)) })}
+            </div>
+          </div>
+        );
+      })}
+
+      <div className="text-xs dim">{t("case.dup.proximity")}</div>
     </div>
   );
 }

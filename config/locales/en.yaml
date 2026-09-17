@@ -305,6 +305,36 @@ D-DUP-01:
     actions:
       - "Compare this work's file against work {pair}."
       - "Confirm the two works are at different locations before further release."
+  batch:
+    headline: "One of {size} identical works recommended together"
+    plain: "{mp} recommended {size} works with exactly this description, worth {total} together, under {letters} recommendation letter(s); payments so far went to {payees} payee(s). Identical items for different sites are normal, so these works are not treated as duplicates of each other. The batch is held outside the risk score until the sites are confirmed."
+    metric: "{size} identical works, {total}"
+    benchmark: "a separate site for each work"
+    actions:
+      - "Confirm that each of the {size} works has its own site, for example from the completion photos."
+    same_payee: "Check first: works {works} were all paid to {payee}."
+  held:
+    headline: "Held: matches another work, and nothing recorded tells them apart"
+    plain: "The description is {similarity:.0f}% identical to work {pair}{same_amount}{same_payee}, and no recorded detail separates the two: no different numbers or place names in the descriptions, amounts close together, and no different panchayat or municipality paid. It is held outside the risk score until evidence, such as the works' photos, shows whether they are one work or two.{photo}"
+    same_payee: ", both paid to {payee}"
+    photo_look_alike: " Their photos on the portal look alike but are not the same file: compare them by eye, since different sites photographed the same way can look alike."
+    photo_different_photos: " Their photos on the portal are different pictures, which suggests two sites without proving it."
+    photo_no_photo: " The portal has no photo for at least one of them yet."
+    photo_not_completed: " At least one of them is not completed, so it has no photo yet."
+    photo_failed: " The portal did not return their photos at the last check."
+    metric: "{similarity:.0f}% description match, nothing separating"
+    benchmark: "one record per work"
+    actions:
+      - "Compare this work's file and photos with work {pair}."
+  photo:
+    headline: "The same photo file is recorded for another work"
+    plain: "The photo recorded on the portal for this work is the same image file, byte for byte, as the one recorded for work {pair}{others}, and their descriptions are {similarity:.0f}% alike. Works recorded as separate assets should not share a site photo, so this is raised for review: it may be one work recorded twice, or a wrong photo uploaded."
+    others: " and {count} other work(s)"
+    metric: "one photo file on {works} works"
+    benchmark: "a separate photo for each work"
+    actions:
+      - "Compare the files and photos of this work and work {pair}."
+      - "Confirm on site that each asset exists."
 
 D-DUP-02:
   headline: "Several works share one vague description"

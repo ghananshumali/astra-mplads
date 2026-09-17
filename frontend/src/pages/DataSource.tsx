@@ -381,6 +381,36 @@ function LiveSync({ f }: { f: Freshness }) {
             value={f.analysis.in_progress ? t("sync.recomputingNow") : fmt.clock(f.analysis.last_at)}
             hint={analysisHint(f, i18n, now)}
           />
+          {f.photos && (
+            <Kv
+              label={t("sync.photos")}
+              value={
+                !f.photos.enabled
+                  ? t("sync.off")
+                  : f.photos.active_now
+                    ? t("sync.running")
+                    : f.poller_running
+                      ? t("sync.paused")
+                      : t("sync.notRunningShort")
+              }
+              hint={
+                f.photos.enabled
+                  ? [
+                      t("sync.photosChecked", {
+                        n: compact(f.photos.checked),
+                        m: compact(f.photos.held_works),
+                      }),
+                      f.photos.active_now
+                        ? null
+                        : t("sync.runsHours", { hours: rotationHours(f.photos.hours, i18n) }),
+                      f.photos.last_at ? t("sync.photosLast", { time: fmt.clock(f.photos.last_at) }) : null,
+                    ]
+                      .filter(Boolean)
+                      .join(" · ")
+                  : t("sync.photosOff")
+              }
+            />
+          )}
           <Kv
             label={t("sync.areasMatching")}
             value={

@@ -310,6 +310,7 @@ def freshness_meta():
     return {
         "rolling": _rolling_status(poller, running),
         "analysis": _analysis_status(poller, running),
+        "photos": _photo_status(poller, running),
         "parity": parity,
         "poller_running": running,
         "poller_since": (owner or {}).get("since"),
@@ -427,6 +428,41 @@ def _rolling_status(poller: dict, running: bool) -> dict | None:
         "hours": settings.get("hours"),
         "min_age_hours": settings.get("min_age_hours"),
         "last_at": db.get_state("last_rolling_at") or None,
+    }
+
+
+def _photo_status(poller: dict, running: bool) -> dict | None:
+    """The nightly photo check of held duplicate matches: its settings, as the
+    running poller reported them, and what the checks have found so far.
+
+    None until a poller has reported its settings, like the rotation.
+    """
+    from datetime import datetime
+    from ..ingestion.poller import in_hours, parse_hours
+    settings = poller.get("photos")
+    if not settings:
+        return None
+    hours = parse_hours(settings.get("hours"))
+    enabled = bool(settings.get("per_night")) and hours is not None
+    try:
+        tonight = json.loads(db.get_state("photo_night") or "null")
+    except ValueError:
+        tonight = None
+    summary = db.photo_check_summary()
+    return {
+        "enabled": enabled,
+        "active_now": bool(running and enabled
+                           and in_hours(datetime.now().astimezone(), hours)),
+        "hours": settings.get("hours"),
+        "per_night": settings.get("per_night"),
+        "last_at": db.get_state("last_photo_check_at") or None,
+        # {"night": "2026-09-17", "asked": 120}: the night named by the date it began
+        "last_night": tonight if isinstance(tonight, dict) else None,
+        "held_works": summary["held_works"],
+        "checked": summary["checked"],
+        "by_status": summary["by_status"],
+        "results_waiting": bool(db.get_state("photo_results_pending")),
+        "paused_until": db.get_state("photo_paused_until") or None,
     }
 
 

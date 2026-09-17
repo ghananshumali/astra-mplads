@@ -139,6 +139,24 @@ SAMPLES = [
     finding("D-DUP-01", "entity_resolution", {
         "semantic_sim": 1.0, "pair_work_id": "WS/MP195/2023-2024/23344",
         "evidence_strength": "strong", "same_sanction_amount": True, "this_cost": 106850}),
+    finding("D-DUP-01", "entity_resolution", {
+        "held": True, "semantic_sim": 1.0, "pair_work_id": "WS/MP18335/2024-2025/150941",
+        "evidence_strength": "held", "same_sanction_amount": True, "this_cost": 499206,
+        "shared_payee": "GP Kapisda B", "photo_check": "different_photos"}, severity="low"),
+    finding("D-DUP-01", "entity_resolution", {
+        "held": True, "semantic_sim": 1.0, "pair_work_id": "WS/MP18235/2025-2026/254515",
+        "evidence_strength": "held", "photo_check": "look_alike",
+        "this_file": "1786525591620.jpeg", "other_file": "1786526642613.jpeg"}, severity="low"),
+    finding("D-DUP-01", "entity_resolution", {
+        "photo_match": True, "semantic_sim": 0.95, "pair_work_id": "WS/MP18178/2024-2025/174398",
+        "evidence_strength": "same photo file", "photo_check": "same_file",
+        "photo_cluster": ["WS/MP18178/2025-2026/202071", "WS/MP18178/2024-2025/174398",
+                          "WS/MP18178/2024-2025/174399"]}, severity="critical"),
+    finding("D-DUP-01", "entity_resolution", {
+        "batch": True, "held": True, "batch_size": 6, "batch_mp": "RADHE SHYAM RATHIYA",
+        "batch_total": 2994230, "batch_letters": 1, "batch_payees": 5, "evidence_strength": "batch",
+        "same_payee_groups": [{"payee": "GP Kapisda B", "work_ids": [
+            "WS/MP18335/2024-2025/150940", "WS/MP18335/2024-2025/150941"]}]}, severity="low"),
     finding("D-DUP-02", "entity_resolution", {
         "cluster_size": 10, "district": "NANDURBAR", "total_cost": 1700000,
         "normalised_description": "install 2 set of street light"}),

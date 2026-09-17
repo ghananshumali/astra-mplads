@@ -116,7 +116,7 @@ authority (see *AI synthesis layer*).
 | **Ingestion** | Dual-mode router; era tagging around the 2023-04 eSAKSHI cutover; pdfplumber pipeline for utilisation certificates | canonical `works` + `fundflows` |
 | **Compliance** | Deterministic rules, thresholds in `config/rules.yaml`, each finding citing its paragraph of the MPLADS Guidelines 2023 | paragraph-cited findings |
 | **Statistical Anomaly** | Robust z-score (median/MAD) within *state × work-type × era* peer groups (empirical SoR proxy), materiality floor, degenerate-group and scale-mismatch handling; a peer profile across time to sanction, time to complete, share paid and payment count. Isolation Forest only corroborates | cost, expenditure and peer-profile outliers |
-| **Entity-Resolution** | Blocked top-k sparse TF-IDF neighbours + rapidfuzz + **shared-rare-token evidence gate** + numeric-locator discriminator + geo gate | duplicate pairs with likely mode |
+| **Entity-Resolution** | Blocked top-k sparse TF-IDF neighbours + rapidfuzz + **shared-rare-token evidence gate** + numeric-locator discriminator + geo gate find candidates; the record decides: a separating detail clears a pair, a batch of identical works is one held item, anything else is held until evidence | held duplicate pairs and batches (outside the score) |
 | **Network** | Vendors (by portal vendor id), implementing agencies and district authorities: district spread, overrun concentration, national-supplier down-weighting | concentration signals |
 | **Revision** | Edits the poller observed on the portal after sanction; normal progress is never a revision | post-sanction change signals |
 | **Payment** | Every payment record the portal lists, read against the work's sanction and completion dates | payment-record signals |
@@ -145,7 +145,7 @@ own **indicator**, which never claims to be a scheme rule.
 | `A-COST-01` | statistical | Cost anomaly vs peer benchmark (SoR proxy, 3.2.13) |
 | `A-PEER-01` | statistical | Extreme on two or more of time to sanction, time to complete, share paid, payment count |
 | `A-EXP-01` | statistical | Expenditure-pattern outlier |
-| `D-DUP-01` | statistical | Duplicate / near-duplicate work |
+| `D-DUP-01` | statistical | Works that may be one work recorded twice: held, outside the score, until evidence decides |
 | `D-DUP-02` | indicator | Repeated low-detail descriptions in one district |
 | `N-NET-01` | indicator | Vendor, implementing-agency or district-authority concentration |
 | `V-REV-01` | 3.2.15 | Work or site changed after sanction |
@@ -191,6 +191,38 @@ difference between a demo and a system an authority could trust:
   identifiers (place names, ward numbers), and **differing numeric locators**
   (culverts at KM 0+400 vs KM 1+200) are treated as evidence *against*
   duplication.
+- **Matching text finds candidates; the record decides.** On 16 Sep 2026, 4,459
+  of the 4,522 duplicate alerts came from a member recommending three or more
+  works with one identical description (benches, high-mast lights, borewells for
+  different villages), and payment records showed such batches paid to different
+  gram panchayats. Now a detail that separates two works clears the pair (numbers
+  or place names only one description carries, amounts at least 10% apart,
+  different panchayats or municipalities paid); a batch of identical works is one
+  held item per work; any other match is held at low severity, outside the risk
+  score, until evidence such as the works' photos decides. Ids, dates, letter
+  numbers, stages and vendors never clear a pair. Measured on copies of the live
+  database the same day: alerts 5,791 → 611, and no work newly became an alert.
+- **Photos settle what the record cannot.** The poller checks them itself at
+  night, a few held works a minute (see the schedule below);
+  `python -m astra.ingestion.photos --status` shows the progress, and
+  `--limit N` runs a check on a database no poller is writing. It looks only at works the last analysis held, reads the portal's
+  internal number for completed works from the raw response cache, fetches
+  their photos one request at a time and keeps only a fingerprint (64-bit row
+  and column difference hashes, and the file's SHA-256), never the image. The
+  next analysis raises two works sharing one photo file byte for byte (critical)
+  and one photo file recorded for three or more works of a batch (high). Photos
+  that only look alike stay held and are shown for a person to compare: many
+  uploads are phone photos of a printed site photo under the same camera stamp,
+  and two such photos of different sites came within 1 bit on one fingerprint.
+  Different photos leave a pair held too, since a second photo can always be
+  taken. The files carry no GPS metadata; a GPS stamp drawn into some pictures
+  is not read, so there is no location check. The command refuses while a
+  poller holds the database. Documents are not compared: in a 106-work sample on 17 Sep 2026 most completed
+  works had a PDF and no photo, and a PDF shared by two works turned out to be a
+  collector's fund-withdrawal order listing four works in different villages,
+  so one paper legitimately covers several works. Only 26 of 94 completed works
+  in that sample had a photo, so most held matches stay held until a person
+  looks.
 - **Cost anomalies need a materiality floor.** 17% of peer groups are degenerate
   (costs concentrated at one value, MAD = 0), so those use a percentile rule.
   A flag also requires ≥30% and ≥₹1 lakh above benchmark.
@@ -316,6 +348,7 @@ What the poller does, and the settings that change it (environment variables):
 | Every minute | Checks the portal's counts and re-reads only the areas whose counts moved | `ASTRA_POLL_INTERVAL` (seconds) |
 | Every minute, 08:00–20:00 | In a quiet minute, also re-reads the one area read longest ago (five requests), so edits that change no figure arrive within hours | `ASTRA_ROLLING_AREAS` (`0` = off), `ASTRA_ROLLING_HOURS` (`HH:MM-HH:MM`, `always`, `off`) |
 | Nightly, 03:00 | Re-reads every area record by record | `ASTRA_RECONCILE_AT` |
+| Every minute, 21:00–07:00 | In a quiet minute, checks the portal photos of up to 10 held duplicate matches, at most 300 a night that need the portal (works not yet completed need no request); when the night's checks stop, the risk flags are recomputed to include them. Pauses 30 minutes if the attachment service stops answering | `ASTRA_PHOTO_HOURS` (`HH:MM-HH:MM`, `always`, `off`), `ASTRA_PHOTOS_PER_NIGHT` (`0` = off), `ASTRA_PHOTOS_PER_CHECK` |
 | After data changes | Recomputes the risk flags (about two minutes), at most every 3 hours and after each nightly check; review decisions are kept | `ASTRA_ANALYSIS_EVERY_MIN` (`0` = off) |
 | When the portal stops answering | Pauses (the wait doubles up to 30 minutes) and serves the last good data; tries one national check every 5 minutes so a recovery is noticed soon. The Data source page shows when it failed, the last error and the next attempt; paused minutes are not counted as failures | `ASTRA_PORTAL_TRIAL_SECONDS` (`0` = no trials) |
 
@@ -537,7 +570,9 @@ The pre-existing endpoints (`/flags/{tier}`, `/flags/case/{id}`, `/synthesis`,
 4. **Agent trace** — the four agents, their measurements and benchmarks, their
    individual risk contributions, feeding the synthesiser.
 5. **Evidence** — the exact numbers and the raw audit trail behind each signal.
-6. **Duplicates** — side-by-side text comparison of the two matching records.
+6. **Duplicates** — this work once, its batch of identical works (amount, who was
+   paid, stage, letter; works paid to the same panchayat marked), and the matched
+   works held for evidence, side by side.
 7. **AI synthesis & action plan** — the evidence-grounded explanation plus a
    staged action plan (IMMEDIATE → NEXT → IF CONCERNS PERSIST → ESCALATION),
    with the deterministic allow-list shown beneath it.

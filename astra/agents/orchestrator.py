@@ -102,6 +102,8 @@ class Orchestrator:
             for t in self.route_trace:
                 if t["agent"] == agent.name:
                     t["findings"] = len(found)
+                    if getattr(agent, "last_stats", None):
+                        t["stats"] = agent.last_stats
             all_findings.extend(found)
 
         self.confidence = data_confidence.annotate(
@@ -203,9 +205,12 @@ class Orchestrator:
             # weight: it is how the portal records a work, not evidence of risk.
             # Context findings (`standalone: False`) are shown on the case but
             # carry no weight either: a deviation the guideline allows with
-            # recorded reasons must not tip a case into an alert.
+            # recorded reasons must not tip a case into an alert. Nor do held
+            # findings (`held`): a text match nothing in the record separates,
+            # or a batch of identical works, waits for evidence before it counts.
             score = min(100.0, sum(weights[f.severity] for f in fs
                                    if not f.details.get("portal_record_pair")
+                                   and not f.details.get("held")
                                    and f.details.get("standalone", True)))
             meta = self._entity_meta(etype, eid, widx)
             if meta.get("actor_type"):

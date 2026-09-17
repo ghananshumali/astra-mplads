@@ -30,6 +30,8 @@ os.environ["ASTRA_ESCALATE_AFTER"] = "3"
 # The rotation depends on the time of day, so it is off unless a test turns it
 # on; [13] and [14] exercise it and the analysis re-run explicitly.
 os.environ["ASTRA_ROLLING_AREAS"] = "0"
+# [16] drives the nightly photo check with a fake portal; no pause between requests.
+os.environ["ASTRA_PHOTO_PAUSE_SECONDS"] = "0"
 
 from astra import db                                            # noqa: E402
 from astra.ingestion import poller as pmod                      # noqa: E402
@@ -1619,6 +1621,166 @@ def test_portal_pause(tiles) -> None:
           and state.get("place") == "UTTAR PRADESH", json.dumps(state)[:160])
 
 
+class _FakePhotoPortal:
+    """The two attachment calls, scripted: a work number maps to its files."""
+
+    def __init__(self, files: dict[str, list[tuple[str, str]]], image: bytes):
+        self.files, self.image = files, image
+        self.calls: list[tuple[str, str]] = []
+        self.down = False
+
+    def attachments(self, portal_work_id: str):
+        self.calls.append(("list", portal_work_id))
+        if self.down:
+            raise CircuitOpen("attachment service paused")
+        return self.files.get(portal_work_id, [])
+
+    def attachment(self, attach_id: str) -> bytes:
+        self.calls.append(("file", attach_id))
+        return self.image
+
+
+def test_photo_checks(tiles) -> None:
+    print("\n[16] held duplicate matches get their photos checked at night, gently")
+    import io
+    from datetime import datetime, timedelta
+    from fastapi.testclient import TestClient
+    from PIL import Image
+    from astra.api.main import app
+
+    buf = io.BytesIO()
+    Image.new("RGB", (64, 48), (120, 90, 30)).save(buf, "JPEG")
+    photos_portal = _FakePhotoPortal({
+        "101": [("a101", "p1.jpg")], "102": [("a102", "p2.jpg")],
+        "103": [("a103", "q1 completion.pdf")],
+        "201": [("a201", "b1.jpg")], "202": [], "203": [("a203", "b3.jpeg")], "204": [],
+        "301": [("a301", "late.jpg")]}, buf.getvalue())
+    with db.connect() as con:
+        for table in ("duplicate_groups", "photo_checks", "work_attachments"):
+            con.execute(f"DELETE FROM {table}")
+    db.replace_duplicate_groups([
+        {"group_id": "pair:aaa", "kind": "pair", "work_ids": ["P1", "P2"]},
+        {"group_id": "pair:bbb", "kind": "pair", "work_ids": ["Q1", "Q2"]},
+        {"group_id": "batch:ccc", "kind": "batch",
+         "work_ids": ["B1", "B2", "B3", "B4", "N1", "N2", "N3"]}])
+    ids = {"P1": "101", "P2": "102", "Q1": "103", "B1": "201", "B2": "202", "B3": "203", "B4": "204"}
+
+    saved = (pmod.PHOTO_HOURS, pmod.PHOTOS_PER_NIGHT, pmod.PHOTOS_PER_CHECK,
+             pmod.PHOTOS_UNASKED_PER_CHECK)
+    try:
+        pmod.PHOTO_HOURS, pmod.PHOTOS_PER_NIGHT, pmod.PHOTOS_PER_CHECK = "21:00-07:00", 5, 3
+        pmod.PHOTOS_UNASKED_PER_CHECK = 2
+        portal = FakePortal(tiles)
+        poller = pmod.Poller(client=portal, houses=(HOUSE_LS,), verbose=False)
+        poller.photo_client = photos_portal
+        night = datetime(2026, 9, 17, 23, 0).astimezone()
+        poller._photo_ids, poller._photo_ids_at = ids, night.astimezone(pmod.timezone.utc)
+
+        check("a night is named by the date its hours began",
+              pmod.Poller.photo_night(night, (1260, 420)) == "2026-09-17"
+              and pmod.Poller.photo_night(night.replace(day=18, hour=3), (1260, 420)) == "2026-09-17"
+              and pmod.Poller.photo_night(night.replace(day=18, hour=21), (1260, 420)) == "2026-09-18")
+
+        noon = night.replace(hour=12)
+        check("outside its hours it asks the portal nothing",
+              not poller.photo_checks(now=noon) and not photos_portal.calls
+              and not _count("photo_checks"))
+        busy = pmod.CycleReport(started_at=pmod._now(), dirty=("2:33:418",))
+        check("in a minute busy with a portal change it stands down",
+              not poller.photo_checks(busy, now=night) and not photos_portal.calls)
+        portal.breaker = _OpenBreaker()
+        check("and while the portal's figures are not answering",
+              not poller.photo_checks(now=night) and not photos_portal.calls)
+        portal.breaker = _NullBreaker()
+        pmod.PHOTOS_PER_NIGHT = 0
+        off_by_count = poller.photo_checks(now=night)
+        pmod.PHOTOS_PER_NIGHT, pmod.PHOTO_HOURS = 5, "off"
+        check("it can be switched off by count or by hours",
+              not off_by_count and not poller.photo_checks(now=night) and not photos_portal.calls)
+        pmod.PHOTO_HOURS = "21:00-07:00"
+        poller._stop = True
+        check("a stop requested before a work is checked leaves it for later",
+              not sum(poller.photo_checks(now=night).values()) and not photos_portal.calls
+              and not _count("photo_checks"))
+        poller._stop = False
+
+        changed_before = db.get_state("data_changed_at")
+        first = poller.photo_checks(now=night)
+        asked = [pid for kind, pid in photos_portal.calls if kind == "list"]
+        check("at night it checks a few held works a minute, pairs first",
+              asked == ["101", "102", "103"], str(photos_portal.calls))
+        check("fetching only photos, never the certificate",
+              [a for kind, a in photos_portal.calls if kind == "file"] == ["a101", "a102"])
+        with db.connect() as con:
+            statuses = dict(con.execute("SELECT work_id, status FROM photo_checks").fetchall())
+        check("works not yet completed are recorded without a request, a few a minute",
+              statuses == {"P1": "photos", "P2": "photos", "Q1": "documents",
+                           "Q2": "not_completed", "N1": "not_completed"}, str(statuses))
+        check("the night's count covers only works that asked the portal",
+              json.loads(db.get_state("photo_night")) == {"night": "2026-09-17", "asked": 3}
+              and first["not_completed"] == 2, db.get_state("photo_night"))
+        check("while checks go on, the analysis is not triggered yet",
+              db.get_state("photo_results_pending") and db.get_state("data_changed_at") == changed_before)
+
+        photos_portal.calls.clear()
+        poller.photo_checks(now=night + timedelta(minutes=1))
+        check("the next minute takes what is left of the night's allowance",
+              [pid for kind, pid in photos_portal.calls if kind == "list"] == ["201", "202"]
+              and json.loads(db.get_state("photo_night"))["asked"] == 5, str(photos_portal.calls))
+        photos_portal.calls.clear()
+        poller.photo_checks(now=night + timedelta(minutes=2))
+        check("with the allowance spent it asks nothing more tonight", not photos_portal.calls)
+        check("and the night's checks become a change the analysis reads, once",
+              not db.get_state("photo_results_pending")
+              and db.get_state("data_changed_at") not in (None, "", changed_before)
+              and poller.analysis_due())
+
+        tomorrow = night + timedelta(days=1)
+        poller._photo_ids_at = tomorrow.astimezone(pmod.timezone.utc)
+        photos_portal.calls.clear()
+        poller.photo_checks(now=tomorrow)
+        check("the next night starts a new allowance and finishes the batch",
+              [pid for kind, pid in photos_portal.calls if kind == "list"] == ["203", "204"]
+              and json.loads(db.get_state("photo_night")) == {"night": "2026-09-18", "asked": 2},
+              str(photos_portal.calls))
+        check("a checked work is not asked about again",
+              not db.due_photo_checks(recheck_before=(tomorrow - timedelta(days=14)).isoformat()))
+        marked = db.get_state("data_changed_at")
+        poller.photo_checks(now=tomorrow.replace(hour=8) + timedelta(days=1))
+        check("checks left waiting when the hours end are handed to the analysis too",
+              not db.get_state("photo_results_pending") and db.get_state("data_changed_at") != marked)
+
+        print("      a failing attachment service")
+        db.replace_duplicate_groups([{"group_id": "pair:ddd", "kind": "pair", "work_ids": ["L1", "L2"]}])
+        later = tomorrow + timedelta(hours=1)
+        poller._photo_ids = {**ids, "L1": "301", "L2": "302"}
+        poller._photo_ids_at = later.astimezone(pmod.timezone.utc)
+        photos_portal.down, photos_portal.calls = True, []
+        tally = poller.photo_checks(now=later)
+        check("the run stops at the first refusal and pauses",
+              tally["stopped_early"] == 1 and len(photos_portal.calls) == 1
+              and db.get_state("photo_paused_until"), str(photos_portal.calls))
+        photos_portal.down, photos_portal.calls = False, []
+        check("nothing is asked until the pause is over",
+              not poller.photo_checks(now=later + timedelta(minutes=5)) and not photos_portal.calls)
+        poller.photo_checks(now=later + pmod.RETRY_GAP + timedelta(minutes=1))
+        check("and then it carries on",
+              [pid for kind, pid in photos_portal.calls if kind == "list"] == ["301", "302"],
+              str(photos_portal.calls))
+
+        print("      what the website shows")
+        poller._write_status(pmod.CycleReport(started_at=pmod._now()))
+        shown = TestClient(app).get("/meta/freshness").json().get("photos") or {}
+        check("the data page reports the settings, the night and the progress",
+              shown.get("enabled") and shown.get("hours") == "21:00-07:00" and shown.get("per_night") == 5
+              and shown.get("held_works") == 2 and shown.get("checked") == 2
+              and (shown.get("last_night") or {}).get("night") == "2026-09-18"
+              and shown.get("last_at"), json.dumps(shown)[:300])
+    finally:
+        (pmod.PHOTO_HOURS, pmod.PHOTOS_PER_NIGHT, pmod.PHOTOS_PER_CHECK,
+         pmod.PHOTOS_UNASKED_PER_CHECK) = saved
+
+
 def test_live() -> None:
     print("\n[12] live portal — the loop's assumptions still hold")
     client = EsakshiClient()
@@ -1663,7 +1825,7 @@ def main() -> int:
                    test_data_source_live, test_duplicate_listings,
                    test_removal_lifecycle, test_move_between_slices,
                    test_later_report_only, test_rotation,
-                   test_analysis_refresh, test_portal_pause):
+                   test_analysis_refresh, test_portal_pause, test_photo_checks):
             db.init_db(force=True)
             with db.connect() as con:
                 for table in ("works", "shards", "shard_watermarks",
