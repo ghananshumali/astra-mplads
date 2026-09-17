@@ -401,6 +401,24 @@ export interface Freshness {
     min_age_hours: number;
     last_at: string | null;
   } | null;
+  /** The nightly photo check of held duplicate matches. Null until a poller
+   *  has reported its settings. */
+  photos?: {
+    enabled: boolean;
+    /** Running now: poller up, and inside its hours. */
+    active_now: boolean;
+    /** Local hours, e.g. "21:00-07:00". */
+    hours: string;
+    per_night: number;
+    last_at: string | null;
+    last_night: { night: string; asked: number } | null;
+    held_works: number;
+    checked: number;
+    by_status: Record<string, number>;
+    /** Checks recorded that the risk flags do not include yet. */
+    results_waiting: boolean;
+    paused_until: string | null;
+  } | null;
   /** When the risk flags were last recomputed from the stored data. */
   analysis: {
     last_at: string | null;

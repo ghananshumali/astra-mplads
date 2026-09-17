@@ -4,6 +4,9 @@
     python -m astra.ingestion.photos --limit 100          # check held works not yet checked
     python -m astra.ingestion.photos --works WS/MP.../1 WS/MP.../2
 
+The running poller does this itself at night (`Poller.photo_checks`, see
+`ASTRA_PHOTO_HOURS`); the commands are for a database no poller is writing.
+
 Why it exists
 -------------
 A duplicate match that nothing in the record separates is held outside the risk
@@ -36,8 +39,9 @@ What it does, and does not
 * The photo files carry no GPS or camera metadata (checked on 16 Sep 2026).
   Some show a GPS camera stamp drawn into the picture itself; reading it would
   need text recognition, which is not built, so there is no location check.
-* One writer per database: it refuses while a poller holds the database, like
-  `router.ingest()`.
+* One writer per database: the commands refuse while a poller holds the
+  database, like `router.ingest()`; the poller, being that writer, runs the
+  same check in its quiet hours instead.
 
 Statuses: `photos` (at least one photo fingerprinted), `documents` (no photo,
 only PDFs), `no_photo` (completed, nothing attached),
@@ -134,9 +138,11 @@ class PhotoClient:
 
 def check_works(work_ids: list[str], *, client: PhotoClient | None = None,
                 ids: dict[str, str] | None = None, pause: float = PAUSE_SECONDS,
-                log: Callable[[str], None] = print) -> Counter:
+                log: Callable[[str], None] = print, progress_every: int = 25,
+                should_stop: Callable[[], bool] | None = None) -> Counter:
     """Fingerprint the photos of each work and record the check. Stops early,
-    keeping what it recorded, if the portal stops answering."""
+    keeping what it recorded, if the portal stops answering or `should_stop`
+    says so; each work's check is saved on its own, so nothing is half-written."""
     client = client or PhotoClient()
     ids = portal_work_ids() if ids is None else ids
     tally: Counter = Counter()
@@ -146,6 +152,8 @@ def check_works(work_ids: list[str], *, client: PhotoClient | None = None,
             time.sleep(pause)
 
     for n, wid in enumerate(work_ids, 1):
+        if should_stop is not None and should_stop():
+            break
         internal = ids.get(wid)
         if internal is None:
             db.save_photo_check(wid, portal_work_id=None, status="not_completed")
@@ -183,19 +191,28 @@ def check_works(work_ids: list[str], *, client: PhotoClient | None = None,
             db.save_photo_check(wid, portal_work_id=internal, status="failed", error=str(exc)[:300])
             tally["failed"] += 1
             rest()
-        if n % 25 == 0:
+        if progress_every and n % progress_every == 0:
             log(f"  {n}/{len(work_ids)} works checked: {dict(tally)}")
     return tally
+
+
+#: Check outcomes that asked the portal (a work not yet completed needs no request).
+ASKED = ("photos", "documents", "no_photo", "failed")
+
+
+def recheck_before(now: datetime | None = None) -> str:
+    """Checks older than this, that found nothing to compare, are due again."""
+    return ((now or datetime.now(timezone.utc)) - RECHECK_AFTER).isoformat()
 
 
 def run(limit: int | None = None, *, work_ids: list[str] | None = None,
         log: Callable[[str], None] = print) -> Counter:
     """Check the held works that are due (or the ones named)."""
     if instance_lock.is_held():
-        raise RuntimeError("a poller holds this database; stop it before a photo check "
+        raise RuntimeError("a poller holds this database, and checks these photos itself at "
+                           "night (ASTRA_PHOTO_HOURS); stop it before a manual photo check "
                            "(one writer per database)")
-    recheck_before = (datetime.now(timezone.utc) - RECHECK_AFTER).isoformat()
-    due = work_ids if work_ids else db.due_photo_checks(recheck_before=recheck_before, limit=limit)
+    due = work_ids if work_ids else db.due_photo_checks(recheck_before=recheck_before(), limit=limit)
     log(f"photo check: {len(due)} work(s) to look at")
     started = time.monotonic()
     tally = check_works(due, log=log)
@@ -211,7 +228,15 @@ def main(argv: list[str] | None = None) -> int:
     group.add_argument("--works", nargs="+", help="check these works now")
     args = parser.parse_args(argv)
     if args.status:
-        print(json.dumps(db.photo_check_summary(), indent=2))
+        try:
+            last_night = json.loads(db.get_state("photo_night") or "null")
+        except ValueError:
+            last_night = None
+        print(json.dumps({**db.photo_check_summary(),
+                          "last_night": last_night,
+                          "last_check_at": db.get_state("last_photo_check_at") or None,
+                          "waiting_for_analysis": bool(db.get_state("photo_results_pending"))},
+                         indent=2))
         return 0
     try:
         run(args.limit, work_ids=args.works)

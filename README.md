@@ -202,8 +202,10 @@ difference between a demo and a system an authority could trust:
   score, until evidence such as the works' photos decides. Ids, dates, letter
   numbers, stages and vendors never clear a pair. Measured on copies of the live
   database the same day: alerts 5,791 → 611, and no work newly became an alert.
-- **Photos settle what the record cannot.** `python -m astra.ingestion.photos
-  --limit N` looks only at works the last analysis held, reads the portal's
+- **Photos settle what the record cannot.** The poller checks them itself at
+  night, a few held works a minute (see the schedule below);
+  `python -m astra.ingestion.photos --status` shows the progress, and
+  `--limit N` runs a check on a database no poller is writing. It looks only at works the last analysis held, reads the portal's
   internal number for completed works from the raw response cache, fetches
   their photos one request at a time and keeps only a fingerprint (64-bit row
   and column difference hashes, and the file's SHA-256), never the image. The
@@ -214,9 +216,8 @@ difference between a demo and a system an authority could trust:
   and two such photos of different sites came within 1 bit on one fingerprint.
   Different photos leave a pair held too, since a second photo can always be
   taken. The files carry no GPS metadata; a GPS stamp drawn into some pictures
-  is not read, so there is no location check. It refuses while a poller holds
-  the database.
-  Documents are not compared: in a 106-work sample on 17 Sep 2026 most completed
+  is not read, so there is no location check. The command refuses while a
+  poller holds the database. Documents are not compared: in a 106-work sample on 17 Sep 2026 most completed
   works had a PDF and no photo, and a PDF shared by two works turned out to be a
   collector's fund-withdrawal order listing four works in different villages,
   so one paper legitimately covers several works. Only 26 of 94 completed works
@@ -347,6 +348,7 @@ What the poller does, and the settings that change it (environment variables):
 | Every minute | Checks the portal's counts and re-reads only the areas whose counts moved | `ASTRA_POLL_INTERVAL` (seconds) |
 | Every minute, 08:00–20:00 | In a quiet minute, also re-reads the one area read longest ago (five requests), so edits that change no figure arrive within hours | `ASTRA_ROLLING_AREAS` (`0` = off), `ASTRA_ROLLING_HOURS` (`HH:MM-HH:MM`, `always`, `off`) |
 | Nightly, 03:00 | Re-reads every area record by record | `ASTRA_RECONCILE_AT` |
+| Every minute, 21:00–07:00 | In a quiet minute, checks the portal photos of up to 10 held duplicate matches, at most 300 a night that need the portal (works not yet completed need no request); when the night's checks stop, the risk flags are recomputed to include them. Pauses 30 minutes if the attachment service stops answering | `ASTRA_PHOTO_HOURS` (`HH:MM-HH:MM`, `always`, `off`), `ASTRA_PHOTOS_PER_NIGHT` (`0` = off), `ASTRA_PHOTOS_PER_CHECK` |
 | After data changes | Recomputes the risk flags (about two minutes), at most every 3 hours and after each nightly check; review decisions are kept | `ASTRA_ANALYSIS_EVERY_MIN` (`0` = off) |
 | When the portal stops answering | Pauses (the wait doubles up to 30 minutes) and serves the last good data; tries one national check every 5 minutes so a recovery is noticed soon. The Data source page shows when it failed, the last error and the next attempt; paused minutes are not counted as failures | `ASTRA_PORTAL_TRIAL_SECONDS` (`0` = no trials) |
 
