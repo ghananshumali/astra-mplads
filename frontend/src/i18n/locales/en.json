@@ -518,6 +518,8 @@
   "parity.sub": "The portal's own dashboard figures beside ASTRA's, rebuilt from the stored records after every update and checked area by area",
   "parity.exact": "Exact in {n} of {m} areas",
   "parity.differ": "{n} of {m} areas differ",
+  "parity.nationalDiffers": "Behind the portal's national figures",
+  "parity.liveNote": "Portal figures are the portal's national totals, read at {time}. Just after the portal changes, ASTRA's can trail them for a minute or two while it reads the areas that changed; a difference that stays means an area was missed, and ASTRA asks that state's constituencies again.",
   "parity.diffs": "Differences from the portal:",
   "parity.reread": "Each is re-read automatically.",
   "parity.col.figure": "Figure",

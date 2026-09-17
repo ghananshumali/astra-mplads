@@ -363,6 +363,18 @@ def test_tick_and_api() -> None:
           body["supervisor_running"] is False and body["backup"]["kept"] == 2
           and body["backup"]["newest"]["name"] == "astra-20260916-230000.db",
           json.dumps(body)[:240])
+    stamp = datetime.now(UTC).isoformat()
+    state.update({"alerts": {"portal_unreachable": {
+                      "first_seen": stamp, "notified_at": stamp, "severity": "warning",
+                      "title": "The eSAKSHI portal is not answering", "detail": "Failing for 4 h."}},
+                  "alerts_last_sent": {"kind": "problem", "title": "ASTRA: something to check",
+                                       "body": "The eSAKSHI portal is not answering.", "at": stamp}},
+                 STATE)
+    body = TestClient(app).get("/meta/ops").json()
+    check("a stopped supervisor's open conditions are not served as current, "
+          "though its last alert is",
+          body["conditions"] == [] and (body["last_alert"] or {}).get("at") == stamp,
+          json.dumps({k: body[k] for k in ("conditions", "last_alert")})[:240])
 
 
 def main() -> int:

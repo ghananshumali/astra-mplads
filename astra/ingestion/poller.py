@@ -306,6 +306,12 @@ class Poller:
         self.photo_client = None
         self._photo_ids: dict[str, str] | None = None
         self._photo_ids_at: datetime | None = None
+        #: Lok Sabha states already asked again because their figures did not
+        #: add up to their constituencies', and the state figures they had then.
+        self._rechecked: dict[str, str] = {}
+        #: Whether the website was last told the portal is not answering; None
+        #: until this process has looked.
+        self._portal_shown_open: bool | None = None
 
     # ------------------------------------------------------------- plumbing
     def log(self, message: str) -> None:
@@ -362,24 +368,84 @@ class Poller:
         return db.mark_shard_failure(shard_id, str(exc), lifecycle=lifecycle)
 
     def _record_probe(self, shard_id: str, signature, count: int | None,
-                      lifecycle: str, *, keep_payload: bool = False) -> None:
+                      lifecycle: str, *, keep_payload: bool = False,
+                      keep_queue: bool = False) -> None:
         # A probe that found nothing moved leaves the records' fingerprint in
         # place, so a later read of the same records can still skip the write.
+        if keep_queue and lifecycle == validate.IDLE:
+            # ...and does not take an area out of the queue: one still owed a
+            # read (queued, or a read that failed) is owed it until it is read.
+            held = (db.get_watermark(shard_id) or {}).get("lifecycle")
+            if held in PENDING:
+                lifecycle = held
         db.save_watermark(shard_id, signature=signature, n_records=count,
                           lifecycle=lifecycle, keep_payload=keep_payload)
 
+    #: Rupees a state's total may differ from the sum of its constituencies' by
+    #: rounding alone.
+    ADDS_UP_RUPEES = 1.0
+
+    def _adds_up(self, state_sid: str, signature, members: list[Shard],
+                 seen: dict[str, dict]) -> bool:
+        """Do a Lok Sabha state's figures equal the sum of its constituencies'?
+
+        The portal's figures are exactly additive, so when the last figures seen
+        for the constituencies do not sum to the state's, a change was lost
+        between the two levels and the state must be walked again. `seen` holds
+        the stored watermarks. Only the figures that carry records are compared.
+
+        A state already asked again at these same figures is taken as adding up:
+        if its constituencies still disagree, that is the portal's own figures,
+        and asking again every minute would not change them.
+        """
+        key = json.dumps(signature, default=str)
+        if self._rechecked.get(state_sid) == key:
+            return True
+        names = {TILE_KEYS[tile] for tile in RECORD_TILES}
+        try:
+            state = {name: (count, total) for name, count, total in json.loads(key)
+                     if name in names}
+            sums = {name: [0, 0.0] for name in state}
+            for shard in members:
+                stored = (seen.get(shard.shard_id) or {}).get("signature_json")
+                if not stored:
+                    return False
+                for name, count, total in json.loads(stored):
+                    if name in sums:
+                        sums[name][0] += count or 0
+                        sums[name][1] += total or 0.0
+        except (TypeError, ValueError):
+            return False
+        return all((count is None or count == sums[name][0])
+                   and (total is None or abs(total - sums[name][1]) <= self.ADDS_UP_RUPEES)
+                   for name, (count, total) in state.items())
+
     # ------------------------------------------------------------- the hunt
-    def descend(self, house: int, report: CycleReport) -> list[Shard]:
+    def descend(self, house: int, report: CycleReport) -> tuple[list[Shard], bool]:
         """Walk the difference down: states, then the constituencies that moved.
 
-        Every state is probed, not a prioritised subset. The accounting is
-        checked afterwards as a consistency assertion, with a tolerance, and a
-        mismatch widens the search rather than narrowing it.
+        Every state is probed, not a prioritised subset. A Lok Sabha state whose
+        figures no longer add up to its constituencies' is walked as if it had
+        moved (`_adds_up`), so a change an earlier walk lost is found by the
+        next one rather than by the nightly sweep.
+
+        Returns the areas to read and whether the walk was complete. A level is
+        recorded as seen only once everything under it is accounted for: a
+        state once its constituencies have been asked, a moved one queued, and
+        the national figure (by the caller) only after a complete walk. Recorded
+        any earlier, a walk cut short — the process stopped, the network gone,
+        the breaker opening — left a state marked seen whose constituencies were
+        never asked. The next minute saw nothing moved, and the change waited for
+        the nightly sweep: on 17 Sep 2026, 2 recommended and 19 sanctioned works
+        in five Maharashtra constituencies.
         """
         dirty: list[Shard] = []
-        states = {}
+        complete = True
+        states: dict[int, list[Shard]] = {}
         for shard in self.registry(house):
             states.setdefault(shard.state_id, []).append(shard)
+        seen = (db.get_watermarks([s.shard_id for members in states.values() for s in members])
+                if house == HOUSE_LS else {})
 
         # Every state at once, four at a time. All 36 are probed rather than a
         # prioritised subset: measured at 7.5 s, which is not worth a learned
@@ -389,47 +455,67 @@ class Poller:
             state_ids,
             lambda sid_: self._probe(state_shard_id(house, sid_),
                                      shard_combo(sid_, 0, house=house)))
-        moved_states = []
+        walk: list[tuple[int, object, int | None, bool]] = []
         for state_id, probe in zip(state_ids, probes):
             sid = state_shard_id(house, state_id)
             if isinstance(probe, BaseException):
                 self._failed(sid, probe, validate.RETRY)
                 self.log(f"  state {state_id}: {probe}")
+                complete = False
                 continue
             moved, signature, count = probe
             report.requests += 1
             report.states_probed += 1
             if moved:
-                moved_states.append(state_id)
-            self._record_probe(sid, signature, count, validate.IDLE,
-                               keep_payload=not moved)
+                walk.append((state_id, signature, count, False))
+            elif house == HOUSE_LS and not self._adds_up(sid, signature, states[state_id], seen):
+                self.log(f"  {states[state_id][0].state_name or state_id}: its figures do not "
+                         f"add up to its constituencies'; asking them again")
+                walk.append((state_id, signature, count, True))
+            else:
+                # Rajya Sabha states are areas, which may be owed a read.
+                self._record_probe(sid, signature, count, validate.IDLE,
+                                   keep_payload=True, keep_queue=house == HOUSE_RS)
 
-        if not moved_states:
-            return dirty
-
-        for state_id in moved_states:
+        for state_id, signature, count, rechecking in walk:
+            sid = state_shard_id(house, state_id)
             members = states[state_id]
             # Rajya Sabha slices ARE states: no constituency level to descend to.
+            # Queued before the read, as a moved constituency is, so a read cut
+            # short is resumed rather than forgotten.
             if house == HOUSE_RS:
+                for shard in members:
+                    db.save_watermark(shard.shard_id, signature=signature,
+                                      n_records=count, lifecycle=validate.DIRTY)
                 dirty.extend(members)
                 continue
             probed = run_parallel(
                 members, lambda s: self._probe(s.shard_id, s.combo))
+            asked = True
             for shard, probe in zip(members, probed):
                 if isinstance(probe, BaseException):
-                    self._failed(shard.shard_id, probe, validate.RETRY)
+                    # A failed probe queues the area for a read; one the breaker
+                    # held back queues nothing, so the state stays unseen.
+                    if self._failed(shard.shard_id, probe, validate.RETRY) is None:
+                        asked = False
                     continue
-                moved, signature, count = probe
+                area_moved, area_signature, area_count = probe
                 report.requests += 1
                 report.constituencies_probed += 1
-                if moved:
+                if area_moved:
                     dirty.append(shard)
-                    db.save_watermark(shard.shard_id, signature=signature,
-                                      n_records=count, lifecycle=validate.DIRTY)
+                    db.save_watermark(shard.shard_id, signature=area_signature,
+                                      n_records=area_count, lifecycle=validate.DIRTY)
                 else:
-                    self._record_probe(shard.shard_id, signature, count,
-                                       validate.IDLE, keep_payload=True)
-        return dirty
+                    self._record_probe(shard.shard_id, area_signature, area_count,
+                                       validate.IDLE, keep_payload=True, keep_queue=True)
+            if not asked:
+                complete = False
+                continue
+            self._record_probe(sid, signature, count, validate.IDLE)
+            if rechecking:
+                self._rechecked[sid] = json.dumps(signature, default=str)
+        return dirty, complete
 
     # ------------------------------------------------------------ the fetch
     def fetch_shard(self, shard: Shard, *, force: bool = False,
@@ -494,6 +580,7 @@ class Poller:
             return {**outcome, "status": validate.RETRY, "reason": str(exc)}
         except SourceError as exc:
             return refuse(str(exc), validate.RETRY)
+        self._portal_answered()
 
         digest = validate.payload_hash(tiles)
         stored_row = db.get_watermark(shard.shard_id) or {}
@@ -877,6 +964,8 @@ class Poller:
                 busy = True
                 continue
             report.requests += 1
+            self._portal_answered()
+            self._note_national(house, signature)
             if not moved:
                 self._record_probe(nid, signature, count, validate.IDLE)
                 continue
@@ -885,16 +974,21 @@ class Poller:
                      f"(recommended={count:,})" if count else
                      f"national (house {house}) moved -> descending")
             report.houses_moved = report.houses_moved + (house,)
-            dirty = self.descend(house, report)
+            dirty, complete = self.descend(house, report)
             report.dirty = report.dirty + tuple(s.shard_id for s in dirty)
             if dirty:
                 self.log(f"  {len(dirty)} shard(s) changed: "
                          + ", ".join(s.label for s in dirty[:6])
                          + (" ..." if len(dirty) > 6 else ""))
                 self.drain(dirty, report)
-            # Record the national watermark only after the descent, so a crash
-            # midway leaves it "moved" and the next cycle tries again.
-            self._record_probe(nid, signature, count, validate.IDLE)
+            # Record the national watermark only after a complete descent, so a
+            # crash midway, or a walk the portal cut short, leaves it "moved"
+            # and the next cycle walks again what was not asked.
+            if complete:
+                self._record_probe(nid, signature, count, validate.IDLE)
+            else:
+                self.log(f"  national (house {house}): not every state could be "
+                         f"asked; walking again next check")
 
         if not busy:
             self.rolling_reread(report)
@@ -912,7 +1006,43 @@ class Poller:
         last real error — for the website, which cannot see this process."""
         status = getattr(getattr(self.client, "breaker", None), "status", None)
         if callable(status):
-            db.set_state("portal_status", json.dumps(status(), default=str))
+            saved = status()
+            db.set_state("portal_status", json.dumps(saved, default=str))
+            self._portal_shown_open = bool(saved.get("open"))
+
+    def _portal_answered(self) -> None:
+        """Tell the website the portal is answering as soon as it is.
+
+        Otherwise the status is saved at the end of a check, and the first check
+        after an outage can spend minutes catching up. On 17 Sep 2026 the site
+        went on saying the portal was not answering for those minutes, on the
+        word of the process that had run before this one.
+        """
+        if self._portal_shown_open is False:
+            return
+        breaker = getattr(self.client, "breaker", None)
+        if not callable(getattr(breaker, "status", None)) or breaker.is_open:
+            return
+        if self._portal_shown_open is None:
+            shown = json.loads(db.get_state("portal_status") or "null") or {}
+            if not shown.get("open"):
+                self._portal_shown_open = False
+                return
+        self._save_portal_status()
+
+    @staticmethod
+    def _note_national(house: int, signature) -> None:
+        """Keep the portal's national figures as last read, for the parity table.
+
+        Saved on every national check rather than with the watermark, which is
+        recorded only after a complete descent: the table compares ASTRA's
+        stored figures with what the portal says now.
+        """
+        figures = {name: [count, total] for name, count, total in signature}
+        db.set_state(f"national_figures_{house}", json.dumps({
+            "at": _now(),
+            "figures": {tile: figures.get(TILE_KEYS[tile]) for tile in RECORD_TILES},
+        }, default=str))
 
     # ------------------------------------------------------- full sweep
     def reconcile_all(self, house: int | None = None) -> dict:
@@ -1016,6 +1146,7 @@ class Poller:
             try:
                 _moved, signature, count = self._probe(
                     national_shard_id(house), shard_combo(house=house))
+                self._note_national(house, signature)
                 self._record_probe(national_shard_id(house), signature, count,
                                    validate.IDLE)
                 recorded += 1
