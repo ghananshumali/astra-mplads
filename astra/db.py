@@ -1383,7 +1383,7 @@ def state_risk_summary() -> pd.DataFrame:
             "SELECT state, COUNT(*) AS flags, "
             "SUM(CASE WHEN risk_score>=70 THEN 1 ELSE 0 END) AS high_risk, "
             "SUM(alert) AS alerts, ROUND(AVG(risk_score),1) AS avg_risk "
-            "FROM flags WHERE state IS NOT NULL GROUP BY state ORDER BY high_risk DESC",
+            "FROM flags WHERE state IS NOT NULL GROUP BY state ORDER BY alerts DESC, flags DESC",
             con)
 
 
@@ -1391,13 +1391,13 @@ def district_risk_summary(state: str | None = None, limit: int = 25) -> pd.DataF
     init_db()
     sql = ("SELECT state, district, COUNT(*) AS flags, "
            "SUM(CASE WHEN risk_score>=70 THEN 1 ELSE 0 END) AS high_risk, "
-           "ROUND(AVG(risk_score),1) AS avg_risk FROM flags "
+           "SUM(alert) AS alerts, ROUND(AVG(risk_score),1) AS avg_risk FROM flags "
            "WHERE district IS NOT NULL")
     params: list = []
     if state:
         sql += " AND state = ?"
         params.append(state)
-    sql += " GROUP BY state, district ORDER BY high_risk DESC, flags DESC LIMIT ?"
+    sql += " GROUP BY state, district ORDER BY alerts DESC, flags DESC LIMIT ?"
     params.append(int(limit))
     with connect() as con:
         return pd.read_sql_query(sql, con, params=params)

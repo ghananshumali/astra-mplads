@@ -70,7 +70,7 @@ export default function Geography() {
                   <th>{t("geo.col.district")}</th>
                   <th>{t("geo.col.state")}</th>
                   <th style={{ width: 90 }}>{t("geo.col.cases")}</th>
-                  <th style={{ width: 100 }}>{t("geo.col.high")}</th>
+                  <th style={{ width: 100 }}>{t("geo.col.alerts")}</th>
                   <th style={{ width: 96 }}>{t("geo.col.avg")}</th>
                 </tr>
               </thead>
@@ -87,9 +87,9 @@ export default function Geography() {
                     <td className="num">{compact(d.flags)}</td>
                     <td
                       className="num semibold"
-                      style={{ color: RISK_META.high.color }}
+                      style={{ color: RISK_META.medium.color }}
                     >
-                      {compact(d.high_risk)}
+                      {compact(d.alerts)}
                     </td>
                     <td className="num">{d.avg_risk}</td>
                   </tr>

@@ -218,7 +218,8 @@ export default function Overview() {
                   <ResponsiveContainer width="100%" height={280}>
                     <BarChart
                       data={[...(states.data ?? [])]
-                        .sort((a, b) => b.high_risk - a.high_risk)
+                        .filter((s) => s.alerts > 0)
+                        .sort((a, b) => b.alerts - a.alerts)
                         .slice(0, 10)}
                       layout="vertical"
                       margin={{ left: 8, right: 16, top: 4, bottom: 4 }}
@@ -246,21 +247,21 @@ export default function Overview() {
                         contentStyle={tooltipStyle}
                         formatter={((v: unknown, _n: unknown, item: unknown) => [
                           t("overview.states.tooltip", {
-                            high: String(v),
+                            alerts: String(v),
                             total: String(rowOf<StateRow>(item)?.flags ?? "?"),
                           }),
                           t("chart.state"),
                         ]) as never}
                       />
                       <Bar
-                        dataKey="high_risk"
-                        name={t("chart.highRisk")}
-                        fill={RISK_META.high.color}
+                        dataKey="alerts"
+                        name={t("chart.mediumHigh")}
+                        fill={RISK_META.medium.color}
                         radius={[0, 3, 3, 0]}
                         cursor="pointer"
                         onClick={(d: unknown) => {
                           const st = barKey<string>(d, "state");
-                          if (st) goCases({ state: st, min: "70" });
+                          if (st) goCases({ state: st, min: "40" });
                         }}
                       />
                     </BarChart>

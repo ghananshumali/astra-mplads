@@ -226,7 +226,8 @@ def main() -> int:
     check("GET /analytics/districts", r.status_code == 200 and len(rows) <= 5)
     if rows:
         ok, missing = has_keys(rows[0],
-                               {"state", "district", "flags", "high_risk", "avg_risk"})
+                               {"state", "district", "flags", "high_risk", "alerts",
+                                "avg_risk"})
         check("district row shape", ok, missing)
 
     r = client.get("/analytics/detections")
